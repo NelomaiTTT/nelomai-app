@@ -8,6 +8,9 @@ import java.util.UUID
 internal fun admitBackgroundRecovery(store: BackgroundCredentialStore, operation: NativeOwnerOperation) {
     val current = store.read()
     if (current !is CredentialStoreResult.Success ||
+        current.value.requiresFreshProvision ||
+        (current.value.reservation != null && current.value.pending == null) ||
+        (current.value.active == null && current.value.pending == null) ||
         store.beginOwnerOperation(current.value.revision, operation, true) !is CredentialStoreResult.Success) {
         throw BackgroundConnectionException("background_recovery_not_issued")
     }

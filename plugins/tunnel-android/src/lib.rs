@@ -279,6 +279,19 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
         require_state(response, "stopped")
     }
 
+    async fn stop_on_owner_eof(&self) -> std::result::Result<(), TunnelError> {
+        if self.app.config().identifier == "ru.nelomai.runtime.stable" {
+            return if self.retains_protection().await.unwrap_or(true) {
+                self.stop_if_unowned().await
+            } else {
+                self.stop().await
+            };
+        }
+        // The Android VPN dispatcher independently checks the replacement
+        // broker and revokes the dataplane if its authorization is lost.
+        Ok(())
+    }
+
     async fn stop_if_unowned(&self) -> std::result::Result<(), TunnelError> {
         let response = self
             .app

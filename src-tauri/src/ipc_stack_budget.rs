@@ -66,6 +66,10 @@ const COMMAND_SIZES: &[(&str, usize, bool)] = &[
     command!(app_update_refresh, return_size_1, true),
     command!(app_update_set_automatic, return_size_2, true),
     command!(app_update_install, return_size_1, true),
+    command!(app_update_check, return_size_2, true),
+    command!(app_update_confirm, return_size_2, true),
+    command!(app_update_defer, return_size_2, true),
+    command!(app_update_presented, return_size_2, true),
     command!(app_update_restart, return_size_3, true),
     command!(app_runtime_switch_status, return_size_1, true),
     command!(app_runtime_switch_request, return_size_2, true),
@@ -90,7 +94,7 @@ const COMMAND_SIZES: &[(&str, usize, bool)] = &[
     command!(app_logout, return_size_4, true),
 ];
 
-const _: () = assert!(COMMAND_SIZES.len() == 47);
+const _: () = assert!(COMMAND_SIZES.len() == 51);
 
 #[test]
 fn all_ipc_command_futures_fit_stack_budget() {
@@ -140,5 +144,5 @@ fn stack_inventory_covers_registered_ipc_commands() {
             .map(|&(name, _, _)| name)
             .collect::<Vec<_>>()
     );
-    assert_eq!(names.len(), 47);
+    assert_eq!(names.len(), 51);
 }

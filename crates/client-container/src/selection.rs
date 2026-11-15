@@ -348,7 +348,7 @@ fn validate_basic_selection(state: &SlotSelectionV1) -> io::Result<()> {
     Ok(())
 }
 
-fn read_optional_bounded(path: &Path, max: usize) -> io::Result<Option<Vec<u8>>> {
+pub(crate) fn read_optional_bounded(path: &Path, max: usize) -> io::Result<Option<Vec<u8>>> {
     match fs::metadata(path) {
         Ok(metadata) if !metadata.is_file() || metadata.len() > max as u64 => Ok(Some(Vec::new())),
         Ok(_) => read_bounded(path, max).map(Some),

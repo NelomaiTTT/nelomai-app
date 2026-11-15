@@ -352,7 +352,7 @@ impl OwnerRuntimeAuth {
             Some(_) => return Err(CoreError::AuthRecoveryRequired),
         }
         self.broker
-            .stop_runtime_logout_cleanup(&receipt)
+            .stop_runtime_logout_cleanup(&receipt, None)
             .await
             .map_err(map_error)?;
         self.admission.complete_logout(&receipt, &quiescence)?;
@@ -590,6 +590,11 @@ impl<T: TunnelController> LocalAuthStop for CoreLocalStop<T> {
     }
     async fn stop_local_on_disconnect(&self) -> Result<(), BrokerError> {
         CoreLocalStop::stop_local_on_disconnect(self)
+            .await
+            .map_err(|_| BrokerError::RecoveryRequired)
+    }
+    async fn stop_local_on_peer_eof(&self) -> Result<(), BrokerError> {
+        CoreLocalStop::stop_local_on_peer_eof(self)
             .await
             .map_err(|_| BrokerError::RecoveryRequired)
     }

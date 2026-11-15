@@ -21,7 +21,8 @@
             android:exported="false" android:process=":runtime" />
         <service android:name=".RuntimeAuthBrokerService" android:exported="false" />
         <activity android:name=".SupportDiagnosticsActivity" android:exported="false"
-            android:label="@string/support_diagnostics_label" />
+            android:label="@string/support_diagnostics_label"
+            android:theme="@style/Theme.MaterialComponents.DayNight.NoActionBar" />
         <activity android:name=".RuntimeApkInstallerActivity" android:exported="false" />
         <service android:name=".RuntimeVpnDispatcherService" android:exported="false"
             android:foregroundServiceType="systemExempted" android:permission="android.permission.BIND_VPN_SERVICE"

@@ -10,7 +10,7 @@ import { KillSwitchControls } from "./kill-switch";
 import { commandCode, commandMessage, waitForSettlement,
   START_FAILURE_DIAGNOSTICS_UI_TIMEOUT_MILLIS } from "./native-client";
 import { bindingPreferenceUpdateRequest, connectionEgressMode, primaryAction,
-  type Phase, type ConnectionIntentStatus } from "./app-model";
+  viewForAppState, type Phase, type ConnectionIntentStatus } from "./app-model";
 
 // Execute the page's actual async callback with controlled native replies. No
 // duplicate implementation of its application/epoch checks in the test.
@@ -19,7 +19,8 @@ const ast = ts.createSourceFile("page.ts", script, ts.ScriptTarget.Latest, true)
 const callback = ast.statements.find((node) => ts.isFunctionDeclaration(node)
   && node.name?.text === "synchronizeRuntimeState")!;
 const sharedFunctions = ast.statements.filter((node) => ts.isFunctionDeclaration(node)
-  && ["applyRuntimeChannelClosure", "requireRuntimeChannelOpen"].includes(node.name?.text ?? ""))
+  && ["applyRuntimeChannelClosure", "requireRuntimeChannelOpen", "observeUpdateStatus", "finishLogout", "isAndroidRuntime",
+    "updateViewFromRuntimeState"].includes(node.name?.text ?? ""))
   .map((node) => node.getText(ast)).join("\n");
 const executable = ts.transpile(sharedFunctions + callback.getText(ast), { target: ts.ScriptTarget.ES2022 });
 const synchronize = new Function("context", "foreground = true", `with (context) { ${executable}; return synchronizeRuntimeState(foreground); }`);
@@ -77,9 +78,9 @@ function fixture() {
       setKillSwitchPreference: async () => { throw new Error("not used by this fixture"); },
       stopProtection: async () => {}, retryProtectedConnection: async () => {},
     }, () => {}),
-    busy: false, bootstrapPending: false, runtimeStateSync: initialRuntimeStateSync(), bootstrap: { binding: {} },
+    busy: false, bootstrapPending: false, restoringLogout: false, runtimeStateSync: initialRuntimeStateSync(), bootstrap: { binding: {} },
     phase: "ready", connection: null, runtimeWarning: "tunnel_runtime_stopped" as string | null,
-    runtimeChannelClosed: false, runtimeSelectionBusy: false,
+    runtimeChannelClosed: false, runtimeSelectionBusy: false, runtimeStateUnavailable: false,
     startupRetry: { cancel: () => {}, checkpoint: () => () => true },
     splitTunnelOpen: false, splitTunnelState: null,
     splitTunnelBusy: false, splitTunnelLoaded: false, splitTunnelApplications: [],
@@ -101,9 +102,10 @@ function fixture() {
 function logoutFixture() {
   const result = fixture();
   Object.assign(result.context, {
+    bootstrap: { device: { platform: "android" }, binding: {} },
     startupRetry: { cancel: () => {}, schedule: () => {}, checkpoint: () => () => true }, startupPending: false,
     peers: [{ id: 1 }], selectedPeerId: "1", password: "test-password",
-    diagnosticsStatus: null, updateStatus: null, notifications: [],
+    diagnosticsStatus: null, updateStatus: null, updateRequestSequence: 0, updateAppliedSequence: 0, notifications: [],
     notificationUnreadCount: 0, notificationNextCursor: null,
     notificationHistoryExpanded: false, notificationsOpen: false, changelogOpen: false,
     clearUpdateTimer: () => {},
@@ -154,6 +156,23 @@ describe("retired Start cancellation", () => {
     expect(context.phase).toBe(phase);
     expect(context.error).toBeNull();
     expect(context.busy).toBe(false);
+  });
+
+  it("retires the unavailable Stop observation when a new Start begins", async () => {
+    const { context, current } = startFixture();
+    context.phase = "server_unavailable";
+    context.runtimeStateUnavailable = true;
+    Object.assign(context.nativeClient, {
+      start: async () => ({ status: "connected", connection: current.connection }),
+    });
+    await toggle(context);
+    expect(context.phase).toBe("connected");
+
+    current.phase = "connecting";
+    await synchronize(context, false);
+
+    expect(context.phase).toBe("connecting");
+    expect(context.runtimeStateUnavailable).toBe(false);
   });
 
   it.each(["invalid_access_token", "preferences_unavailable"])(
@@ -339,6 +358,24 @@ describe("async Stop presentation", () => {
     expect(buttonLabel(context)).toBe("Старт");
   });
 
+  it("returns to Start when Android recovers after an unavailable Stop snapshot", async () => {
+    const { context, reply, state } = stopFixture();
+    Object.assign(context, { viewForAppState });
+    Object.assign(context.nativeClient, { stop: async () => null });
+
+    const stopping = toggle(context);
+    reply({ ...state, phase: "server_unavailable" });
+    await stopping;
+    expect(context.view).toBe("connection");
+    expect(context.phase).toBe("server_unavailable");
+
+    context.nativeClient.state = async () => ({ ...state, phase: "ready" });
+    await synchronize(context, false);
+
+    expect(context.view).toBe("connection");
+    expect(buttonLabel(context)).toBe("Старт");
+  });
+
   it("keeps automatic recovery cancellable instead of presenting it as user shutdown", () => {
     const { context } = stopFixture();
     context.phase = "stopping";
@@ -427,7 +464,7 @@ describe("binding changed outside the open UI", () => {
     Object.assign(context, {
       startupRetry: { cancel: () => {}, checkpoint: () => () => true }, startupPending: false,
       selectedLayer: "tic", ticConnectionMode: "personal", routeMode: "via_tak",
-      refreshUpdateStatus: () => {}, refreshNotifications: () => {}, refreshRuntimeStatus: async () => {},
+      refreshUpdateStatus: () => {}, refreshUpdateOffer: async () => {}, refreshNotifications: () => {}, refreshRuntimeStatus: async () => {},
       refreshProbes: async () => {},
     });
     const response = { defaults: { layer: "tic", tic_connection_mode: "personal", route_mode: "via_tak" },
@@ -450,7 +487,7 @@ describe("binding changed outside the open UI", () => {
     Object.assign(context, {
       startupRetry: { cancel: () => {}, checkpoint: () => () => true }, startupPending: false,
       selectedLayer: "tic", ticConnectionMode: "personal", routeMode: "via_tak",
-      refreshUpdateStatus: () => {}, refreshNotifications: () => {}, refreshRuntimeStatus: async () => {},
+      refreshUpdateStatus: () => {}, refreshUpdateOffer: async () => {}, refreshNotifications: () => {}, refreshRuntimeStatus: async () => {},
       refreshProbes: async () => {},
     });
     const response = { defaults: { layer: "tic", tic_connection_mode: "personal", route_mode: "via_tak" },
@@ -604,7 +641,7 @@ describe("binding preferences across native Start", () => {
     const second = bindingFixture();
     let nativePhase = phase;
     Object.assign(second.c, { startupPending: false,
-      refreshUpdateStatus: () => {}, refreshNotifications: () => {},
+      refreshUpdateStatus: () => {}, refreshUpdateOffer: async () => {}, refreshNotifications: () => {},
       refreshRuntimeStatus: async () => {}, refreshProbes: async () => {},
     });
     second.c.nativeClient.state = async () => ({ phase: nativePhase, connection: null,
@@ -712,6 +749,49 @@ describe("foreground native state callback", () => {
     expect(context.phase).toBe("signed_out");
     expect(context.view).toBe("sign_in");
     expect(context.runtimeChannelClosed).toBe(false);
+    expect(context.busy).toBe(false);
+  });
+
+  it("shows the relaunch screen when Android Logout discovers EOF before a state poll", async () => {
+    const { context } = logoutFixture();
+    let restores = 0;
+    Object.assign(context, { restore: async () => { restores++; } });
+    Object.assign(context.nativeClient, {
+      logout: async () => { throw { code: "runtime_channel_closed" }; },
+    });
+    await executePageFunction("logout", context);
+    expect(context.bootstrap).not.toBeNull();
+    expect(context.runtimeChannelClosed).toBe(true);
+    expect(context.view).toBe("unavailable");
+    expect(context.phase).toBe("error");
+    expect(restores).toBe(0);
+  });
+
+  it("reconciles an Android logout from peer selection once the owner confirms it", async () => {
+    const { context } = logoutFixture();
+    let finish!: (reason: unknown) => void;
+    let restoring: Promise<void> | undefined;
+    Object.assign(context, {
+      bootstrap: { device: { platform: "android" }, binding: null },
+      phase: "needs_peer_binding", view: "peer_selection",
+      refreshPending: false, startupSlow: false, startupTimer: null,
+      window: { setTimeout: () => 1, clearTimeout: () => {} },
+      restore: () => restoring = executePageFunction("restore", context),
+    });
+    Object.assign(context.nativeClient, {
+      logout: async () => { throw { code: "temporarily_unavailable" }; },
+      bootstrap: () => new Promise((_resolve, reject) => { finish = reject; }),
+    });
+
+    await executePageFunction("logout", context);
+    expect(restoring).toBeDefined();
+    expect(context.bootstrap).not.toBeNull();
+    expect(context.view).toBe("peer_selection");
+    finish({ code: "signed_out" });
+    await restoring;
+    expect(context.bootstrap).toBeNull();
+    expect(context.phase).toBe("signed_out");
+    expect(context.view).toBe("sign_in");
     expect(context.busy).toBe(false);
   });
 

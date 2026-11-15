@@ -36,23 +36,27 @@ def main():
     for name in ("source-sha", "release-set-sha256"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--mode", choices=("build_only", "sign_candidate"), default="build_only")
+    parser.add_argument("--scope", choices=("all", "android"), default="all")
     args = parser.parse_args()
+    targets = gates.release_targets(args.scope)
+    if {path.name for path in args.packages.iterdir()} != {platform for platform, _ in targets}:
+        raise ValueError("exact selected package directories required")
     policy = builder.build_trust(args.mode, args.private_key, args.public_key)
     gates.require_operation(args.mode, "test_sign" if args.mode == "build_only" else "release_sign")
     identities = {}
     if args.output.exists() or args.work.exists():
         raise ValueError("immutable installer finalization output exists")
-    gates.verify_runtime_release(args.signed / "release", gates.VERSION, args.source_sha, args.release_set_sha256, args.public_key)
+    gates.verify_runtime_release(args.signed / "release", gates.VERSION, args.source_sha, args.release_set_sha256, args.public_key, scope=args.scope)
     args.work.mkdir(parents=True)
     environment = builder.updater_environment(args.mode, args.work, os.environ)
     cli = builder.ROOT / "node_modules/.bin/tauri"
     final_inputs = args.work / "collector"
     final_inputs.mkdir()
-    for platform, architecture in verifier.TARGETS:
+    for platform, architecture in targets:
         folder = args.packages / platform
         index = json.loads((folder / "package-digests.json").read_bytes())
         if (index.get("source_sha") != args.source_sha or index.get("release_set_sha256") != args.release_set_sha256
-                or index.get("mode") != args.mode or index.get("platform") != platform or index.get("architecture") != architecture):
+                or index.get("mode") != args.mode or index.get("release_scope", "all") != args.scope or index.get("platform") != platform or index.get("architecture") != architecture):
             raise ValueError("native package identity mismatch")
         name = gates.PACKAGE_NAMES[platform]
         path = folder / "shipping" / name
@@ -94,14 +98,14 @@ def main():
     for suffix in (".tar.gz", ".tar.gz.sha256"):
         name = f"nelomai-{gates.VERSION}-amneziawg-android-source" + suffix
         shutil.copyfile(args.packages / "android/shipping" / name, candidate / name)
-    if {path.name for path in candidate.iterdir()} != gates.PUBLISH_ASSETS:
+    if {path.name for path in candidate.iterdir()} != gates.publish_assets(args.scope):
         raise ValueError("final candidate must match the exact ordinary shipping asset allowlist")
     updater_public = args.work / "updater-public.b64"
     updater_public.write_text(environment["NELOMAI_UPDATER_PUBLIC_KEY"])
     android_metadata = json.loads((final_inputs / "android-aarch64.artifact.json").read_bytes())
-    gates.verify_updater_release(candidate, args.public_key, updater_public, android_metadata["signature"])
+    gates.verify_updater_release(candidate, args.public_key, updater_public, android_metadata["signature"], scope=args.scope)
     inventory = dict(source_sha=args.source_sha, release_set_sha256=args.release_set_sha256, mode=args.mode,
-        trust=policy["trust"], purpose="shipping", run_id=os.environ["GITHUB_RUN_ID"],
+        trust=policy["trust"], purpose="shipping", release_scope=args.scope, run_id=os.environ["GITHUB_RUN_ID"],
         run_attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]), environment_ids=identities,
         assets={path.name: verifier.digest(path) for path in candidate.iterdir()})
     (candidate / "candidate-inventory.json").write_bytes(verifier.load_script("build-runtime-release-set.py").canonical(inventory))

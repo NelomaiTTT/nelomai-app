@@ -22,11 +22,14 @@ internal object QuickDesiredActiveProjection {
     fun update(
         store: AndroidRecoveryStore,
         desiredActive: Boolean,
+        ownerCurrent: () -> Boolean = { true },
+        expectedGeneration: Long? = null,
     ): RecoveryStoreResult<AndroidConnectionIntent> {
-        val current = read(store)
-        if (current is RecoveryStoreResult.Failure) return current
-        val intent = (current as RecoveryStoreResult.Success).value
-        return when (val result = store.setDesiredActive(intent.generation, desiredActive)) {
+        val generation = expectedGeneration ?: when (val current = read(store)) {
+            is RecoveryStoreResult.Failure -> return current
+            is RecoveryStoreResult.Success -> current.value.generation
+        }
+        return when (val result = store.setDesiredActive(generation, desiredActive, ownerCurrent)) {
             is RecoveryStoreResult.Success -> RecoveryStoreResult.Success(result.value.intent)
             is RecoveryStoreResult.Failure -> result
         }
@@ -91,6 +94,9 @@ object QuickTunnelController {
         state: SessionState,
         desiredActive: Boolean? = null,
         changed: Boolean = false,
+        ownerCurrent: () -> Boolean = { true },
+        expectedGeneration: Long? = null,
+        onDesiredActiveSaved: (Long) -> Unit = {},
     ): Boolean {
         val preferences = preferences(context)
         if (desiredActive != null) {
@@ -98,11 +104,18 @@ object QuickTunnelController {
             val recoveryResult = QuickDesiredActiveProjection.update(
                 AndroidRecoveryStores.open(context),
                 desiredActive,
+                ownerCurrent,
+                expectedGeneration,
             )
-            if (recoveryResult is RecoveryStoreResult.Failure) {
-                TunnelLog.warning("quick_state.recovery_save_failed", recoveryResult.code)
-                return false
+            when (recoveryResult) {
+                is RecoveryStoreResult.Failure -> {
+                    TunnelLog.warning("quick_state.recovery_save_failed", recoveryResult.code)
+                    return false
+                }
+                is RecoveryStoreResult.Success -> onDesiredActiveSaved(recoveryResult.value.generation)
             }
+        } else if (expectedGeneration != null && generation(context) != expectedGeneration) {
+            return false
         }
         val changedRevision = if (changed) {
             val storedRevision = preferences.getLong(STATE_CHANGE_REVISION, 0L)

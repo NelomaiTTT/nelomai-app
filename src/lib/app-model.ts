@@ -158,6 +158,9 @@ export interface UpdateState {
 }
 
 export type UpdatePhase =
+  | "checking"
+  | "ready_to_install"
+  | "installing"
   | "idle"
   | "available"
   | "downloading"
@@ -166,6 +169,10 @@ export type UpdatePhase =
   | "failed";
 
 export interface UpdateStatus {
+  protocol?: number;
+  offerId?: string | null;
+  promptPending?: boolean;
+  updateAvailable?: boolean;
   supported: boolean;
   automatic: boolean;
   phase: UpdatePhase;

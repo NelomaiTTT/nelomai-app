@@ -1,7 +1,7 @@
 //! One-shot admitted Android child endpoint, received before Tauri starts.
 use jni::{
     objects::{JClass, JObject, JString, JValue},
-    sys::jint,
+    sys::{jboolean, jint},
     JNIEnv, JavaVM,
 };
 use nelomai_client_container::host::RuntimeBootstrapV1;
@@ -10,7 +10,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-static BOOTSTRAP: OnceLock<Mutex<Option<(OwnedFd, RuntimeBootstrapV1)>>> = OnceLock::new();
+static BOOTSTRAP: OnceLock<Mutex<Option<(OwnedFd, RuntimeBootstrapV1, u32)>>> = OnceLock::new();
 
 /// Read through the container class loader and its collector's rotation lock.
 /// Diagnostics are optional: JNI failures must not prevent the existing report.
@@ -57,7 +57,7 @@ pub fn logcat_snapshot() -> Option<String> {
         .filter(|text| !text.is_empty() && text.len() <= 2 * 1024 * 1024)
 }
 
-pub fn take_bootstrap() -> std::io::Result<(OwnedFd, RuntimeBootstrapV1)> {
+pub fn take_bootstrap() -> std::io::Result<(OwnedFd, RuntimeBootstrapV1, u32)> {
     BOOTSTRAP
         .get()
         .ok_or_else(blocked)?
@@ -70,7 +70,7 @@ fn blocked() -> std::io::Error {
     std::io::Error::other("runtime_startup_blocked: Android owner admission is required")
 }
 
-fn attach(mut env: JNIEnv, fd: jint, bootstrap: JString) {
+fn attach(mut env: JNIEnv, fd: jint, bootstrap: JString, update_protocol: u32) {
     let descriptor = (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) });
     let result = (|| -> Result<(), ()> {
         let descriptor = descriptor.ok_or(())?;
@@ -84,7 +84,7 @@ fn attach(mut env: JNIEnv, fd: jint, bootstrap: JString) {
             .identity(bootstrap.session_generation)
             .map_err(|_| ())?;
         BOOTSTRAP
-            .set(Mutex::new(Some((descriptor, bootstrap))))
+            .set(Mutex::new(Some((descriptor, bootstrap, update_protocol))))
             .map_err(|_| ())
     })();
     if result.is_err() {
@@ -102,7 +102,46 @@ pub extern "system" fn Java_ru_nelomai_client_RuntimeEntrypoint_attach(
     fd: jint,
     bootstrap: JString,
 ) {
-    attach(env, fd, bootstrap)
+    attach(env, fd, bootstrap, 1)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_ru_nelomai_client_RuntimeEntrypoint_attachWithUpdates(
+    env: JNIEnv,
+    _: JObject,
+    fd: jint,
+    bootstrap: JString,
+    protocol: jint,
+) {
+    attach(env, fd, bootstrap, if protocol == 2 { 2 } else { 1 })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_ru_nelomai_client_RuntimeEntrypoint_updateUi(
+    mut env: JNIEnv,
+    _: JObject,
+    foreground: jboolean,
+    new_user_launch: jboolean,
+    session: JString,
+    reason: jint,
+) {
+    let session = if session.is_null() {
+        None
+    } else {
+        match env.get_string(&session) {
+            Ok(value) => Some(String::from(value)),
+            Err(_) => return,
+        }
+    };
+    if session.as_ref().is_some_and(|value| value.len() > 64) || !(0..=2).contains(&reason) {
+        return;
+    }
+    crate::android_update_ui::submit(crate::android_update_ui::UiUpdate {
+        foreground: foreground != 0,
+        new_user_launch: new_user_launch != 0,
+        launch_session_id: session,
+        reason: reason as u8,
+    });
 }
 
 // Stable build generation emits only its namespaced export, never both slots.

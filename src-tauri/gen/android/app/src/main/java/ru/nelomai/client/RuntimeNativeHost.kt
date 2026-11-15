@@ -7,6 +7,7 @@ object RuntimeNativeHost {
     init { System.loadLibrary("nelomai_android_container") }
     external fun nativeOpen(context: Context, dataRoot: String, resourceRoot: String, callbacks: RuntimeNativeCallbacks): Long
     external fun nativeSelection(host: Long): String
+    external fun nativeUpdateUiForeground(host: Long): Boolean
     /** Takes ownership of fd on success and failure; all identity fields are checked in Rust. */
     external fun nativeAttach(host: Long, fd: Int, peerPid: Int, peerUid: Int, request: String): String
     external fun nativeClose(host: Long): Boolean

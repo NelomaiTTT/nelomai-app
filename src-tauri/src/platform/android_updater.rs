@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use nelomai_client_api::AccessSnapshot;
 use nelomai_client_updater::{
-    AndroidApkInstaller, DownloadProgress, InstallResult, UpdateBackend, UpdateBackendError,
+    AndroidApkInstaller, DownloadProgress, InstallResult, PreparedUpdate, ResolvedUpdate, UpdateBackend, UpdateBackendError,
     UpdateBarrierPhase,
 };
 use std::{path::Path, sync::Arc};
@@ -52,20 +52,29 @@ impl<R: Runtime> AndroidUpdateBackend<R> {
 }
 #[async_trait]
 impl<R: Runtime> UpdateBackend for AndroidUpdateBackend<R> {
-    fn requires_install_confirmation(&self) -> bool {
-        self.backend.requires_install_confirmation()
-    }
-
-    async fn install(
+    async fn resolve(
         &self,
         access: &AccessSnapshot,
         version: &str,
-        barrier: UpdateBarrierPhase,
+    ) -> Result<Option<ResolvedUpdate>, UpdateBackendError> {
+        self.backend.resolve(access, version).await
+    }
+
+    async fn prepare(
+        &self,
+        access: &AccessSnapshot,
+        update: &ResolvedUpdate,
         progress: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
+    ) -> Result<PreparedUpdate, UpdateBackendError> {
+        self.backend.prepare(access, update, progress).await
+    }
+
+    async fn install_prepared(
+        &self,
+        update: &PreparedUpdate,
+        barrier: UpdateBarrierPhase,
     ) -> Result<InstallResult, UpdateBackendError> {
-        self.backend
-            .install(access, version, barrier, progress)
-            .await
+        self.backend.install_prepared(update, barrier).await
     }
 }
 fn plugin_error_code(error: &str) -> &str {

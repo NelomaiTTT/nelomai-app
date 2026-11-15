@@ -16,12 +16,13 @@ internal enum class SupportStartupStage(val code: String) {
 
 internal object SupportDiagnosticsStartup {
     const val OPEN_BUTTON = 0x00d10006
-    fun showFailure(activity: Activity, stage: SupportStartupStage, error: Throwable) {
+    fun showFailure(activity: Activity, stage: SupportStartupStage, error: Throwable, ownerRecovery: Boolean = false) {
         val cause = (error as? java.lang.reflect.InvocationTargetException)?.targetException ?: error
         // Exception messages/bootstrap payloads can contain credentials. Log only a fixed stage and class.
         Log.e("NelomaiStartup", "code=${stage.code} error_class=${cause.javaClass.name}")
         RuntimeActivityRecovery.showFailure(activity, allowRetry = stage in setOf(
             SupportStartupStage.LAUNCHER_OWNER_START, SupportStartupStage.LAUNCHER_OWNER_READ,
-            SupportStartupStage.BOOTSTRAP_OWNER_READ, SupportStartupStage.BOOTSTRAP_OWNER_ATTACH))
+            SupportStartupStage.BOOTSTRAP_OWNER_READ, SupportStartupStage.BOOTSTRAP_OWNER_ATTACH),
+            ownerRecovery = ownerRecovery)
     }
 }

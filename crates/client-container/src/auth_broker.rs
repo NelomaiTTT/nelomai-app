@@ -18,7 +18,10 @@ use nelomai_client_storage::{
 use nelomai_client_storage::{RecoveryTicketV1, TransitionDispatchStateV1};
 use sha2::{Digest, Sha256};
 use std::{sync::Arc, time::Duration};
-use tokio::sync::Mutex;
+use tokio::{
+    sync::Mutex,
+    time::{timeout_at, Instant},
+};
 use uuid::Uuid;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -158,6 +161,8 @@ pub enum BrokerAuthState {
 pub struct BrokerObservation {
     pub state: BrokerAuthState,
     pub access: Option<AccessSnapshot>,
+    pub(crate) confirmed_vpn_scope: bool,
+    pub(crate) logout_epoch: Option<u64>,
 }
 
 /// Nonsecret live provenance. This is not launcher or executable authority.
@@ -169,6 +174,14 @@ pub struct ScopeStamp {
     identity: Option<nelomai_contracts::RuntimeIdentity>,
 }
 impl ScopeStamp {
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn follows_logout_of(&self, source: &Self) -> bool {
+        // Cancellation of a pending Login can advance the epoch twice.
+        // A confirmed new Login always replaces the family.
+        self.epoch > source.epoch
+            && self.family == source.family
+            && self.identity == source.identity
+    }
     pub(crate) fn session_generation(&self) -> Option<u64> {
         self.identity
             .as_ref()
@@ -226,10 +239,18 @@ pub trait LocalAuthStop: Send + Sync {
     /// they must not await I/O or suppress subsequent physical/remote cleanup.
     fn revoke_runtime(&self) {}
     async fn stop_local(&self) -> Result<(), BrokerError>;
+    async fn stop_local_until(&self, deadline: Instant) -> Result<(), BrokerError> {
+        timeout_at(deadline, self.stop_local())
+            .await
+            .map_err(|_| BrokerError::Timeout)?
+    }
     /// Channel loss is not evidence of logout. Always stop physically, while
     /// adapters with shared presentation keep authorization unavailable.
     async fn stop_local_on_disconnect(&self) -> Result<(), BrokerError> {
         self.stop_local().await
+    }
+    async fn stop_local_on_peer_eof(&self) -> Result<(), BrokerError> {
+        self.stop_local_on_disconnect().await
     }
     async fn stop_local_for_transition(&self) -> Result<(), BrokerError> {
         self.stop_local().await
@@ -1591,24 +1612,7 @@ impl AuthBroker {
             return Ok(());
         }
         let authorities = &meta.transition_authorities;
-        let mut terminal: std::collections::HashSet<&str> = authorities
-            .iter()
-            .filter(|entry| entry.resume_evidence.is_some())
-            .map(|entry| entry.reconcile_operation_id.as_str())
-            .collect();
-        // A superseded predecessor is terminal only if its successor chain has
-        // a known resume result. Cycles/unknown outcomes are never evicted.
-        for _ in 0..authorities.len() {
-            for entry in authorities {
-                if entry
-                    .superseded_by
-                    .as_deref()
-                    .is_some_and(|id| terminal.contains(id))
-                {
-                    terminal.insert(&entry.reconcile_operation_id);
-                }
-            }
-        }
+        let terminal = meta.terminal_transition_operations();
         let completed_reconcile = meta
             .completed_resume
             .as_ref()
@@ -1934,6 +1938,10 @@ impl AuthBroker {
         } else {
             None
         };
+        // Pending refresh or native credential issuance does not change the
+        // locally confirmed owner. This proof never authorizes a broker RPC.
+        let confirmed_vpn_scope = access.is_some()
+            || (state == BrokerAuthState::RecoveryRequired && Self::snapshot(&auth).is_ok());
         Ok((
             ScopeStamp::of(&auth)?,
             BrokerObservation {
@@ -1943,6 +1951,8 @@ impl AuthBroker {
                     state
                 },
                 access,
+                confirmed_vpn_scope,
+                logout_epoch: (auth.logout_state != LogoutState::Active).then_some(auth.auth_epoch),
             },
         ))
     }
@@ -1992,7 +2002,7 @@ impl AuthBroker {
         Ok(match auth.logout_state {
             LogoutState::Pending => BrokerAuthState::LogoutPending,
             LogoutState::LoggedOut => BrokerAuthState::LoggedOut,
-            LogoutState::Active if Self::is_pristine_auth(auth, meta) => BrokerAuthState::LoggedOut,
+            LogoutState::Active if auth.is_pristine() => BrokerAuthState::LoggedOut,
             // A persisted password attempt has an unknown outcome until commit,
             // including when its caller future was dropped in this process.
             LogoutState::Active
@@ -2013,28 +2023,6 @@ impl AuthBroker {
             }
             LogoutState::Active => BrokerAuthState::Active,
         })
-    }
-
-    fn is_pristine_auth(auth: &AuthStoreV1, meta: &BrokerMetadataV1) -> bool {
-        auth.auth_epoch == 0
-            && auth.access_token.is_none()
-            && auth.refresh_token.is_none()
-            && auth.session_generation.is_none()
-            && auth.confirmed_identity.is_none()
-            && auth.pending_resume.is_none()
-            && auth.completed_runtime_logout.is_none()
-            && auth.pending_runtime_supersede.is_none()
-            && meta.next_attempt == 0
-            && meta.pending_request.is_none()
-            && meta.completed_resume.is_none()
-            && meta.pending_logout.is_none()
-            && meta.pending_recovery.is_none()
-            && meta.cancelled_login.is_none()
-            && !meta.authentication_outcome_unknown
-            && meta.pending_login_account.is_none()
-            && meta.confirmed_device_id.is_none()
-            && meta.pending_push_cleanup_epoch.is_none()
-            && meta.transition_authorities.is_empty()
     }
 
     /// Container-only password ingress. Install identity is read from protected
@@ -3018,7 +3006,7 @@ impl AuthBroker {
     }
 
     pub async fn logout(&self) -> Result<(), BrokerError> {
-        self.logout_inner(None, None, || {}).await
+        self.logout_inner(None, None, None, || {}).await
     }
 
     /// The callback is synchronous and runs under the same state lock as the
@@ -3028,7 +3016,7 @@ impl AuthBroker {
         stamp: &ScopeStamp,
         revoke: impl FnOnce() + Send,
     ) -> Result<(), BrokerError> {
-        self.logout_inner(Some(stamp), None, revoke).await
+        self.logout_inner(Some(stamp), None, None, revoke).await
     }
 
     /// Owner-resolved per-peer intent only; protected tickets never cross IPC.
@@ -3036,18 +3024,31 @@ impl AuthBroker {
         &self,
         stamp: &ScopeStamp,
         pending: Option<&BrokerRequestV1>,
+        io_deadline: Option<Instant>,
     ) -> Result<(), BrokerError> {
-        self.logout_inner(Some(stamp), pending, || {}).await
+        self.logout_inner(Some(stamp), pending, io_deadline, || {})
+            .await
     }
 
     async fn logout_inner(
         &self,
         stamp: Option<&ScopeStamp>,
         pending_login: Option<&BrokerRequestV1>,
+        io_deadline: Option<Instant>,
         revoke: impl FnOnce() + Send,
     ) -> Result<(), BrokerError> {
         // Deliberately never acquire issuance: a hung refresh/resume cannot
         // delay the durable cancellation fence, local stop, or family revocation.
+        let io_budget = || io_deadline.unwrap_or_else(|| Instant::now() + REQUEST_TIMEOUT);
+        let stop = |deadline| async move {
+            if io_deadline.is_some() {
+                self.stop.stop_local_until(deadline).await
+            } else {
+                timeout_at(deadline, self.stop.stop_local())
+                    .await
+                    .map_err(|_| BrokerError::Timeout)?
+            }
+        };
         let (epoch, proof) = {
             let _state = self.state.lock().await;
             let mut auth = self.load()?;
@@ -3087,17 +3088,16 @@ impl AuthBroker {
                 self.stop.revoke_runtime();
                 revoke();
                 drop(_state);
+                let deadline = io_budget();
                 if retry_push {
                     let (stop, handoff) = tokio::join!(
-                        tokio::time::timeout(REQUEST_TIMEOUT, self.stop.stop_local()),
-                        tokio::time::timeout(REQUEST_TIMEOUT, self.stop.prepare_revocation(epoch))
+                        stop(deadline),
+                        timeout_at(deadline, self.stop.prepare_revocation(epoch))
                     );
                     handoff.map_err(|_| BrokerError::Timeout)??;
-                    return stop.map_err(|_| BrokerError::Timeout)?;
+                    return stop;
                 }
-                return tokio::time::timeout(REQUEST_TIMEOUT, self.stop.stop_local())
-                    .await
-                    .map_err(|_| BrokerError::Timeout)?;
+                return stop(deadline).await;
             }
             if auth.logout_state == LogoutState::Active {
                 let logout_source = Self::transition_source_from_auth(&auth).ok().map(|source| {
@@ -3129,7 +3129,11 @@ impl AuthBroker {
                     self.stop.revoke_runtime();
                     revoke();
                     drop(_state);
-                    return self.stop.stop_local().await;
+                    return if let Some(deadline) = io_deadline {
+                        stop(deadline).await
+                    } else {
+                        self.stop.stop_local().await
+                    };
                 }
                 let meta = auth.broker.as_mut().ok_or(BrokerError::RecoveryRequired)?;
                 if meta
@@ -3192,12 +3196,13 @@ impl AuthBroker {
                 auth.broker.as_ref().and_then(|m| m.pending_logout.clone()),
             )
         };
+        let deadline = io_budget();
         let Some(proof) = proof else {
             let (stop, handoff) = tokio::join!(
-                tokio::time::timeout(REQUEST_TIMEOUT, self.stop.stop_local()),
-                tokio::time::timeout(REQUEST_TIMEOUT, self.stop.prepare_revocation(epoch))
+                stop(deadline),
+                timeout_at(deadline, self.stop.prepare_revocation(epoch))
             );
-            stop.map_err(|_| BrokerError::Timeout)??;
+            stop?;
             handoff.map_err(|_| BrokerError::Timeout)??;
             return Err(BrokerError::AuthenticationOutcomeUnknown);
         };
@@ -3208,8 +3213,8 @@ impl AuthBroker {
         // Initiate both immediately; physical stop failure must not suppress
         // revocation, and a slow remote server must not delay the stop attempt.
         let (stop, response) = tokio::join!(
-            tokio::time::timeout(REQUEST_TIMEOUT, self.stop.stop_local()),
-            tokio::time::timeout(REQUEST_TIMEOUT, async {
+            stop(deadline),
+            timeout_at(deadline, async {
                 self.stop.prepare_revocation(epoch).await?;
                 self.api
                     .logout_runtime(&request)
@@ -3217,9 +3222,6 @@ impl AuthBroker {
                     .map_err(BrokerError::from)
             })
         );
-        let stop = stop
-            .map_err(|_| BrokerError::Timeout)
-            .and_then(|result| result);
         let response = response.map_err(|_| BrokerError::Timeout)??;
         if !matches!(
             response.code.as_str(),
@@ -3269,24 +3271,32 @@ impl AuthBroker {
     pub(crate) async fn stop_runtime_logout_cleanup(
         &self,
         receipt: &CompletedRuntimeLogoutV1,
+        deadline: Option<Instant>,
     ) -> Result<(), BrokerError> {
-        tokio::time::timeout(REQUEST_TIMEOUT, async {
-            // Called under actual runtime writer quiescence. Serializing with
-            // issuance also prevents a password login during this stop retry.
-            let _issuance = self.issuance.lock().await;
+        let android_budget = deadline.is_some();
+        let deadline = deadline.unwrap_or_else(|| Instant::now() + REQUEST_TIMEOUT);
+        // Hold issuance through the physical stop so Login cannot overtake it.
+        let _issuance = timeout_at(deadline, self.issuance.lock())
+            .await
+            .map_err(|_| BrokerError::Timeout)?;
+        {
+            let _state = timeout_at(deadline, self.state.lock())
+                .await
+                .map_err(|_| BrokerError::Timeout)?;
+            let auth = self.load()?;
+            if auth.completed_runtime_logout.as_ref() != Some(receipt)
+                || auth.logout_state != LogoutState::LoggedOut
             {
-                let _state = self.state.lock().await;
-                let auth = self.load()?;
-                if auth.completed_runtime_logout.as_ref() != Some(receipt)
-                    || auth.logout_state != LogoutState::LoggedOut
-                {
-                    return Err(BrokerError::Cancelled);
-                }
+                return Err(BrokerError::Cancelled);
             }
-            self.stop.stop_local().await
-        })
-        .await
-        .map_err(|_| BrokerError::Timeout)?
+        }
+        if android_budget {
+            self.stop.stop_local_until(deadline).await
+        } else {
+            timeout_at(deadline, self.stop.stop_local())
+                .await
+                .map_err(|_| BrokerError::Timeout)?
+        }
     }
 
     pub(crate) async fn logout_covers_transition(

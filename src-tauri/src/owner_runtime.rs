@@ -6,7 +6,7 @@ use nelomai_client_container::ipc::{
 use tauri::Manager;
 
 pub fn setup_android(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    let (descriptor, bootstrap) = android_runtime::take_bootstrap()?;
+    let (descriptor, bootstrap, update_protocol) = android_runtime::take_bootstrap()?;
     let paths = bootstrap.runtime_paths()?;
     let selected = paths
         .iter()
@@ -33,25 +33,30 @@ pub fn setup_android(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Err
         local.runtime_writer_gates(),
         Arc::new(RuntimeRecordInventory::new(record.clone(), retained)),
     ));
+    let runtime_directory = selected
+        .operational_state
+        .parent()
+        .ok_or_else(|| std::io::Error::other("runtime state directory unavailable"))?;
     let diagnostics = Arc::new(diagnostics::AppDiagnostics::new(
-        selected
-            .operational_state
-            .parent()
-            .ok_or_else(|| std::io::Error::other("runtime diagnostics directory unavailable"))?
-            .join("diagnostics"),
+        runtime_directory.join("diagnostics"),
         resource_usage::ResourceSnapshot::capture(app.handle()),
     )?);
     let login_diagnostics = diagnostics.clone();
+    let logout_diagnostics = diagnostics.clone();
+    let logout_app = app.handle().clone();
+    let logout_intent = runtime_directory.join("logout-intent-v1.json");
     let socket = std::os::unix::net::UnixStream::from(descriptor);
     socket.set_nonblocking(true)?;
     let port = tauri::async_runtime::block_on(async {
         tokio::net::UnixStream::from_std(socket).map(|socket| {
-            Arc::new(
-                PrivateRuntimeAuthClient::new(socket, admission, local.clone())
-                    .with_login_failure_observer(move |stage, error| {
-                        commands::record_private_login_failure(&login_diagnostics, stage, error);
-                    }),
-            )
+            let mut port = PrivateRuntimeAuthClient::new(socket, admission, local.clone())
+                .with_login_failure_observer(move |stage, error| {
+                    commands::record_private_login_failure(&login_diagnostics, stage, error);
+                });
+            port.enable_android_logout_recovery(logout_intent, move || {
+                commands::clear_android_logout_quick_plan(&logout_app, &logout_diagnostics)
+            });
+            Arc::new(port)
         })
     })?;
     let channel = port.clone();
@@ -83,7 +88,9 @@ pub fn setup_android(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Err
     app.manage(Arc::new(runtime_control::RuntimeControls::new(
         port.clone(),
     )));
-    app.manage(Arc::new(updates::NativeUpdater::new(port.clone())));
+    app.manage(Arc::new(
+        updates::NativeUpdater::new(port.clone()).with_update_protocol(update_protocol),
+    ));
     app.manage(local);
     app.manage(application.clone());
     app.manage(tunnel.clone());
@@ -93,8 +100,10 @@ pub fn setup_android(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Err
     app.manage(push.clone());
     app.manage(metrics.clone());
     let handle = app.handle().clone();
+    let update_port = port.clone();
     let startup_diagnostics = diagnostics.clone();
     let startup = Arc::new(runtime_startup::RuntimeStartup::new(move || {
+        crate::android_update_ui::start(update_protocol, update_port);
         diagnostics.record_named("startup.runtime_ready", None, None, None);
         let dns = application_dns(&handle);
         let dns_handle = handle.clone();
@@ -119,11 +128,7 @@ pub fn setup_android(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Err
         start_push_registration_scheduler(handle, application, push);
     }));
     app.manage(startup.clone());
-    tauri::async_runtime::spawn(async move {
-        let _ = startup
-            .recover(|| async { runtime_startup::request_ready(&port, &startup_diagnostics).await })
-            .await;
-    });
+    runtime_startup::schedule_android_recovery(startup, port, startup_diagnostics);
     Ok(())
 }
 fn application_dns(app: &tauri::AppHandle) -> Vec<String> {

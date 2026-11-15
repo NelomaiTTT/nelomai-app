@@ -2,7 +2,7 @@ diff --git a/tunnel/src/main/java/org/amnezia/awg/GoBackend.java b/tunnel/src/ma
 index 3f16820..266970f 100644
 --- a/tunnel/src/main/java/org/amnezia/awg/GoBackend.java
 +++ b/tunnel/src/main/java/org/amnezia/awg/GoBackend.java
-@@ -6,10 +6,29 @@ public class GoBackend {
+@@ -6,10 +6,33 @@ public class GoBackend {
      @Nullable
      public static native String awgGetConfig(int handle);
  
@@ -21,6 +21,10 @@ index 3f16820..266970f 100644
 +
 +    public static native int awgRebindUdp(int handle);
 +
++    public static native long awgPrepareUdpRebind(int handle);
++
++    public static native int awgAbortUdpRebind(int handle, long token);
++
 +    public static native int awgSendKeepalives(int handle);
 +
 +    public static native long awgStartHandshakeProbe(int handle);
@@ -36,7 +40,7 @@ diff --git a/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java b/tunne
 index 2bb8026..a8aa7a4 100644
 --- a/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java
 +++ b/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java
-@@ -171,6 +171,78 @@ public final class GoBackend implements Backend {
+@@ -171,6 +171,127 @@ public final class GoBackend implements Backend {
          return stats;
      }
  
@@ -52,13 +56,7 @@ index 2bb8026..a8aa7a4 100644
 +    public void rebindUdp(final Tunnel tunnel) throws Exception {
 +        if (tunnel != currentTunnel || currentTunnelHandle == -1)
 +            throw new IllegalStateException("Tunnel is not active");
-+
-+        final VpnService service;
-+        try {
-+            service = vpnService.get(2, TimeUnit.SECONDS);
-+        } catch (final TimeoutException e) {
-+            throw new IllegalStateException("VPN service is unavailable", e);
-+        }
++        final VpnService service = rebindVpnService();
 +        if (awgRebindUdp(currentTunnelHandle) != 0)
 +            throw new IllegalStateException("Unable to rebind UDP sockets");
 +        protectAndAdmitSockets(service, currentTunnelHandle);
@@ -66,26 +64,81 @@ index 2bb8026..a8aa7a4 100644
 +            throw new IllegalStateException("Unable to send keepalive after UDP rebind");
 +    }
 +
-+    private static void protectAndAdmitSockets(final VpnService service, final int handle) {
-+        final long token = awgPreparedSocketToken(handle);
-+        final int socketV4 = awgGetSocketV4(handle);
-+        final int socketV6 = awgGetSocketV6(handle);
++    public enum UdpRebindResult {
++        SKIPPED,
++        ABORTED,
++        APPLIED
++    }
++
++    /** Stage a replacement alongside the active bind and preserve it on failure. */
++    public UdpRebindResult rebindUdp(final Tunnel tunnel,
++                                    final java.util.function.BooleanSupplier mayRebind,
++                                    final java.util.function.BooleanSupplier stillOwned) throws Exception {
++        if (tunnel != currentTunnel || currentTunnelHandle == -1)
++            throw new IllegalStateException("Tunnel is not active");
++        final VpnService service = rebindVpnService();
++        if (!mayRebind.getAsBoolean())
++            return UdpRebindResult.SKIPPED;
++        final int handle = currentTunnelHandle;
++        final long token = awgPrepareUdpRebind(handle);
++        if (token <= 0)
++            throw new IllegalStateException("Unable to prepare replacement UDP sockets");
++        boolean admitted = false;
 +        try {
-+            if (token <= 0 || (socketV4 < 0 && socketV6 < 0)
-+                    || (socketV4 >= 0 && !service.protect(socketV4))
-+                    || (socketV6 >= 0 && !service.protect(socketV6))
-+                    || awgAdmitSockets(handle, token) != 0)
-+                throw new IllegalStateException("Unable to protect and admit UDP sockets");
++            admitted = protectPreparedSockets(service, handle, token, mayRebind);
++            if (!admitted)
++                return UdpRebindResult.ABORTED;
++        } finally {
++            if (!admitted)
++                awgAbortUdpRebind(handle, token);
++        }
++        if (stillOwned.getAsBoolean() && awgSendKeepalives(handle) != 0)
++            throw new IllegalStateException("Unable to send keepalive after UDP rebind");
++        return UdpRebindResult.APPLIED;
++    }
++
++    private static VpnService rebindVpnService() throws Exception {
++        try {
++            return vpnService.get(2, TimeUnit.SECONDS);
++        } catch (final TimeoutException e) {
++            throw new IllegalStateException("VPN service is unavailable", e);
++        }
++    }
++
++    private static void protectAndAdmitSockets(final VpnService service, final int handle) {
++        try {
++            protectPreparedSockets(service, handle, awgPreparedSocketToken(handle), null);
 +        } catch (final RuntimeException failure) {
 +            awgCloseUdp(handle);
 +            throw failure;
 +        }
 +    }
 +
++    private static boolean protectPreparedSockets(final VpnService service, final int handle, final long token,
++                                                  @Nullable final java.util.function.BooleanSupplier mayAdmit) {
++        final int socketV4 = awgGetSocketV4(handle);
++        final int socketV6 = awgGetSocketV6(handle);
++        if (token <= 0 || (socketV4 < 0 && socketV6 < 0)
++                || (socketV4 >= 0 && !service.protect(socketV4))
++                || (socketV6 >= 0 && !service.protect(socketV6)))
++            throw new IllegalStateException("Unable to protect and admit UDP sockets");
++        if (mayAdmit != null && !mayAdmit.getAsBoolean())
++            return false;
++        if (awgAdmitSockets(handle, token) != 0)
++            throw new IllegalStateException("Unable to protect and admit UDP sockets");
++        return true;
++    }
++
 +    /** Force a fresh authenticated handshake without expiring the data-plane keypair. */
 +    public long startHandshakeProbe(final Tunnel tunnel) {
++        return startHandshakeProbe(tunnel, null);
++    }
++
++    public long startHandshakeProbe(final Tunnel tunnel, @Nullable final java.util.function.BooleanSupplier allowed) {
 +        if (tunnel != currentTunnel || currentTunnelHandle == -1)
 +            throw new IllegalStateException("Tunnel is not active");
++        if (allowed != null && !allowed.getAsBoolean())
++            return 0;
 +        final long generation = awgStartHandshakeProbe(currentTunnelHandle);
 +        if (generation <= 0)
 +            throw new IllegalStateException("Unable to start handshake probe");
@@ -115,7 +168,7 @@ index 2bb8026..a8aa7a4 100644
  
      /**
       * Get the last handshake time for a given {@link Tunnel}.
-@@ -423,12 +495,17 @@ public final class GoBackend implements Backend {
+@@ -423,12 +544,17 @@ public final class GoBackend implements Backend {
              if (currentTunnelHandle < 0)
                  throw new BackendException(Reason.GO_ACTIVATION_ERROR_CODE, currentTunnelHandle);
  
@@ -1542,7 +1595,7 @@ index 3af343d..092441a 100644
  	for i = 0; i < math.MaxInt32; i++ {
  		if _, exists := tunnelHandles[i]; !exists {
  			break
-@@ -142,26 +792,59 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+@@ -142,26 +792,62 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
  		device.Close()
  		return -1
  	}
@@ -1594,6 +1647,9 @@ index 3af343d..092441a 100644
 +	if !ok || bind.AdmitPreparedToken(uint64(token)) != nil {
 +		return -1
 +	}
++	if port, ok := bind.ActivePort(); ok && handle.telemetry != nil {
++		handle.telemetry.localPort.Store(uint32(port))
++	}
 +	return 0
 +}
 +
@@ -1604,7 +1660,7 @@ index 3af343d..092441a 100644
  	if !ok {
  		return -1
  	}
-@@ -178,7 +861,7 @@ func awgGetSocketV4(tunnelHandle int32) int32 {
+@@ -178,7 +864,7 @@ func awgGetSocketV4(tunnelHandle int32) int32 {
  
  //export awgGetSocketV6
  func awgGetSocketV6(tunnelHandle int32) int32 {
@@ -1613,7 +1669,7 @@ index 3af343d..092441a 100644
  	if !ok {
  		return -1
  	}
-@@ -195,7 +878,7 @@ func awgGetSocketV6(tunnelHandle int32) int32 {
+@@ -195,7 +881,7 @@ func awgGetSocketV6(tunnelHandle int32) int32 {
  
  //export awgGetConfig
  func awgGetConfig(tunnelHandle int32) *C.char {
@@ -1622,7 +1678,7 @@ index 3af343d..092441a 100644
  	if !ok {
  		return nil
  	}
-@@ -206,6 +889,92 @@ func awgGetConfig(tunnelHandle int32) *C.char {
+@@ -206,6 +892,133 @@ func awgGetConfig(tunnelHandle int32) *C.char {
  	return C.CString(settings)
  }
  
@@ -1661,6 +1717,47 @@ index 3af343d..092441a 100644
 +		return -1
 +	}
 +	if err := handle.device.IpcSet("listen_port=0\n\n"); err != nil {
++		return -1
++	}
++	return 0
++}
++
++//export awgPrepareUdpRebind
++func awgPrepareUdpRebind(tunnelHandle int32) int64 {
++	handle, ok := lookupTunnelHandle(tunnelHandle)
++	if !ok {
++		return -1
++	}
++	bind, ok := handle.device.Bind().(*admissionBind)
++	if !ok {
++		return -1
++	}
++	prepareErr := bind.PrepareRebind(0)
++	if port, ok := bind.ActivePort(); ok && handle.telemetry != nil {
++		// Opening a diagnostic bind updates its port even before admission.
++		handle.telemetry.localPort.Store(uint32(port))
++	}
++	if prepareErr != nil {
++		return -1
++	}
++	prepared, err := bind.PreparedSockets()
++	if err != nil || prepared.Token == 0 || prepared.Token > math.MaxInt64 {
++		if prepared.Token > 0 {
++			_ = bind.AbortPreparedToken(prepared.Token)
++		}
++		return -1
++	}
++	return int64(prepared.Token)
++}
++
++//export awgAbortUdpRebind
++func awgAbortUdpRebind(tunnelHandle int32, token int64) int32 {
++	handle, ok := lookupTunnelHandle(tunnelHandle)
++	if !ok || token <= 0 {
++		return -1
++	}
++	bind, ok := handle.device.Bind().(*admissionBind)
++	if !ok || bind.AbortPreparedToken(uint64(token)) != nil {
 +		return -1
 +	}
 +	return 0
@@ -1725,13 +1822,15 @@ index 237043e..e6f2ff6 100644
  /* SPDX-License-Identifier: Apache-2.0
   *
   * Copyright © 2017-2021 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
-@@ -13,7 +15,72 @@ extern void awgTurnOff(int handle);
+@@ -13,7 +15,74 @@ extern void awgTurnOff(int handle);
  extern int awgGetSocketV4(int handle);
  extern int awgGetSocketV6(int handle);
  extern char *awgGetConfig(int handle);
 +extern char *awgGetNetworkTelemetry(int handle);
 +extern int awgCloseUdp(int handle);
 +extern int awgRebindUdp(int handle);
++extern long long awgPrepareUdpRebind(int handle);
++extern int awgAbortUdpRebind(int handle, long long token);
 +extern int awgSendKeepalives(int handle);
 +extern long long awgPreparedSocketToken(int handle);
 +extern int awgAdmitSockets(int handle, long long token);
@@ -1798,7 +1897,7 @@ index 237043e..e6f2ff6 100644
  
  JNIEXPORT jint JNICALL Java_org_amnezia_awg_GoBackend_awgTurnOn(JNIEnv *env, jclass c, jstring ifname, jint tun_fd, jstring settings)
  {
-@@ -59,6 +126,47 @@ JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgGetConfig(JNIEnv *en
+@@ -59,6 +128,57 @@ JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgGetConfig(JNIEnv *en
  	return ret;
  }
  
@@ -1821,6 +1920,16 @@ index 237043e..e6f2ff6 100644
 +JNIEXPORT jint JNICALL Java_org_amnezia_awg_GoBackend_awgRebindUdp(JNIEnv *env, jclass c, jint handle)
 +{
 +	return awgRebindUdp(handle);
++}
++
++JNIEXPORT jlong JNICALL Java_org_amnezia_awg_GoBackend_awgPrepareUdpRebind(JNIEnv *env, jclass c, jint handle)
++{
++	return (jlong)awgPrepareUdpRebind(handle);
++}
++
++JNIEXPORT jint JNICALL Java_org_amnezia_awg_GoBackend_awgAbortUdpRebind(JNIEnv *env, jclass c, jint handle, jlong token)
++{
++	return awgAbortUdpRebind(handle, (long long)token);
 +}
 +
 +JNIEXPORT jint JNICALL Java_org_amnezia_awg_GoBackend_awgSendKeepalives(JNIEnv *env, jclass c, jint handle)
@@ -1846,7 +1955,7 @@ index 237043e..e6f2ff6 100644
  JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgVersion(JNIEnv *env, jclass c)
  {
  	jstring ret;
-@@ -69,3 +177,141 @@ JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgVersion(JNIEnv *env,
+@@ -69,3 +189,141 @@ JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgVersion(JNIEnv *env,
  	free(version);
  	return ret;
  }

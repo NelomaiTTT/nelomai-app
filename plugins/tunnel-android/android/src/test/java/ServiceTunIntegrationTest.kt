@@ -242,7 +242,7 @@ class ServiceTunIntegrationTest {
         f.retention.unavailable(owner)
         assertEquals("blocked", f.retention.state())
         val before = OwnershipBuilder.established!!
-        assertTrue(native.replacePolicy(AndroidTunnelOptions()) { false })
+        assertEquals(RedundantPolicyReplacement.APPLIED, native.replacePolicy(AndroidTunnelOptions()) { false })
         assertNotSame(before, OwnershipBuilder.established)
         assertTrue(f.retention.hasTun())
         assertEquals("blocked", f.retention.state())
@@ -260,7 +260,7 @@ class ServiceTunIntegrationTest {
         assertTrue(native.confirmTunReady())
         val before = OwnershipBuilder.established!!
         f.failRedundantStart = true
-        assertFalse(native.replacePolicy(AndroidTunnelOptions()) { false })
+        assertEquals(RedundantPolicyReplacement.FAILED, native.replacePolicy(AndroidTunnelOptions()) { false })
         assertFalse(before.fileDescriptor.valid())
         assertTrue(f.retention.hasTun())
         assertTrue(OwnershipBuilder.established!!.fileDescriptor.valid())

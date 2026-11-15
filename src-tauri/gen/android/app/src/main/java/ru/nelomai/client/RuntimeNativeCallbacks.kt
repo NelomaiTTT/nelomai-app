@@ -3,9 +3,13 @@ package ru.nelomai.client
 import android.app.ActivityManager
 import android.content.Context
 import android.content.Intent
+import android.content.ComponentName
+import android.content.ServiceConnection
+import android.os.IBinder
+import android.os.Message
+import android.os.Messenger
 import android.os.Process
 import android.os.Bundle
-import android.os.ResultReceiver
 import android.os.Handler
 import android.os.Looper
 import ru.nelomai.runtime.v1.RuntimeNativeBridgeV1
@@ -34,7 +38,12 @@ class RuntimeNativeCallbacks(private val context: RuntimeAuthBrokerService) {
         requireNotNull(migrationStorage).acknowledge(context)
         return true
     }
-    fun installApk(path: String, version: String, signer: String): Boolean = RuntimeApkInstaller.install(context, path, version, signer)
+    fun validateApk(path: String, version: String, signer: String): Boolean {
+        RuntimeApkValidation.validate(context, path, version, signer)
+        return true
+    }
+    fun installApk(path: String, version: String, signer: String): Boolean =
+        RuntimeApkInstaller.install(context, path, version, signer, context::updateUiForeground)
     private fun bridge(): RuntimeNativeBridgeV1 {
         val selected = RuntimeSelectionStore.decode(context.currentSelection())
         val namespace = when (selected.slot) {
@@ -65,7 +74,7 @@ class RuntimeNativeCallbacks(private val context: RuntimeAuthBrokerService) {
                 val selected = RuntimeSelectionStore.decode(context.currentSelection())
                 if (action == "provision" && selected.slot == "stable") {
                     try {
-                        prepareStableBackground(request, selected)
+                        prepareStableBackground(request)
                         check(RuntimeSelectionStore.decode(context.currentSelection()) == selected)
                     } catch (_: Exception) {
                         ru.nelomai.runtime.v1.SupportBackgroundDiagnostics.recordFailure(action, "background_owner_scope_mismatch")
@@ -88,32 +97,47 @@ class RuntimeNativeCallbacks(private val context: RuntimeAuthBrokerService) {
         }
     }
 
-    private fun prepareStableBackground(request: String, selected: RuntimeSelectionV1) {
+    private fun prepareStableBackground(request: String) {
         require(request.toByteArray().size <= 65536)
         val expiresAt = JSONObject(JSONObject(request).getString("owner_operation"))
             .getLong("expires_at_unix_ms")
-        fun prepare(): Boolean {
-            val remaining = expiresAt - System.currentTimeMillis()
-            require(remaining in 1..10_000)
-            val done = CompletableFuture<Boolean>()
-            val receiver = object : ResultReceiver(Handler(Looper.getMainLooper())) {
-                override fun onReceiveResult(code: Int, data: Bundle?) {
-                    if (code == 1 && data != null) done.complete(!data.getBoolean("restart_required"))
-                    else done.completeExceptionally(IllegalStateException("background_owner_scope_mismatch"))
-                }
+        val remaining = expiresAt - System.currentTimeMillis()
+        require(remaining in 1..10_000)
+        val done = CompletableFuture<Unit>()
+        val receiver = Messenger(Handler(Looper.getMainLooper()) { reply ->
+            if (reply.what == 1) done.complete(Unit)
+            else done.completeExceptionally(IllegalStateException("background_owner_scope_mismatch"))
+            true
+        })
+        // A preparation probe must not advance the started VPN service's
+        // startId: stable still owns its pending Start/Stop and idle callbacks.
+        val connection = object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+                try {
+                    Messenger(requireNotNull(binder)).send(Message.obtain(null, 1).apply {
+                        replyTo = receiver
+                        data = Bundle().apply {
+                            putString(RuntimeServiceIntents.STABLE_PROVISION_REQUEST, request)
+                        }
+                    })
+                } catch (error: Exception) { done.completeExceptionally(error) }
             }
-            context.startService(RuntimeServiceIntents.vpn(context)
-                .setAction(RuntimeServiceIntents.PREPARE_STABLE_BACKGROUND)
-                .putExtra(RuntimeServiceIntents.STABLE_PROVISION_REQUEST, request)
-                .putExtra("result_receiver", receiver))
-            return done.get(remaining, TimeUnit.MILLISECONDS)
+            override fun onServiceDisconnected(name: ComponentName?) {
+                done.completeExceptionally(IllegalStateException("background_owner_unavailable"))
+            }
+            override fun onNullBinding(name: ComponentName?) = onServiceDisconnected(name)
+            override fun onBindingDied(name: ComponentName?) = onServiceDisconnected(name)
         }
-        check(prepareStableBackgroundAfterExit(::prepare) {
-            check(System.currentTimeMillis() < expiresAt &&
-                RuntimeSelectionStore.decode(context.currentSelection()) == selected)
-            stopVpn(true)
-        }) {
-            "background_owner_scope_mismatch"
+        try {
+            val bound = context.bindService(RuntimeServiceIntents.vpn(context)
+                .setAction(RuntimeServiceIntents.PREPARE_STABLE_BACKGROUND), connection, Context.BIND_AUTO_CREATE)
+            check(bound) { "background_owner_unavailable" }
+            val left = expiresAt - System.currentTimeMillis()
+            require(left > 0)
+            done.get(left, TimeUnit.MILLISECONDS)
+        } finally {
+            // Android may register the connection even on false/SecurityException.
+            try { context.unbindService(connection) } catch (_: IllegalArgumentException) { }
         }
     }
 
@@ -185,11 +209,6 @@ class RuntimeNativeCallbacks(private val context: RuntimeAuthBrokerService) {
         context.getSystemService(ActivityManager::class.java).runningAppProcesses.orEmpty()
             .associate { it.pid to RuntimeProcessInfo(it.uid, it.processName) }
 }
-
-/** A READY probe must leave a running engine alone; a stale process gets one
- * independently verified exit and one retry, never an unbounded restart loop. */
-internal fun prepareStableBackgroundAfterExit(prepare: () -> Boolean, stop: () -> Boolean): Boolean =
-    prepare() || (stop() && prepare())
 
 data class RuntimeProcessInfo(val uid: Int, val name: String)
 

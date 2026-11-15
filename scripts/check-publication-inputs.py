@@ -42,13 +42,14 @@ def select_candidate(repository, run_id, source_sha, version, fetch=gates.github
     return int(artifact["id"])
 
 
-def check(directory, source_sha, run_id, inventory_sha256=None):
+def check(directory, source_sha, run_id, inventory_sha256=None, *, scope="all"):
     gates.full_source(source_sha)
     inventory_sha256 = inventory_sha256 or gates.file_hash(directory / "candidate-inventory.json")
     inventory = gates.verify_inventory(directory, directory / "candidate-inventory.json", inventory_sha256)
     if (inventory.get("source_sha") != source_sha or str(inventory.get("run_id")) != run_id
             or inventory.get("mode") != "sign_candidate" or inventory.get("trust") != "release"
-            or inventory.get("purpose") != "shipping" or set(inventory["assets"]) != gates.PUBLISH_ASSETS):
+            or inventory.get("purpose") != "shipping" or inventory.get("release_scope", "all") != scope
+            or set(inventory["assets"]) != gates.publish_assets(scope)):
         raise ValueError("selected build is not the requested shipping release")
 
 
@@ -61,6 +62,7 @@ if __name__ == "__main__":
     parser.add_argument("--inventory-sha256")
     for name in ("source-sha", "run-id"):
         parser.add_argument("--" + name, required=True)
+    parser.add_argument("--scope", choices=("all", "android"), default="all")
     args = parser.parse_args()
     if args.select:
         if not args.repository:
@@ -71,4 +73,4 @@ if __name__ == "__main__":
     else:
         if args.directory is None:
             parser.error("--directory is required for downloaded build validation")
-        check(args.directory, args.source_sha, args.run_id, args.inventory_sha256)
+        check(args.directory, args.source_sha, args.run_id, args.inventory_sha256, scope=args.scope)

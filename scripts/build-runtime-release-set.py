@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Aggregate four authenticated final runtime archives into one immutable root.
+"""Aggregate the explicitly selected runtime archives into one immutable root.
 
 Native re-extraction is mandatory in each platform job. The aggregation host
-repeats signatures, contract, identity and ZIP/file checks for all platforms;
+repeats signatures, contract, identity and ZIP/file checks for the selected platforms;
 it does not claim to execute foreign native binaries.
 """
 import argparse
@@ -24,13 +24,14 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
 
-def collect(input_dir, version, source, public_key):
+def collect(input_dir, version, source, public_key, *, scope="all"):
+    targets = verifier.load_script("release-candidate-gates.py").release_targets(scope)
     manifests = sorted(input_dir.rglob("nelomai-runtime-*.manifest.json"))
     manifests = [path for path in manifests if not path.name.endswith("-release-set.manifest.json")]
-    if len(manifests) != 4:
-        raise ValueError("exactly four successful platform artifacts required")
+    if len(manifests) != len(targets):
+        raise ValueError("exact selected platform artifacts required")
     result, seen = [], set()
-    for platform, architecture in verifier.TARGETS:
+    for platform, architecture in targets:
         prefix = f"nelomai-runtime-{version}-{platform}-{architecture}"
         matches = [path for path in manifests if path.name == prefix + ".manifest.json"]
         if len(matches) != 1:
@@ -53,10 +54,10 @@ def collect(input_dir, version, source, public_key):
     return result
 
 
-def build(input_dir, output, version, source, signing_key, public_key):
+def build(input_dir, output, version, source, signing_key, public_key, *, scope="all"):
     if output.exists() or output.is_symlink():
         raise ValueError("immutable release-set output already exists")
-    artifacts = collect(input_dir, version, source, public_key)
+    artifacts = collect(input_dir, version, source, public_key, scope=scope)
     if signing_key.is_symlink():
         raise ValueError("explicit regular signing key required")
     key = Ed25519PrivateKey.from_private_bytes(signing_key.read_bytes())
@@ -85,8 +86,9 @@ def main():
         parser.add_argument("--" + name, type=Path, required=True)
     for name in ("version", "source-commit"):
         parser.add_argument("--" + name, required=True)
+    parser.add_argument("--scope", choices=("all", "android"), default="all")
     args = parser.parse_args()
-    digest = build(args.input_dir, args.output, args.version, args.source_commit, args.signing_key, args.public_key)
+    digest = build(args.input_dir, args.output, args.version, args.source_commit, args.signing_key, args.public_key, scope=args.scope)
     print(json.dumps({"stable_manifest_sha256": digest}))
 
 

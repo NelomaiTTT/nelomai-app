@@ -26,12 +26,13 @@ internal class AndroidSecureEnvelopeBackend(
     private val recordName: String = RECOVERY_RECORD,
     keyAlias: String = RECOVERY_KEY_ALIAS,
     scoped: Boolean = true,
+    preferenceMode: Int = Context.MODE_PRIVATE,
 ) : EncryptedRecordBackend {
     private val preferenceName = if (scoped) AndroidRuntimeNamespace.record(preferenceName) else preferenceName
     private val keyAlias = if (scoped) AndroidRuntimeNamespace.record(keyAlias) else keyAlias
     private val preferences = context.applicationContext.getSharedPreferences(
         this.preferenceName,
-        Context.MODE_PRIVATE,
+        preferenceMode,
     )
     private val gate = Any()
 

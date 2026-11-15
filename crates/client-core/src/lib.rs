@@ -106,30 +106,42 @@ impl<T: TunnelController> CoreLocalStop<T> {
         self.writers.clone()
     }
     pub async fn stop_local(&self) -> Result<(), CoreError> {
-        self.stop_local_with_success_phase(Phase::SignedOut, false, false)
+        self.stop_local_with_success_phase(Phase::SignedOut, false, self.tunnel.stop())
             .await
     }
     pub async fn stop_local_for_transition(&self) -> Result<(), CoreError> {
-        self.stop_local_with_success_phase(Phase::Ready, false, false)
+        self.stop_local_with_success_phase(Phase::Ready, false, self.tunnel.stop())
             .await
     }
     /// Release locally without discarding the legacy connection identity needed
     /// by the existing pending-Stop worker. No authentication or panel wait.
     pub async fn stop_local_for_user(&self) -> Result<(), CoreError> {
-        self.stop_local_with_success_phase(Phase::Ready, false, true)
+        self.stop_local_with_success_phase(Phase::Ready, true, self.tunnel.stop())
             .await
     }
     /// A lost owner channel closes admission without revoking persisted auth.
     /// Error does not grant Start or assert that operational cleanup completed.
     pub async fn stop_local_on_disconnect(&self) -> Result<(), CoreError> {
-        self.stop_local_with_success_phase(Phase::Error, true, false)
+        self.stop_local_with_success_phase(Phase::Error, false, async {
+            // Uncertainty cannot authorize destroying retained protection.
+            if self.tunnel.retains_protection().await.unwrap_or(true) {
+                self.tunnel.stop_if_unowned().await
+            } else {
+                self.tunnel.stop().await
+            }
+        })
+        .await
+    }
+    pub async fn stop_local_on_peer_eof(&self) -> Result<(), CoreError> {
+        self.stop_local_with_success_phase(Phase::Error, false, self.tunnel.stop_on_owner_eof())
             .await
     }
+
     async fn stop_local_with_success_phase(
         &self,
         success_phase: Phase,
-        preserve_protection: bool,
         preserve_connection: bool,
+        stop: impl Future<Output = Result<(), TunnelError>>,
     ) -> Result<(), CoreError> {
         {
             let mut state = self.state.lock().await;
@@ -151,14 +163,7 @@ impl<T: TunnelController> CoreLocalStop<T> {
                 connection,
             };
         }
-        // EOF is not consent to disarm. Native ownership/scoped Stop remains
-        // authoritative; uncertainty cannot authorize destroying retained TUN.
-        let result =
-            if preserve_protection && self.tunnel.retains_protection().await.unwrap_or(true) {
-                self.tunnel.stop_if_unowned().await
-            } else {
-                self.tunnel.stop().await
-            };
+        let result = stop.await;
         let mut state = self.state.lock().await;
         if result.is_ok() {
             if preserve_connection && state.connection.is_some() {
@@ -2000,7 +2005,13 @@ where
         let response = match response {
             Ok(response) => response,
             Err(error) => {
-                self.set_phase(phase_for_api_error(&error)).await;
+                // Android's owner recovers an expired access token after this
+                // preflight. Publishing SignedOut now strands concurrent UI
+                // polling on the login screen before that recovery completes.
+                // The ordinary bootstrap still publishes a final auth refusal.
+                if !matches!(error, CoreApiError::Unauthorized) {
+                    self.set_phase(phase_for_api_error(&error)).await;
+                }
                 return Err(error.into());
             }
         };

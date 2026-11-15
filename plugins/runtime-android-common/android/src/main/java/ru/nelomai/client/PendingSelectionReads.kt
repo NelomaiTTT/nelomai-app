@@ -15,13 +15,14 @@ class PendingSelectionReads<T>(private val capacity: Int) {
         return true
     }
 
-    fun complete(result: Result<T>) {
-        val ready = synchronized(this) {
-            buildList {
-                while (callbacks.isNotEmpty()) add(callbacks.removeFirst())
-            }
+    @Synchronized
+    fun take(limit: Int): List<(Result<T>) -> Unit> =
+        buildList {
+            repeat(minOf(limit, callbacks.size)) { add(callbacks.removeFirst()) }
         }
-        ready.forEach { callback -> runCatching { callback(result) } }
+
+    fun complete(result: Result<T>) {
+        take(Int.MAX_VALUE).forEach { callback -> runCatching { callback(result) } }
     }
 
     @Synchronized

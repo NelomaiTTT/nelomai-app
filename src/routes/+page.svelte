@@ -2,6 +2,8 @@
   import { onMount } from "svelte";
   import { StartupRetry } from "$lib/startup-retry";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import UpdatePrompt from "$lib/UpdatePrompt.svelte";
+  import {canConfirmUpdate,updatePrompt,updateMessage} from "$lib/update-presentation";
   import ChangelogPanel from "$lib/ChangelogPanel.svelte";
   import KillSwitchPanel from "$lib/KillSwitchPanel.svelte";
   import { KillSwitchControls, confirmAndroidTransition, type KillSwitchStatus } from "$lib/kill-switch";
@@ -48,6 +50,7 @@
     requiresServerProbes,
     viewForAppState,
     viewForPhase,
+    type AppState,
     type AppView,
     type AppPreferences,
     type BindPeerRequest,
@@ -119,6 +122,7 @@
   }
   let view = $state<AppView>("loading");
   let phase = $state<Phase>("signed_out");
+  let runtimeStateUnavailable = false;
   let localStopPendingCleanup = $state(false);
   // A private client cannot reopen a closed channel. Reset only on full launch,
   // never through mutable split warnings or a delayed successful state reply.
@@ -156,8 +160,14 @@
   let updateStatus = $state<UpdateStatus | null>(null);
   let lastRecordedUpdateState: string | null = null;
   const updateOfferRefresher = new UpdateOfferRefresher<UpdateStatus>();
+  let updateRequestSequence = 0;
+  let updateAppliedSequence = 0;
   const runtimeStatusRefresher = new RuntimeStatusRefresher<RuntimeStatus>();
   let updateBusy = $state(false);
+  let updateDialogId = $state<string|null>(null);
+  let updateUiVisible = $state(true);
+  let manualUpdateResult = $state<string|null>(null);
+  let manualUpdatePending: { acknowledged: boolean } | null = null;
   let runtimeStatus = $state<RuntimeStatus | null>(null);
   let runtimeSelectionBusy = $state(false);
   let updateTimer: number | null = null;
@@ -167,6 +177,7 @@
   let runtimeStatusTimer: number | null = null;
   let startupSlow = $state(false);
   let startupPending = $state(false);
+  let restoringLogout = false;
   let bootstrapPending = $state(false);
   let refreshPending = $state(false);
   const startupRetry = new StartupRetry();
@@ -254,6 +265,7 @@
   };
 
   onMount(() => {
+    updateUiVisible=document.visibilityState === "visible";
     let disposed = false;
     void protection.refresh();
     void nativeClient.recordStartupStage("frontend_mounted");
@@ -310,10 +322,11 @@
       else connectionIntentNotificationUnlisten = unlisten;
     });
     stateTimer = window.setInterval(() => {
-      if (document.visibilityState === "visible") {
-        void protection.refresh();
-        void synchronizeRuntimeState(false);
-      }
+    if (document.visibilityState === "visible") {
+      void protection.refresh();
+      void synchronizeRuntimeState(false);
+      if (bootstrap) void refreshUpdateStatus();
+    }
     }, 1_000);
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void refreshProbes();
@@ -324,6 +337,7 @@
       }
     }, 60_000);
     const handleVisibility = () => {
+      updateUiVisible = document.visibilityState === "visible";
       if (document.visibilityState === "visible") {
         void protection.refresh();
         wakeStartup();
@@ -333,7 +347,7 @@
         void refreshRuntimeStatus();
         if (bootstrap) {
           void refreshNotifications(false, true);
-          void refreshUpdateOffer();
+          void refreshUpdateStatus();
         }
       }
     };
@@ -566,17 +580,28 @@
     }
   }
 
+  function updateViewFromRuntimeState(state: AppState, keepView = false) {
+    const nextView = viewForAppState(state);
+    runtimeStateUnavailable = nextView === "unavailable";
+    if (!keepView) view = nextView;
+  }
+
   async function synchronizeRuntimeState(foreground = true) {
+    // Only a native state snapshot can keep the recovery poll active.
+    // A failed bootstrap must not recover from cached state alone.
+    const observingUnavailable = runtimeStateUnavailable && isAndroidRuntime() &&
+      !runtimeSelectionBusy && (view === "unavailable" || view === "connection");
     if (
       runtimeChannelClosed || (busy && !connectionActionState.cancelBusy) ||
       !bootstrap?.binding ||
-      !["ready", "connecting", "connected", "stopping"].includes(phase)
+      (!observingUnavailable && !["ready", "connecting", "connected", "stopping"].includes(phase))
     ) {
       return;
     }
     const sync = beginRuntimeStateSync(runtimeStateSync, foreground);
     runtimeStateSync = sync.state;
     if (!sync.started) return;
+    const isRecoveryCurrent = observingUnavailable ? startupRetry.checkpoint() : null;
     try {
       const previous = phase;
       const observingStop = connectionActionState.cancelBusy;
@@ -587,11 +612,12 @@
         stateError = reason;
         return null;
       });
-      if (runtimeChannelClosed || bootstrap !== observedBootstrap ||
-        !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
-      // A confirmed EOF outranks unrelated UI busy work, unlike a successful
-      // snapshot. Account/action retirement still protects newer user intent.
-      if (applyRuntimeChannelClosure(stateError)) return;
+      if (runtimeChannelClosed || !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
+      const sameBootstrap = bootstrap === observedBootstrap;
+      // A confirmed EOF for this device remains valid across a startup retry.
+      if ((sameBootstrap || (observingUnavailable && bootstrap?.device.id === observedBootstrap.device.id)) &&
+        applyRuntimeChannelClosure(stateError)) return;
+      if (!sameBootstrap || (isRecoveryCurrent !== null && !isRecoveryCurrent())) return;
       if (!current || (observingStop && !connectionActionState.cancelBusy)) return;
       if (connectionActionState.cancelBusy) {
         // Observe local closure while the same Stop still awaits server cleanup.
@@ -601,6 +627,15 @@
       }
       if (busy) return;
       localStopPendingCleanup = current.localStopPendingCleanup === true;
+      if (observingUnavailable) {
+        if (current.phase !== "ready" || current.connectionIntentStatus !== "none") return;
+        if (view === "unavailable") {
+          // A local Ready observation wakes startup. Bootstrap still owns
+          // admission before the unavailable screen can expose Start.
+          if (!localStopPendingCleanup) await restore();
+          return;
+        }
+      }
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;
       reserveState = current.reserveState;
@@ -614,13 +649,13 @@
         error = cleared.error;
         ownedConnectionIntentNotice = cleared.ownedNotice;
       }
-      if (current.phase === phase) {
+      if (current.phase === phase && !observingUnavailable) {
         connection = current.connection;
         return;
       }
       phase = current.phase;
       connection = current.connection;
-      view = viewForAppState(current);
+      updateViewFromRuntimeState(current);
       if (view === "sign_in") {
         void nativeClient.recordStartupStage("sign_in_bootstrap_signed_out");
       }
@@ -654,6 +689,7 @@
 
   async function restore(automaticRetry = false) {
     if (runtimeChannelClosed || runtimeSelectionBusy || (automaticRetry && busy)) return;
+    runtimeStateUnavailable = false;
     const actionEpoch = connectionActionState.epoch;
     let expectedBootstrap = bootstrap;
     startupRetry.cancel(!automaticRetry);
@@ -676,6 +712,7 @@
       const response = await nativeClient.bootstrap();
       if (!isStartupCurrent() || runtimeChannelClosed || bootstrap !== expectedBootstrap ||
         !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
+      restoringLogout = false;
       const applying = applyBootstrap(response);
       isStartupCurrent = startupRetry.checkpoint();
       // Svelte may wrap the response; retain the assigned state identity.
@@ -689,12 +726,19 @@
       const code = commandCode(reason);
       refreshPending = code === "auth_refresh_pending";
       startupPending = code === "runtime_startup_pending" || refreshPending;
-      startupRetry.schedule(code, () => {
+      // A newer Android Stop can retire the first state read during startup.
+      const retryCode = code === "connection_intent_cancelled" && isAndroidRuntime()
+        ? "temporarily_unavailable" : code;
+      startupRetry.schedule(retryCode, () => {
         if (!isStartupCurrent() || bootstrap !== expectedBootstrap ||
           !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
-        retryPendingStartup(code);
+        retryPendingStartup(retryCode);
       });
-      if (code === "signed_out") {
+      if (code === "signed_out" && restoringLogout) {
+        finishLogout();
+      } else if (code === "signed_out" ||
+        (code === "authentication_outcome_unknown" && isAndroidRuntime())) {
+        if (code === "authentication_outcome_unknown") error = commandMessage(reason, "startup");
         reserveState = null;
         phase = "signed_out";
         view = "sign_in";
@@ -735,6 +779,7 @@
     ticConnectionMode = response.defaults.tic_connection_mode;
     routeMode = response.defaults.route_mode;
     void refreshUpdateStatus();
+    void refreshUpdateOffer("startup");
     void refreshNotifications(false, true);
 
     if (response.update.required) {
@@ -769,7 +814,7 @@
     connectionMetrics = state.metrics;
     reserveState = state.reserveState;
     runtimeWarning = state.warning;
-    view = viewForAppState(state);
+    updateViewFromRuntimeState(state);
     if (view === "sign_in") {
       void nativeClient.recordStartupStage("sign_in_bootstrap_signed_out");
     }
@@ -794,6 +839,7 @@
         platformVersion: null,
       };
       const response = await nativeClient.login(request);
+      restoringLogout = false;
       password = "";
       await applyBootstrap(response);
     } catch (reason) {
@@ -869,6 +915,7 @@
       ? beginConnectionStop(connectionActionState)
       : beginConnectionStart(connectionActionState);
     connectionActionState = action.state;
+    runtimeStateUnavailable = false;
     let shouldReportStartFailure = !stopping;
     busy = true;
     error = null;
@@ -925,6 +972,7 @@
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;
       reserveState = current.reserveState;
+      if (stopping && isAndroidRuntime()) updateViewFromRuntimeState(current, true);
     } catch (reason) {
       if (runtimeChannelClosed || !isCurrentConnectionAction(connectionActionState, action.token)) return;
       if (applyRuntimeChannelClosure(reason)) return;
@@ -957,6 +1005,7 @@
       connectionMetrics = current?.metrics ?? connectionMetrics;
       reserveState = current?.reserveState ?? reserveState;
       runtimeWarning = current?.warning ?? runtimeWarning;
+      if (current && stopping && isAndroidRuntime()) updateViewFromRuntimeState(current, true);
       if (failureCode !== "connection_intent_cancelled") {
         error = commandMessage(reason, stopping ? "stop" : "start", {
           personalPeer:
@@ -1113,49 +1162,63 @@
     }
   }
 
+  function finishLogout() {
+    restoringLogout = false;
+    error = null;
+    startupPending = false;
+    localStopPendingCleanup = false;
+    bootstrap = null;
+    connection = null;
+    pinnedStray = null;
+    peers = [];
+    selectedPeerId = "";
+    password = "";
+    diagnosticsStatus = null;
+    manualUpdatePending = null;
+    manualUpdateResult = null;
+    observeUpdateStatus(null);
+    updateDialogId = null;
+    splitTunnelState = null;
+    splitTunnelApplications = [];
+    splitTunnelOpen = false;
+    splitTunnelLoaded = false;
+    runtimeWarning = null;
+    notifications = [];
+    notificationUnreadCount = 0;
+    notificationNextCursor = null;
+    notificationHistoryExpanded = false;
+    notificationsOpen = false;
+    changelogOpen = false;
+    clearUpdateTimer();
+    // The confirmed sign-out clears the account above, but cannot reopen a
+    // closed owner channel or replace its mandatory relaunch presentation.
+    if (runtimeChannelClosed) {
+      applyRuntimeChannelClosure({ code: "runtime_channel_closed" });
+    } else {
+      phase = "signed_out";
+      view = "sign_in";
+    }
+    void nativeClient.recordStartupStage("sign_in_logout_completed");
+  }
+
   async function logout() {
     if (busy) return;
     startupRetry.cancel();
+    const android = isAndroidRuntime();
     busy = true;
     error = null;
     try {
       await nativeClient.logout();
-      startupPending = false;
-      localStopPendingCleanup = false;
-      bootstrap = null;
-      connection = null;
-      pinnedStray = null;
-      peers = [];
-      selectedPeerId = "";
-      password = "";
-      diagnosticsStatus = null;
-      updateStatus = null;
-      splitTunnelState = null;
-      splitTunnelApplications = [];
-      splitTunnelOpen = false;
-      splitTunnelLoaded = false;
-      runtimeWarning = null;
-      notifications = [];
-      notificationUnreadCount = 0;
-      notificationNextCursor = null;
-      notificationHistoryExpanded = false;
-      notificationsOpen = false;
-      changelogOpen = false;
-      clearUpdateTimer();
-      // The confirmed sign-out clears the account above, but cannot reopen a
-      // closed owner channel or replace its mandatory relaunch presentation.
-      if (runtimeChannelClosed) {
-        applyRuntimeChannelClosure({ code: "runtime_channel_closed" });
-      } else {
-        phase = "signed_out";
-        view = "sign_in";
-      }
-      void nativeClient.recordStartupStage("sign_in_logout_completed");
+      finishLogout();
     } catch (reason) {
       error = commandMessage(reason, "logout");
+      // Bootstrap waits for the owner to confirm any pending Logout. This
+      // also reconciles the account screen when no peer is bound to poll.
+      restoringLogout = android && !applyRuntimeChannelClosure(reason);
     } finally {
       busy = false;
-      if (startupPending) startupRetry.schedule("runtime_startup_pending", retryPendingStartup);
+      if (restoringLogout) void restore();
+      else if (startupPending) startupRetry.schedule("runtime_startup_pending", retryPendingStartup);
     }
   }
 
@@ -1265,24 +1328,59 @@
   }
 
   async function refreshUpdateStatus() {
+    const sequence = ++updateRequestSequence;
+    // Only reads started after this Manual's acknowledgement can finish it.
+    const manualCheck = manualUpdatePending?.acknowledged ? manualUpdatePending : null;
     clearUpdateTimer();
-    try {
-      const status = await nativeClient.updateStatus();
-      observeUpdateStatus(status);
-      if (updateStatusNeedsPolling(status)) {
-        updateTimer = window.setTimeout(refreshUpdateStatus, 500);
-      }
-    } catch {
-      updateStatus = null;
+    const status = await nativeClient.updateStatus().catch(() => null);
+    const applied = observeUpdateStatus(status, sequence, manualCheck);
+    // An unrelated reply can supersede this read without finishing Manual.
+    // In that case, a new read keeps Manual tied to its own acknowledgement.
+    const retryManualRead = !applied && bootstrap && manualCheck && manualCheck === manualUpdatePending;
+    if (updateUiVisible && updateTimer === null &&
+        (retryManualRead || (applied && status && updateStatusNeedsPolling(status)))) {
+      updateTimer = window.setTimeout(refreshUpdateStatus, 500);
     }
   }
 
-  function observeUpdateStatus(status: UpdateStatus) {
+  function observeUpdateStatus(
+    status: UpdateStatus | null,
+    sequence = ++updateRequestSequence,
+    manualCheck: typeof manualUpdatePending = null,
+  ): boolean {
+    // User-action replies commit a new sequence. Older polls/checks (including
+    // failures) must not overwrite a newer decision. Pending reads do not
+    // suppress completed reads, so a slow IPC cannot starve presentation.
+    if (sequence < updateAppliedSequence) return false;
+    updateAppliedSequence = sequence;
+    if (!status) {
+      updateStatus = null;
+      if (manualCheck && manualCheck === manualUpdatePending) {
+        manualUpdatePending = null;
+        manualUpdateResult = "Не удалось проверить обновление. Повторите позже.";
+      }
+      return true;
+    }
     const refreshStage = updateRefreshDiagnosticStage(
       updateStatus?.errorCode === "update_refresh_pending",
       status,
     );
     updateStatus = status;
+    const checkingSameOffer = status.phase === "checking" && status.protocol === 2 && status.supported;
+    if(updateDialogId && (updateDialogId!==status.offerId || (!canConfirmUpdate(status) && !checkingSameOffer)))updateDialogId=null;
+    if(!updateDialogId)updateDialogId=updatePrompt(status,updateUiVisible && view!=="sign_in");
+    if(manualCheck && manualCheck === manualUpdatePending && status.phase!=="checking" && status.errorCode!=="update_refresh_pending") {
+      manualUpdatePending=null;
+      if (status.errorCode?.startsWith("update_refresh_")) {
+        manualUpdateResult = "Не удалось проверить обновление. Повторите позже.";
+      } else if (status.phase === "ready_to_restart" || status.phase === "awaiting_installation") {
+        manualUpdateResult = updateMessage(status);
+      } else {
+        manualUpdateResult = status.updateAvailable && status.version
+          ? `Найдена версия ${status.version}`
+          : "У вас актуальная версия.";
+      }
+    }
     if (refreshStage) void nativeClient.recordStartupStage(refreshStage);
     const stage = updateDiagnosticStage(status.phase);
     const key = stage ? `${stage}:${status.version ?? "none"}` : null;
@@ -1290,31 +1388,56 @@
       lastRecordedUpdateState = key;
       void nativeClient.recordStartupStage(stage);
     }
+    return true;
   }
 
-  async function refreshUpdateOffer() {
+  async function refreshUpdateOffer(reason:"startup"|"manual"="manual") {
     if (!bootstrap) return;
-    await updateOfferRefresher.run(
-      () => nativeClient.refreshUpdate(),
+    const manualCheck = reason === "manual" ? { acknowledged: false } : null;
+    if(manualCheck){manualUpdatePending=manualCheck;manualUpdateResult="Проверяем…";}
+    let sequence: number | null = null;
+    const result=await updateOfferRefresher.run(
+      () => {
+        sequence = ++updateRequestSequence;
+        return nativeClient.checkUpdate(reason);
+      },
       (status) => {
-        observeUpdateStatus(status);
-        if (updateStatusNeedsPolling(status)) {
+        if (sequence === null) return;
+        if (manualCheck === manualUpdatePending && manualCheck) manualCheck.acknowledged = true;
+        const applied = observeUpdateStatus(status, sequence, manualCheck);
+        // A pre-ACK poll may already have applied a newer sequence. Preserve
+        // that presentation fence, but still request a fresh Manual result.
+        // Successful logout clears bootstrap and must not resurrect polling.
+        if ((!applied && bootstrap && manualCheck && manualCheck === manualUpdatePending)
+          || (applied && updateStatusNeedsPolling(status))) {
           clearUpdateTimer();
           updateTimer = window.setTimeout(refreshUpdateStatus, 500);
         }
       },
+      reason === "manual",
     );
+    if (!result && manualCheck && manualCheck === manualUpdatePending && sequence !== null) {
+      updateAppliedSequence = Math.max(updateAppliedSequence, sequence);
+      manualUpdatePending = null;
+      manualUpdateResult = "Не удалось проверить обновление. Повторите позже.";
+    }
   }
 
+  function showUpdatePrompt(){if(updateStatus && canConfirmUpdate(updateStatus))updateDialogId=updateStatus.offerId!;}
+  async function markUpdatePresented(){const id=updateDialogId;if(id)try{await nativeClient.presentedUpdate(id);}catch{await refreshUpdateStatus();}}
+  async function deferUpdate(){const id=updateDialogId;if(!id)return;try{observeUpdateStatus(await nativeClient.deferUpdate(id));updateDialogId=null;}catch(reason){error=commandMessage(reason,"update");await refreshUpdateStatus();}}
+
   async function installUpdate() {
-    if (updateBusy) return;
-    if (!await confirmProtectionTransition("update")) return;
+    const id=updateDialogId;
+    if (updateBusy || !id) return;
+    if (!await confirmProtectionTransition("update") || updateBusy || updateDialogId !== id) return;
     updateBusy = true;
     error = null;
     void nativeClient.recordStartupStage("update_install_requested");
     updateTimer = window.setTimeout(refreshUpdateStatus, 100);
     try {
-      observeUpdateStatus(await nativeClient.installUpdate());
+      observeUpdateStatus(await nativeClient.confirmUpdate(id));
+      updateDialogId=null;
     } catch (reason) {
       error = commandMessage(reason, "update");
       await refreshUpdateStatus();
@@ -1580,55 +1703,17 @@
       {/if}
     </section>
   {/if}
+  {#if updateDialogId && updateStatus && updateDialogId===updateStatus.offerId}
+    <UpdatePrompt status={updateStatus} visible={updateUiVisible} busy={updateBusy} onconfirm={installUpdate} onlater={deferUpdate} onpresented={markUpdatePresented}/>
+  {/if}
   {#if updateStatus && updateStatus.phase !== "idle" && view !== "sign_in"}
     <section class="update-banner" aria-live="polite">
-      <div>
-        <p class="eyebrow">Обновление</p>
-        {#if updateStatus.phase === "downloading"}
-          <strong>Загружаем Nelomai {updateStatus.version}</strong>
-          <span>{updateProgress(updateStatus)}</span>
-        {:else if updateStatus.phase === "ready_to_restart"}
-          <strong>Nelomai {updateStatus.version} готов к запуску</strong>
-          <span>Перезапустите приложение, чтобы завершить обновление.</span>
-        {:else if updateStatus.phase === "awaiting_installation"}
-          <strong>Подтвердите установку Nelomai {updateStatus.version}</strong>
-          <span>Завершите обновление в системном окне Android.</span>
-        {:else if updateStatus.phase === "failed"}
-          <strong>{updateStatus.errorCode === "apk_install_cancelled"
-            ? `Установка Nelomai ${updateStatus.version} отменена`
-            : `Не удалось установить Nelomai ${updateStatus.version}`}</strong>
-          <span>Можно повторить установку сейчас.</span>
-        {:else}
-          <strong>Доступна версия {updateStatus.version}</strong>
-          <span>
-            {updateStatus.supported
-              ? updateStatus.notes || "Обновление готово к загрузке."
-              : "Эту версию необходимо установить вручную."}
-          </span>
-        {/if}
-      </div>
-      {#if updateStatus.phase === "ready_to_restart"}
-        <button
-          class="primary-button update-action"
-          type="button"
-          onclick={restartForUpdate}
-          disabled={updateBusy}
-        >
-          Перезапустить
-        </button>
-      {:else if updateStatus.supported && updateStatus.phase !== "downloading"}
-        <button
-          class="secondary-button update-action"
-          type="button"
-          onclick={installUpdate}
-          disabled={updateBusy}
-        >
-          {updateBusy
-            ? "Начинаем…"
-            : updateStatus.phase === "awaiting_installation"
-              ? "Открыть снова"
-              : "Обновить"}
-        </button>
+      <div><p class="eyebrow">Обновление</p><strong>{updateStatus.version ? `Nelomai ${updateStatus.version}` : "Проверка версии"}</strong>
+      <span>{updateMessage(updateStatus)}</span>{#if updateStatus.phase==="downloading"}<span>{updateProgress(updateStatus)}</span>{/if}</div>
+      {#if updateStatus.phase==="ready_to_restart"}
+        <button class="primary-button update-action" type="button" onclick={restartForUpdate} disabled={updateBusy}>Перезапустить</button>
+      {:else if canConfirmUpdate(updateStatus)}
+        <button class="secondary-button update-action" type="button" onclick={showUpdatePrompt} disabled={updateBusy}>Обновить</button>
       {/if}
     </section>
   {/if}
@@ -2028,8 +2113,8 @@
             {:else}
             <label class="update-preference">
               <span>
-                <strong>Автоматические обновления</strong>
-                <small>Загружать новые версии в фоне</small>
+                <strong>Проверять и скачивать обновления</strong>
+                <small>{bootstrap?.device.platform === "android" ? "Проверять при открытии приложения. Установка — с вашего согласия." : "Проверять каждые 30 минут. Установка — с вашего согласия."}</small>
               </span>
               <input
                 type="checkbox"
@@ -2038,6 +2123,10 @@
               />
             </label>
             {/if}
+          {/if}
+          {#if updateStatus?.supported || (updateStatus === null && manualUpdateResult !== null)}
+            <button class="secondary-button" type="button" onclick={()=>refreshUpdateOffer("manual")} disabled={updateStatus?.phase==="checking"}>Проверить обновления</button>
+            {#if manualUpdateResult}<p aria-live="polite">{manualUpdateResult}</p>{/if}
           {/if}
           {#if runtimeStatus}
             <RuntimeSelector
@@ -2129,11 +2218,11 @@
             >
               {updateBusy ? "Открываем…" : "Открыть снова"}
             </button>
-          {:else if updateStatus.phase !== "downloading"}
+          {:else if canConfirmUpdate(updateStatus)}
             <button
               class="primary-button"
               type="button"
-              onclick={installUpdate}
+              onclick={showUpdatePrompt}
               disabled={updateBusy}
             >
               {updateBusy ? "Начинаем…" : "Обновить"}

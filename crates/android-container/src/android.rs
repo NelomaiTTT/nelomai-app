@@ -61,6 +61,8 @@ fn failure(env: &mut JNIEnv) {
 struct Callbacks {
     vm: Arc<JavaVM>,
     object: GlobalRef,
+    stop_gate: Arc<tokio::sync::Mutex<()>>,
+    revoke_gate: Arc<tokio::sync::Mutex<()>>,
 }
 enum Call {
     Revoke(u64),
@@ -73,7 +75,7 @@ enum Call {
     ReleaseOwnerReload(u32, bool),
 }
 impl Callbacks {
-    fn install_apk(&self, path: &str, version: &str, signer: &str) -> Result<bool, ()> {
+    fn apk(&self, method: &str, path: &str, version: &str, signer: &str) -> Result<bool, ()> {
         let mut env = self.vm.attach_current_thread().map_err(|_| ())?;
         let path = env.new_string(path).map_err(|_| ())?;
         let version = env.new_string(version).map_err(|_| ())?;
@@ -81,7 +83,7 @@ impl Callbacks {
         let result = env
             .call_method(
                 self.object.as_obj(),
-                "installApk",
+                method,
                 "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z",
                 &[
                     JValue::Object(&path),
@@ -216,6 +218,27 @@ impl nelomai_client_container::host::NativeRuntimeStorage for Native {
 }
 #[async_trait::async_trait]
 impl nelomai_client_updater::AndroidApkInstaller for Native {
+    async fn validate_apk(
+        &self,
+        path: &std::path::Path,
+        version: &str,
+        signer: &str,
+    ) -> Result<(), nelomai_client_updater::UpdateBackendError> {
+        let callback = self.0.clone();
+        let path = path.to_string_lossy().into_owned();
+        let version = version.to_owned();
+        let signer = signer.to_owned();
+        match tokio::task::spawn_blocking(move || {
+            callback.apk("validateApk", &path, &version, &signer)
+        })
+        .await
+        {
+            Ok(Ok(true)) => Ok(()),
+            _ => Err(nelomai_client_updater::UpdateBackendError::new(
+                "apk_validation_failed",
+            )),
+        }
+    }
     async fn install_apk(
         &self,
         path: &std::path::Path,
@@ -227,7 +250,7 @@ impl nelomai_client_updater::AndroidApkInstaller for Native {
         let path = path.to_string_lossy().into_owned();
         let version = version.to_owned();
         let signer = signer.to_owned();
-        tokio::task::spawn_blocking(move || callback.install_apk(&path, &version, &signer))
+        tokio::task::spawn_blocking(move || callback.apk("installApk", &path, &version, &signer))
             .await
             .map_err(|_| {
                 nelomai_client_updater::UpdateBackendError::new("apk_installer_unavailable")
@@ -240,16 +263,37 @@ impl nelomai_client_updater::AndroidApkInstaller for Native {
 impl Native {
     async fn call(&self, call: Call) -> Result<Option<String>, BrokerError> {
         let callback = self.0.clone();
-        tokio::task::spawn_blocking(move || callback.call(call))
-            .await
-            .map_err(|_| BrokerError::RecoveryRequired)?
-            .map_err(|_| BrokerError::RecoveryRequired)
+        // Rust timeout cancels the waiter, not an executing JNI callback.
+        // Each gate survives timeout of its Rust waiter. Stop and
+        // revocation have independent budgets and can still run together.
+        let in_flight = match &call {
+            Call::Stop(_) => Some(callback.stop_gate.clone().lock_owned().await),
+            Call::Revoke(_) => Some(callback.revoke_gate.clone().lock_owned().await),
+            _ => None,
+        };
+        tokio::task::spawn_blocking(move || {
+            let _in_flight = in_flight;
+            callback.call(call)
+        })
+        .await
+        .map_err(|_| BrokerError::RecoveryRequired)?
+        .map_err(|_| BrokerError::RecoveryRequired)
     }
 }
 #[async_trait::async_trait]
 impl LocalAuthStop for Native {
     async fn stop_local(&self) -> Result<(), BrokerError> {
+        // Password Login performs this stop before issuing new credentials.
+        // Wait for any previously dispatched revocation to finish first.
+        drop(self.0.revoke_gate.lock().await);
         self.call(Call::Stop(false)).await.map(|_| ())
+    }
+    async fn stop_local_until(&self, deadline: tokio::time::Instant) -> Result<(), BrokerError> {
+        // Logout has already fenced auth and drives stop/revocation in parallel.
+        tokio::time::timeout_at(deadline, self.call(Call::Stop(false)))
+            .await
+            .map_err(|_| BrokerError::Timeout)?
+            .map(|_| ())
     }
     async fn prepare_revocation(&self, epoch: u64) -> Result<(), BrokerError> {
         self.call(Call::Revoke(epoch)).await.map(|_| ())
@@ -362,6 +406,8 @@ pub extern "system" fn Java_ru_nelomai_client_RuntimeNativeHost_nativeOpen(
         let native = Arc::new(Native(Arc::new(Callbacks {
             vm: vm.clone(),
             object: env.new_global_ref(callbacks).map_err(|_| ())?,
+            stop_gate: Arc::new(tokio::sync::Mutex::new(())),
+            revoke_gate: Arc::new(tokio::sync::Mutex::new(())),
         })));
         let cache = env
             .call_method(context.as_obj(), "getCacheDir", "()Ljava/io/File;", &[])
@@ -453,10 +499,12 @@ pub extern "system" fn Java_ru_nelomai_client_RuntimeNativeHost_nativeSelection(
 ) -> jstring {
     let result = (|| -> Result<_, ()> {
         let host = host(id)?;
-        let selection = host
+        let (selection, authorization) = host
             .runtime
-            .block_on(host.owner.selection())
+            .block_on(host.owner.android_selection())
             .map_err(|_| ())?;
+        let mut selection = serde_json::to_value(selection).map_err(|_| ())?;
+        selection["vpn_authorization"] = serde_json::to_value(authorization).map_err(|_| ())?;
         let json = serde_json::to_string(&selection).map_err(|_| ())?;
         env.new_string(json).map(|s| s.into_raw()).map_err(|_| ())
     })();
@@ -467,6 +515,17 @@ pub extern "system" fn Java_ru_nelomai_client_RuntimeNativeHost_nativeSelection(
             std::ptr::null_mut()
         }
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_ru_nelomai_client_RuntimeNativeHost_nativeUpdateUiForeground(
+    _: JNIEnv,
+    _: JObject,
+    id: jlong,
+) -> jboolean {
+    host(id)
+        .is_ok_and(|host| host.owner.update_ui_foreground())
+        .into()
 }
 
 #[no_mangle]

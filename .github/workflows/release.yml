@@ -11,6 +11,14 @@ on:
           - "publish_approved_candidate"
         default: "build_only"
         required: true
+      release_scope:
+        description: "Состав выпуска: все платформы или только Android"
+        type: "choice"
+        options:
+          - "all"
+          - "android"
+        default: "all"
+        required: true
       source_sha:
         description: "Полный immutable source SHA; dispatch ref должен совпадать"
         type: "string"
@@ -47,6 +55,7 @@ defaults:
 env:
   SOURCE_SHA: "${{ inputs.source_sha }}"
   RELEASE_MODE: "${{ inputs.mode }}"
+  RELEASE_SCOPE: "${{ inputs.release_scope }}"
   RELEASE_VERSION: "${{ inputs.version }}"
   GH_TOKEN: "${{ github.token }}"
   NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64: "${{ vars.NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64 }}"
@@ -108,27 +117,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          -
-            platform: "linux"
-            architecture: "x86_64"
-            runner: "ubuntu-22.04"
-            rust_target: "x86_64-unknown-linux-gnu"
-          -
-            platform: "windows"
-            architecture: "x86_64"
-            runner: "windows-2022"
-            rust_target: "x86_64-pc-windows-msvc"
-          -
-            platform: "macos"
-            architecture: "aarch64"
-            runner: "macos-15"
-            rust_target: "aarch64-apple-darwin"
-          -
-            platform: "android"
-            architecture: "aarch64"
-            runner: "ubuntu-22.04"
-            rust_target: "aarch64-linux-android"
+        include: "${{ fromJSON(inputs.release_scope == 'android' && '[{\"platform\":\"android\",\"architecture\":\"aarch64\",\"runner\":\"ubuntu-22.04\",\"rust_target\":\"aarch64-linux-android\"}]' || '[{\"platform\":\"linux\",\"architecture\":\"x86_64\",\"runner\":\"ubuntu-22.04\",\"rust_target\":\"x86_64-unknown-linux-gnu\"},{\"platform\":\"windows\",\"architecture\":\"x86_64\",\"runner\":\"windows-2022\",\"rust_target\":\"x86_64-pc-windows-msvc\"},{\"platform\":\"macos\",\"architecture\":\"aarch64\",\"runner\":\"macos-15\",\"rust_target\":\"aarch64-apple-darwin\"},{\"platform\":\"android\",\"architecture\":\"aarch64\",\"runner\":\"ubuntu-22.04\",\"rust_target\":\"aarch64-linux-android\"}]') }}"
     runs-on: "${{ matrix.runner }}"
     env:
       PLATFORM: "${{ matrix.platform }}"
@@ -219,7 +208,7 @@ jobs:
           python scripts/download-confirmed-stable.py --output "$RUNNER_TEMP/confirmed-stable" --public-key "$RUNNER_TEMP/stable-public.raw"
           root_sha=$(python scripts/sign-runtime-candidate.py --mode "$RELEASE_MODE" --source-sha "$SOURCE_SHA" \
             --version "$RELEASE_VERSION" --confirmed-stable "$RUNNER_TEMP/confirmed-stable" --stable-public-key "$RUNNER_TEMP/stable-public.raw" \
-            --drafts drafts --output signed --signing-key "$RUNNER_TEMP/runtime-private.raw" --public-key "$RUNNER_TEMP/runtime-public.raw")
+            --scope "$RELEASE_SCOPE" --drafts drafts --output signed --signing-key "$RUNNER_TEMP/runtime-private.raw" --public-key "$RUNNER_TEMP/runtime-public.raw")
           echo "root_sha256=$root_sha" >> "$GITHUB_OUTPUT"
         id: "sign"
       -
@@ -237,27 +226,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          -
-            platform: "linux"
-            architecture: "x86_64"
-            runner: "ubuntu-22.04"
-            rust_target: "x86_64-unknown-linux-gnu"
-          -
-            platform: "windows"
-            architecture: "x86_64"
-            runner: "windows-2022"
-            rust_target: "x86_64-pc-windows-msvc"
-          -
-            platform: "macos"
-            architecture: "aarch64"
-            runner: "macos-15"
-            rust_target: "aarch64-apple-darwin"
-          -
-            platform: "android"
-            architecture: "aarch64"
-            runner: "ubuntu-22.04"
-            rust_target: "aarch64-linux-android"
+        include: "${{ fromJSON(inputs.release_scope == 'android' && '[{\"platform\":\"android\",\"architecture\":\"aarch64\",\"runner\":\"ubuntu-22.04\",\"rust_target\":\"aarch64-linux-android\"}]' || '[{\"platform\":\"linux\",\"architecture\":\"x86_64\",\"runner\":\"ubuntu-22.04\",\"rust_target\":\"x86_64-unknown-linux-gnu\"},{\"platform\":\"windows\",\"architecture\":\"x86_64\",\"runner\":\"windows-2022\",\"rust_target\":\"x86_64-pc-windows-msvc\"},{\"platform\":\"macos\",\"architecture\":\"aarch64\",\"runner\":\"macos-15\",\"rust_target\":\"aarch64-apple-darwin\"},{\"platform\":\"android\",\"architecture\":\"aarch64\",\"runner\":\"ubuntu-22.04\",\"rust_target\":\"aarch64-linux-android\"}]') }}"
     runs-on: "${{ matrix.runner }}"
     env:
       ROOT_SHA256: "${{ needs.sign.outputs.root_sha256 }}"
@@ -302,7 +271,7 @@ jobs:
           if [ "$PLATFORM" = android ]; then extra+=(--ndk "$NDK_HOME"); fi
           python scripts/package-release-platform.py --mode "$RELEASE_MODE" --source-sha "$SOURCE_SHA" \
             --release-set-sha256 "$ROOT_SHA256" --platform "$PLATFORM" --architecture "$ARCHITECTURE" \
-            --signed signed --draft "draft/$PLATFORM" --public-key "$RUNNER_TEMP/runtime-public.raw" \
+            --scope "$RELEASE_SCOPE" --signed signed --draft "draft/$PLATFORM" --public-key "$RUNNER_TEMP/runtime-public.raw" \
             --output "packages/$PLATFORM" "${extra[@]}"
       -
         uses: "actions/upload-artifact@v4"
@@ -361,7 +330,9 @@ jobs:
         name: "Keep platform and purpose separation"
         run: |
           mkdir packages
-          for platform in linux windows macos android; do mv "package-downloads/packages-$platform" "packages/$platform"; done
+          platforms=(linux windows macos android)
+          if [ "$RELEASE_SCOPE" = android ]; then platforms=(android); fi
+          for platform in "${platforms[@]}"; do mv "package-downloads/packages-$platform" "packages/$platform"; done
       -
         name: "Phase-local trust"
         run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --phase finalization --public-key \"$RUNNER_TEMP/runtime-public.raw\" --private-key \"$RUNNER_TEMP/runtime-private.raw\""
@@ -381,7 +352,7 @@ jobs:
         name: "Final shipping installer/updater signatures"
         run: |
           python scripts/finalize-release-candidate.py --mode "$RELEASE_MODE" --source-sha "$SOURCE_SHA" \
-            --release-set-sha256 "$ROOT_SHA256" --packages packages --signed signed --output finalized \
+            --scope "$RELEASE_SCOPE" --release-set-sha256 "$ROOT_SHA256" --packages packages --signed signed --output finalized \
             --public-key "$RUNNER_TEMP/runtime-public.raw" --private-key "$RUNNER_TEMP/runtime-private.raw" \
             --work "$RUNNER_TEMP/finalization" --sdk "$ANDROID_HOME" > final-result.json
           python -c 'import json,os; d=json.load(open("final-result.json")); f=open(os.environ["GITHUB_OUTPUT"],"a"); f.write("inventory_sha256="+d["inventory_sha256"]+"\n")'
@@ -458,8 +429,10 @@ jobs:
         name: "Publish selected build without signature or acceptance gates"
         run: |
           python scripts/check-publication-inputs.py --directory candidate --source-sha "$SOURCE_SHA" \
-            --run-id "$CANDIDATE_RUN"
+            --run-id "$CANDIDATE_RUN" --scope "$RELEASE_SCOPE"
           python scripts/release-candidate-gates.py tag --repository "$GITHUB_REPOSITORY" --version "$RELEASE_VERSION" --source-sha "$SOURCE_SHA"
-          mapfile -t assets < <(python -c 'import importlib.util; s=importlib.util.spec_from_file_location("g","scripts/release-candidate-gates.py"); g=importlib.util.module_from_spec(s); s.loader.exec_module(g); print("\n".join("candidate/"+n for n in sorted(g.PUBLISH_ASSETS)))')
-          test "${#assets[@]}" -eq 22
-          gh release create "v$RELEASE_VERSION" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --title "Nelomai $RELEASE_VERSION" --notes "$RELEASE_NOTES"
+          mapfile -t assets < <(python -c 'import importlib.util,os; s=importlib.util.spec_from_file_location("g","scripts/release-candidate-gates.py"); g=importlib.util.module_from_spec(s); s.loader.exec_module(g); print("\n".join("candidate/"+n for n in sorted(g.publish_assets(os.environ["RELEASE_SCOPE"]))))')
+          expected=22
+          if [ "$RELEASE_SCOPE" = android ]; then expected=10; fi
+          test "${#assets[@]}" -eq "$expected"
+          gh release create "v$RELEASE_VERSION" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --title "Nelomai $RELEASE_VERSION" --notes "$RELEASE_NOTES" --latest

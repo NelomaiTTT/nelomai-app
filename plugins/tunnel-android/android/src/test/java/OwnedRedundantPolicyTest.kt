@@ -6,6 +6,20 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class OwnedRedundantPolicyTest {
+    @Test fun failedRouteRefreshClosesTheNativePairAndLeavesRecoveryAvailable() {
+        val f = Fixture()
+        val before = f.store.read()
+        f.failTunStarts = setOf(2)
+
+        assertFalse(f.coordinator.refreshLocalRoutes(true) { false })
+
+        assertEquals(2, f.tunStarts)
+        assertEquals(before, f.store.read())
+        assertFalse(f.native.isUsable("lease-a"))
+        assertFalse(f.native.isUsable("lease-b"))
+        assertEquals(0, f.panelCalls)
+    }
+
     @Test fun pendingRoleObservationSurvivesPolicyApplication() {
         val f = Fixture(panelOverride = PolicyRepairPanel())
         try {
@@ -324,7 +338,7 @@ class OwnedRedundantPolicyTest {
         assertTrue(f.native.closeForStop())
         assertTrue(replacementRetained.all { bytes -> bytes.all { it == 0.toByte() } })
         val starts = f.tunStarts
-        assertFalse(f.native.replacePolicy(f.policy) { false })
+        assertEquals(RedundantPolicyReplacement.FAILED, f.native.replacePolicy(f.policy) { false })
         assertEquals(starts, f.tunStarts)
     }
 
@@ -336,7 +350,12 @@ class OwnedRedundantPolicyTest {
     }
 
     internal class Fixture(active: String = "lease-a", egressMode: String = "ipv4",
-        panelOverride: RedundantConnectionPanel? = null) {
+        panelOverride: RedundantConnectionPanel? = null,
+        initialHealthProbes: Map<String, BackgroundRedundantHealthProbe> = emptyMap(),
+        monotonicMs: () -> Long = { System.nanoTime() / 1_000_000L },
+        startupNetworkUpdatePending: () -> Boolean = { false },
+        onPrimaryFailed: () -> Unit = {},
+    ) {
         val record = PolicyRecord()
         fun coldStore() = AndroidRecoveryStore(record, object : BootIdentityProvider {
             override fun bootCount() = 1L
@@ -382,13 +401,17 @@ class OwnedRedundantPolicyTest {
                 panelCalls++; error("unexpected server stop")
             }
         }
-        val coordinator = testRedundantCoordinator(store, panel, native)
+        val coordinator = RedundantConnectionCoordinator(store, panel, native, monotonicMs = monotonicMs,
+            standbyExecutor = java.util.concurrent.Executor { it.run() },
+            startupNetworkUpdatePending = startupNetworkUpdatePending)
         init {
             record.write(AndroidRecoveryEnvelopeCodec.encode(AndroidRecoveryEnvelope.empty(1)))
             val tx = AndroidRedundantTransaction(true,
                 AndroidIntentTemplate("11111111-1111-4111-8111-111111111111", "account", "stray", "dynamic", "standalone", egressMode, true),
                 "22222222-2222-4222-8222-222222222222", "lease-a", "lease-b", active, true, 4, 7, "operation", "fingerprint")
-            assertTrue("start failed: ${store.read()}", coordinator.start(tx, mapOf("lease-a" to initialBytes[0], "lease-b" to initialBytes[1])))
+            assertTrue("start failed: ${store.read()}", coordinator.start(tx,
+                mapOf("lease-a" to initialBytes[0], "lease-b" to initialBytes[1]), initialHealthProbes,
+                onPrimaryFailed = onPrimaryFailed))
         }
         fun apply(options: AndroidTunnelOptions = policy) = coordinator.applyOwnedPolicy(scope, options) { cancelled }
     }
@@ -396,7 +419,11 @@ class OwnedRedundantPolicyTest {
     internal class PolicyRecord : EncryptedRecordBackend {
         var bytes: ByteArray? = null
         var failNextWrite = false
-        override fun read(): ByteArray? = bytes?.copyOf()
+        var beforeRead: () -> Unit = {}
+        override fun read(): ByteArray? {
+            beforeRead()
+            return bytes?.copyOf()
+        }
         override fun write(plaintext: ByteArray): Boolean {
             if (failNextWrite) { failNextWrite = false; return false }
             bytes = plaintext.copyOf()

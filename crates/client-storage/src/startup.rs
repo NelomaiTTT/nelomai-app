@@ -52,6 +52,9 @@ pub struct PreparedRuntimeStorage<R> {
     pub runtime: ProtectedRuntimeStore<R>,
     pub retained: Vec<ProtectedRuntimeStore<R>>,
     pub migration: Option<MigrationOutcome>,
+    /// Protected inventory has no authenticated runtime or unfinished logout.
+    /// The container still checks its own switch and updater journals.
+    pub can_admit_signed_out_android: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -181,12 +184,22 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
     if known.len() > 64 {
         return recovery();
     }
+    let current_auth = auth.load()?;
     let mut occupied = Vec::new();
     let mut pending = Vec::new();
     // The owner lock excludes live writers during startup. Keep just the
     // selected validated value for pre-write decisions, not a lasting cache.
     // Post-write verification below must still read the protected store anew.
     let mut current_runtime = None;
+    let mut signed_out_inventory = selected == RuntimeSlot::Latest
+        && manifest.latest().platform == "android"
+        && marker.as_ref().is_some_and(|marker| marker.committed)
+        && migration_record.as_ref().is_none_or(|record| {
+            record.phase == MigrationPhase::Complete && record.pending_write.is_none()
+        })
+        && current_auth
+            .as_ref()
+            .is_some_and(AuthStoreV1::is_signed_out_without_cleanup);
     for namespace in &known {
         let paths = paths_from_namespace(root, namespace)?;
         let state = ProtectedRuntimeStore::new(records.record(namespace), paths.clone());
@@ -194,6 +207,14 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
         if loaded.is_some() {
             occupied.push(namespace.clone());
         }
+        signed_out_inventory = signed_out_inventory
+            && loaded
+                .as_ref()
+                .is_none_or(|state| state.auth_scope.is_none() && state.operationally_empty())
+            && matches!(
+                fs::symlink_metadata(paths.operational_state.with_file_name("logout-intent-v1.json")),
+                Err(error) if error.kind() == io::ErrorKind::NotFound
+            );
         if namespace == selected_paths.namespace() {
             current_runtime = loaded;
         }
@@ -205,7 +226,6 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
             pending.push((namespace.clone(), value));
         }
     }
-    let current_auth = auth.load()?;
     let split = FileSplitTunnelStore::new(root);
     let split_exists = match fs::symlink_metadata(split.path()) {
         Ok(_) => true,
@@ -291,6 +311,7 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
                 selected_paths.namespace(),
             )?,
             migration: Some(outcome),
+            can_admit_signed_out_android: false,
         });
     }
     if split_exists {
@@ -353,6 +374,15 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
                     selected_paths.namespace(),
                 )?,
                 migration: None,
+                can_admit_signed_out_android: signed_out_inventory
+                    && migration_record.as_ref().is_none_or(|record| {
+                        record.install_sha256 == marker.install_sha256
+                            && marker.namespaces.contains(&record.runtime_namespace)
+                    })
+                    && marker
+                        .namespaces
+                        .iter()
+                        .all(|namespace| occupied.contains(namespace)),
             });
         }
     }
@@ -442,6 +472,7 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
         runtime,
         retained: Vec::new(),
         migration: None,
+        can_admit_signed_out_android: false,
     })
 }
 

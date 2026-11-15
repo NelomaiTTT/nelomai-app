@@ -55,3 +55,25 @@ describe("update offer refresher", () => {
     expect(lastStatus).toBe(initial);
   });
 });
+
+
+describe("explicit update check intent", () => {
+  it.each([false, true])("delivers Manual during an automatic check (failure=%s)", async (fail) => {
+    const old = deferred<TestStatus>();
+    const manual = deferred<TestStatus>();
+    const refresher = new UpdateOfferRefresher<TestStatus>();
+    const oldApply = vi.fn();
+    const apply = vi.fn();
+    const load = vi.fn(() => manual.promise);
+    const first = refresher.run(() => old.promise, oldApply);
+    const second = refresher.run(load, apply, true);
+    expect(load).toHaveBeenCalledOnce();
+    expect(second).not.toBe(first);
+    if (fail) manual.reject(new Error("manual failed"));
+    else manual.resolve({ phase: "available" });
+    await expect(second).resolves.toEqual(fail ? null : { phase: "available" });
+    expect(apply).toHaveBeenCalledTimes(fail ? 0 : 1);
+    old.resolve({ phase: "idle" });
+    await first;
+  });
+});

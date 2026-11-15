@@ -205,9 +205,20 @@ internal data class AndroidRedundantRetryState(
     val pendingNativeMembershipGeneration: Long? = null,
     val pendingNativeSwitchReason: String? = null,
     val pendingNativeSwitchAttempt: Int = 0,
+    val pendingNativeRequiresProbe: Boolean = false,
     val totalLossRestartReplay: AndroidStartReplay? = null,
     val totalLossIntentGeneration: Long? = null,
     val totalLossSourceStartOperationId: String? = null,
+)
+
+internal fun AndroidRedundantRetryState.clearPendingNativeSwitch(): AndroidRedundantRetryState = copy(
+    pendingNativeSourceLeaseId = null,
+    pendingNativeActiveLeaseId = null,
+    pendingNativeActiveSlot = null,
+    pendingNativeMembershipGeneration = null,
+    pendingNativeSwitchReason = null,
+    pendingNativeSwitchAttempt = 0,
+    pendingNativeRequiresProbe = false,
 )
 
 /** Safe recovery-v2 control state. Configurations and private keys remain ephemeral. */
@@ -534,6 +545,7 @@ internal object AndroidRecoveryEnvelopeCodec {
                 put("pendingNativeSwitchReason", it)
             }
             put("pendingNativeSwitchAttempt", transaction.retry.pendingNativeSwitchAttempt)
+            if (transaction.retry.pendingNativeRequiresProbe) put("pendingNativeRequiresProbe", true)
             transaction.retry.totalLossRestartReplay?.let { replay ->
                 put("totalLossRestartReplay", JSONObject().apply {
                     put("startOperationId", replay.startOperationId)
@@ -610,6 +622,7 @@ internal object AndroidRecoveryEnvelopeCodec {
                 ),
                 pendingNativeSwitchReason = retry.optionalString("pendingNativeSwitchReason"),
                 pendingNativeSwitchAttempt = retry.optInt("pendingNativeSwitchAttempt", 0),
+                pendingNativeRequiresProbe = retry.optBoolean("pendingNativeRequiresProbe", false),
                 totalLossRestartReplay = totalLossRestartReplay,
                 totalLossIntentGeneration = retry.optionalLong("totalLossIntentGeneration"),
                 totalLossSourceStartOperationId = retry.optionalString(
@@ -809,6 +822,7 @@ internal object AndroidRecoveryEnvelopeCodec {
             }
             if (transaction.retry.pendingNativeActiveLeaseId == null) {
                 require(transaction.retry.pendingNativeSwitchAttempt == 0)
+                require(!transaction.retry.pendingNativeRequiresProbe)
             }
             val totalLossFields = listOf(
                 transaction.retry.totalLossRestartReplay,
@@ -993,6 +1007,7 @@ internal class AndroidRecoveryStore(
 
     fun beginRedundant(
         transaction: AndroidRedundantTransaction,
+        ownerCurrent: () -> Boolean = { true },
     ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
         val currentResult = readLocked()
         if (currentResult is RecoveryStoreResult.Failure) return@synchronized currentResult
@@ -1001,6 +1016,7 @@ internal class AndroidRecoveryStore(
         if (current.leaseTransaction != null || current.redundantTransaction != null) {
             return@synchronized RecoveryStoreResult.Failure("connection_cleanup_pending")
         }
+        if (!ownerCurrent()) return@synchronized generationConflict()
         try {
             persist(current.copy(
                 intent = current.intent.copy(
@@ -1182,14 +1198,8 @@ internal class AndroidRecoveryStore(
             backgroundCleanupOnStop = if (transaction.stopOperationId == null) {
                 transaction.asyncStopSupported && transaction.retry.totalLossRestartReplay != null
             } else transaction.backgroundCleanupOnStop,
-            retry = transaction.retry.copy(
+            retry = transaction.retry.clearPendingNativeSwitch().copy(
                 stopState = RedundantStopState.PENDING,
-                pendingNativeSourceLeaseId = null,
-                pendingNativeActiveLeaseId = null,
-                pendingNativeActiveSlot = null,
-                pendingNativeMembershipGeneration = null,
-                pendingNativeSwitchReason = null,
-                pendingNativeSwitchAttempt = 0,
             ),
         )
     }
@@ -1241,7 +1251,7 @@ internal class AndroidRecoveryStore(
                 } else transaction.retainActivePeerOnStop,
                 candidateLeaseId = null,
                 candidateSlot = null,
-                retry = transaction.retry.copy(
+                retry = transaction.retry.clearPendingNativeSwitch().copy(
                     stopState = RedundantStopState.PENDING,
                     roleObservationPending = pendingReadiness,
                     pendingRoleLeaseId = transaction.retry.pendingRoleLeaseId.takeIf { pendingReadiness },
@@ -1250,12 +1260,6 @@ internal class AndroidRecoveryStore(
                     acquireOperationId = null,
                     acquireReplaceLeaseId = null,
                     standbyReleasePending = false,
-                    pendingNativeSourceLeaseId = null,
-                    pendingNativeActiveLeaseId = null,
-                    pendingNativeActiveSlot = null,
-                    pendingNativeMembershipGeneration = null,
-                    pendingNativeSwitchReason = null,
-                    pendingNativeSwitchAttempt = 0,
                     sessionStalledRecorded = false,
                     totalLossRestartReplay = null,
                     totalLossIntentGeneration = null,
@@ -1269,6 +1273,7 @@ internal class AndroidRecoveryStore(
         expectedGeneration: Long,
         template: AndroidIntentTemplate,
         replay: AndroidStartReplay,
+        ownerCurrent: () -> Boolean = { true },
     ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
         val currentResult = readLocked()
         if (currentResult is RecoveryStoreResult.Failure) return@synchronized currentResult
@@ -1319,17 +1324,20 @@ internal class AndroidRecoveryStore(
         } catch (_: Throwable) {
             return@synchronized RecoveryStoreResult.Failure("connection_intent_invalid")
         }
+        if (!ownerCurrent()) return@synchronized generationConflict()
         persist(next)
     }
 
     fun setDesiredActive(
         expectedGeneration: Long,
         desiredActive: Boolean,
+        ownerCurrent: () -> Boolean = { true },
     ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
         val currentResult = readLocked()
         if (currentResult is RecoveryStoreResult.Failure) return@synchronized currentResult
         val current = (currentResult as RecoveryStoreResult.Success).value
         if (current.intent.generation != expectedGeneration) return@synchronized generationConflict()
+        if (!ownerCurrent()) return@synchronized generationConflict()
         setDesiredActiveLocked(current, desiredActive)
     }
 
@@ -1381,7 +1389,8 @@ internal class AndroidRecoveryStore(
                     desiredActive = desiredActive,
                     retry = AndroidRetryState(
                         pendingAction = "legacy_runtime_stop".takeIf {
-                            leaseLessRuntimeStop && !desiredActive
+                            !desiredActive && (leaseLessRuntimeStop ||
+                                current.intent.retry.pendingAction == "legacy_runtime_stop")
                         },
                     ),
                 ),
@@ -1412,6 +1421,25 @@ internal class AndroidRecoveryStore(
         )
     }
 
+    fun dispatchLegacyRuntimeStop(
+        expectedGeneration: Long,
+        dispatch: () -> Unit,
+    ): RecoveryStoreResult<Boolean> = synchronized(gate) {
+        when (val result = readLocked()) {
+            is RecoveryStoreResult.Failure -> result
+            is RecoveryStoreResult.Success -> {
+                val current = result.value
+                val matches = current.intent.generation == expectedGeneration &&
+                    !current.intent.desiredActive && current.leaseTransaction == null &&
+                    current.intent.retry.pendingAction == "legacy_runtime_stop"
+                // Reserve the native operation before any new intent can commit.
+                // The caller waits for native completion outside the store gate.
+                if (matches) dispatch()
+                RecoveryStoreResult.Success(matches)
+            }
+        }
+    }
+
     fun completeLegacyRuntimeStop(
         expectedGeneration: Long,
     ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
@@ -1434,6 +1462,7 @@ internal class AndroidRecoveryStore(
         template: AndroidIntentTemplate,
         replay: AndroidStartReplay,
         stopOperationId: String,
+        ownerCurrent: () -> Boolean = { true },
     ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
         val currentResult = readLocked()
         if (currentResult is RecoveryStoreResult.Failure) return@synchronized currentResult
@@ -1485,6 +1514,7 @@ internal class AndroidRecoveryStore(
             replay = normalizeReplay(replay),
             localStopPending = false,
         )
+        if (!ownerCurrent()) return@synchronized generationConflict()
         persist(
             current.copy(
                 intent = current.intent.copy(
@@ -2269,7 +2299,7 @@ internal class AndroidRecoveryStore(
                     desiredActive = false,
                     candidateLeaseId = null,
                     candidateSlot = null,
-                    retry = transaction.retry.copy(
+                    retry = transaction.retry.clearPendingNativeSwitch().copy(
                         roleObservationPending = false,
                         pendingRoleLeaseId = null,
                         pendingRoleReason = null,
@@ -2277,12 +2307,6 @@ internal class AndroidRecoveryStore(
                         acquireOperationId = null,
                         acquireReplaceLeaseId = null,
                         standbyReleasePending = false,
-                        pendingNativeSourceLeaseId = null,
-                        pendingNativeActiveLeaseId = null,
-                        pendingNativeActiveSlot = null,
-                        pendingNativeMembershipGeneration = null,
-                        pendingNativeSwitchReason = null,
-                        pendingNativeSwitchAttempt = 0,
                         sessionStalledRecorded = false,
                         totalLossRestartReplay = null,
                         totalLossIntentGeneration = null,

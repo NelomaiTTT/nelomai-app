@@ -74,6 +74,7 @@ class RuntimeVpnNotificationTest {
         val service = controller.get()
 
         val result = service.onStartCommand(null, 0, 4)
+        shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(11))
 
         assertEquals(Service.START_NOT_STICKY, result)
         assertEquals(0, service.getSystemService(NotificationManager::class.java).activeNotifications.size)

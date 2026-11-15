@@ -377,6 +377,7 @@ internal object BackgroundCredentialEnvelopeCodec {
 internal class BackgroundCredentialStore(
     private val backend: EncryptedRecordBackend,
     private val nowMillis: () -> Long = System::currentTimeMillis,
+    private val logoutGeneration: ((Long, String) -> Long)? = null,
 ) {
     private val gate = Any()
     // The executor captures provenance once; it cannot acquire a newer revision
@@ -415,7 +416,8 @@ internal class BackgroundCredentialStore(
             ) throw MutationFailure("background_owner_cancelled")
             val hasCredentials = current.deviceId != null || current.installSecret != null ||
                 current.active != null || current.pending != null || current.cleanupCredential != null
-            val finalizedClean = current.logoutState?.phase == BackgroundLogoutPhase.FINALIZED &&
+            val finalizedClean = (current.logoutState?.phase == BackgroundLogoutPhase.FINALIZED ||
+                (current.logoutState == null && current.ownerCancelEpoch != null)) &&
                 current.installSecret == null && current.active == null && current.previous == null &&
                 current.pending == null && current.reservation == null && current.cleanupCredential == null &&
                 (current.ownerScope == null || operation.scope.authEpoch > current.ownerScope.authEpoch)
@@ -437,27 +439,56 @@ internal class BackgroundCredentialStore(
             // before the completed other-slot hop, only through bearer provisioning.
             // Unfinished mutations remain durable for the provision dispatcher;
             // logout and cleanup state remain fenced.
+            val unissued = current.installSecret == null && current.active == null && current.previous == null &&
+                current.pending == null && current.reservation == null && current.cleanupCredential == null
             val successorProvision = provision != null && provision.ownerScope == operation.scope &&
                 current.ownerScope?.let {
                     operation.scope.isSuccessorOf(it, operation.provisionPredecessor)
                 } == true &&
+                provision.deviceId == operation.scope.deviceId && (unissued || current.deviceId == provision.deviceId) &&
+                ((unissued && current.panelBase == null) || current.panelBase == provision.panelBase) && provision.accessToken.isNotBlank() &&
+                provision.installSecret.isNotBlank() && (unissued || current.installSecret == provision.installSecret) &&
+                // A completed earlier logout remains fenced after a new login.
+                // Only the newer authenticated epoch may advance its runtime scope.
+                current.ownerCancelEpoch?.let { operation.scope.authEpoch > it } != false &&
+                (current.logoutState == null || unissued) && current.cleanupCredential == null &&
+                (current.active != null || unissued)
+            // Logout in the other slot revokes this retained token without
+            // rewriting its namespace. A strictly newer authenticated login
+            // may re-enrol it, but never replay old recovery or unfinished work.
+            val newLoginProvision = provision != null && provision.ownerScope == operation.scope &&
+                current.ownerScope?.let {
+                    operation.scope.authEpoch > it.authEpoch && operation.scope.deviceId == it.deviceId &&
+                        operation.scope.slot == it.slot && operation.scope.runtimeVersion == it.runtimeVersion &&
+                        operation.scope.runtimeContractVersion == it.runtimeContractVersion &&
+                        operation.scope.sessionGeneration > it.sessionGeneration
+                } == true &&
+                operation.provisionPredecessor?.let {
+                    it.authEpoch == operation.scope.authEpoch && it.deviceId == operation.scope.deviceId &&
+                        it.slot != operation.scope.slot && it.sessionGeneration == operation.scope.sessionGeneration - 1 &&
+                        it.sessionGeneration > requireNotNull(current.ownerScope).sessionGeneration
+                } == true &&
                 provision.deviceId == operation.scope.deviceId && current.deviceId == provision.deviceId &&
                 current.panelBase == provision.panelBase && provision.accessToken.isNotBlank() &&
                 provision.installSecret.isNotBlank() && current.installSecret == provision.installSecret &&
-                current.ownerCancelEpoch == null && current.logoutState == null &&
-                current.cleanupCredential == null && current.active != null
+                current.logoutState == null && current.cleanupCredential == null &&
+                current.pending == null && current.reservation == null && current.active != null
             if (current.ownerScope != operation.scope &&
-                (requireExistingScope || (!finalizedClean && !legacyProvision && !successorProvision &&
+                (requireExistingScope || (!finalizedClean && !legacyProvision && !successorProvision && !newLoginProvision &&
                     (current.ownerScope != null || hasCredentials)))
             ) throw MutationFailure("background_owner_scope_mismatch")
             if (current.ownerOperation == operation) return@mutate current
             if (operation.attempt <= current.ownerAttempt) throw MutationFailure("background_owner_cancelled")
             current.copy(revision = current.revision.incrementRevision(), ownerScope = operation.scope,
                 ownerOperation = operation, ownerAttempt = operation.attempt,
-                requiresFreshProvision = current.requiresFreshProvision || legacyProvision || successorProvision,
+                requiresFreshProvision = current.requiresFreshProvision || legacyProvision || successorProvision || newLoginProvision,
                 // Retain the proof for owner-checked recovery/cleanup, but force
                 // bearer reprovision instead of treating it as a fresh token.
-                active = if (legacyProvision || successorProvision) {
+                // Completed other-slot admission in a new login retired the
+                // old token. It cannot authorize cleanup for this new login if
+                // fresh issuance fails; any new staged issuance stays durable.
+                previous = if (newLoginProvision) null else current.previous,
+                active = if (newLoginProvision) null else if (legacyProvision || successorProvision) {
                     current.active?.copy(expiresAtUnix = 1)
                 } else current.active)
         }
@@ -960,6 +991,49 @@ internal class BackgroundCredentialStore(
         }
     }
 
+    /** Only the caller's confirmed operation_id_conflict authorizes a new receipt identity. */
+    fun reissueRejectedLogout(
+        expectedRevision: Long,
+        rejectedOperationId: String,
+        replacementOperationId: String,
+    ): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
+        mutate(expectedRevision, advancesRevision = true) { current ->
+            val logout = current.logoutState
+                ?: throw MutationFailure("background_credential_logout_absent")
+            if (logout.phase != BackgroundLogoutPhase.PENDING ||
+                logout.operationId != rejectedOperationId || replacementOperationId == rejectedOperationId ||
+                current.pending != null) {
+                throw MutationFailure("background_credential_mutation_conflict")
+            }
+            BackgroundCredentialEnvelopeCodec.requireSafeValue(replacementOperationId)
+            val allocate = logoutGeneration
+                ?: throw MutationFailure("background_generation_unavailable")
+            val generation = allocate(maxOf(current.installGeneration ?: 0, logout.installGeneration),
+                "logout:${current.deviceId}:$replacementOperationId")
+            require(generation > logout.installGeneration)
+            current.copy(revision = current.revision.incrementRevision(), installGeneration = generation,
+                logoutState = logout.copy(operationId = replacementOperationId, installGeneration = generation))
+        }
+    }
+
+    /** Confirm the exact replay tuple on disk: a failed commit may have changed only the cache. */
+    fun persistPendingLogout(
+        expectedRevision: Long,
+        operationId: String,
+    ): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
+        val result = readLocked()
+        if (result is CredentialStoreResult.Failure) return@synchronized result
+        val current = (result as CredentialStoreResult.Success).value
+        if (current.revision != expectedRevision) {
+            return@synchronized CredentialStoreResult.Failure("background_credential_revision_conflict")
+        }
+        if (current.logoutState?.phase != BackgroundLogoutPhase.PENDING ||
+            current.logoutState.operationId != operationId) {
+            return@synchronized CredentialStoreResult.Failure("background_credential_mutation_conflict")
+        }
+        persist(current)
+    }
+
     fun finalizeLogout(
         expectedRevision: Long,
         operationId: String,
@@ -1042,6 +1116,9 @@ internal class BackgroundCredentialStore(
             }
             throw MutationFailure("background_credential_logout_pending")
         }
+        val generation = logoutGeneration?.invoke(maxOf(installGeneration, current.installGeneration ?: 0),
+            "logout:${current.deviceId}:$operationId") ?: installGeneration
+        require(generation >= installGeneration)
         val phase = BackgroundLogoutPhase.PENDING
         return current.copy(
             revision = current.revision.incrementRevision(),
@@ -1052,7 +1129,8 @@ internal class BackgroundCredentialStore(
             capability = null,
             reservation = current.reservation.takeIf { current.pending != null },
             cleanupCredential = current.active ?: current.cleanupCredential,
-            logoutState = BackgroundLogoutState(operationId, installGeneration, phase),
+            installGeneration = generation,
+            logoutState = BackgroundLogoutState(operationId, generation, phase),
         )
     }
 
@@ -1251,6 +1329,9 @@ internal object AndroidBackgroundCredentialStores {
                 recordName = BACKGROUND_RECORD,
                 keyAlias = BACKGROUND_KEY_ALIAS,
             ),
+            logoutGeneration = { minimum, key ->
+                requireNotNull(AndroidInstallGenerations.reserve(context, minimum, key))
+            },
         )
         // Legacy import is owned by the locked common migration before any
         // engine loads; a runtime must never fall back to another namespace.

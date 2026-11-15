@@ -77,7 +77,8 @@ class UnvalidatedPhysicalNetworkReadinessTest {
                 mapOf("lease-a" to BackgroundRedundantHealthProbe("dns_a", "9.9.9.9", "example.com", 4000)),
                 onPrimaryStarted = { ready++ }, onPrimaryFailed = { failed++ }))
             val observations = listOf(SlotObservation(0, active = true, health = BackendHealth.READY,
-                handshakeFresh = handshake, consecutiveProbeSuccesses = probes, stableSinceMs = 0))
+                handshakeFresh = handshake, consecutiveProbeSuccesses = probes, stableSinceMs = 0,
+                successfulProbeValidThroughElapsedMs = 3_000L.takeIf { probes > 0 }))
             time = 1_000
             coordinator.onHealthObservations(observations)
             val expectedReady = available && handshake && probes > 0

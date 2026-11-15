@@ -292,10 +292,13 @@ internal data class RedundantPhysicalNetworkCallbackIdentity(
     val startOperationId: String,
     val owner: RedundantVpnProcessOwner,
 ) {
-    fun isCurrent(current: RedundantPhysicalNetworkCallbackState): Boolean =
+    fun matchesOwner(current: RedundantPhysicalNetworkCallbackState): Boolean =
         serviceGeneration == current.serviceGeneration &&
             startOperationId == current.installedStartOperationId &&
-            owner === current.installedOwner &&
+            owner === current.installedOwner
+
+    fun isCurrent(current: RedundantPhysicalNetworkCallbackState): Boolean =
+        matchesOwner(current) &&
             !redundantCleanupBlocksNewStarts(
                 current.pendingStop,
                 current.tombstoneUnreadable,

@@ -3,9 +3,10 @@ package ru.nelomai.tunnel
 import android.content.Intent
 import ru.nelomai.runtime.v1.RuntimeVpnEngineV1
 import ru.nelomai.runtime.v1.RuntimeVpnHostV1
+import ru.nelomai.runtime.v1.RuntimeVpnTransportV1
 
 /** Versioned adapter: common dispatcher has no lease, recovery or route policy. */
-class LatestRuntimeVpnEngineV1(host: RuntimeVpnHostV1) : RuntimeVpnEngineV1 {
+class LatestRuntimeVpnEngineV1(host: RuntimeVpnHostV1) : RuntimeVpnEngineV1, RuntimeVpnTransportV1 {
     private val engine = NelomaiVpnService(host)
     override fun requiresStartAdmission(intent: Intent?): Boolean =
         requiresVpnStartAdmission(hostContext(), intent)
@@ -15,6 +16,8 @@ class LatestRuntimeVpnEngineV1(host: RuntimeVpnHostV1) : RuntimeVpnEngineV1 {
     override fun revoke() = engine.onRevoke()
     override fun taskRemoved(intent: Intent?) = engine.onTaskRemoved(intent)
     override fun destroy() = engine.onDestroy()
+    override fun localTransportClosed(): Boolean = engine.localTransportClosed()
+    override fun retiredStartRejected(startId: Int) = engine.retiredStartRejected(startId)
 }
 
 internal fun requiresVpnStartAdmission(context: android.content.Context, intent: Intent?): Boolean =
@@ -23,7 +26,9 @@ internal fun requiresVpnStartAdmission(context: android.content.Context, intent:
         // recovery must remain available before VPN permission is granted.
         NelomaiVpnService.ACTION_ENSURE_RUNNING ->
             QuickTunnelController.desiredActiveSnapshot(context) != false
-        NelomaiVpnService.ACTION_QUICK_TOGGLE -> !QuickTunnelController.desiredActive(context)
+        NelomaiVpnService.ACTION_QUICK_TOGGLE ->
+            !intent.getBooleanExtra(ru.nelomai.runtime.v1.RuntimeServiceIntents.EXTRA_QUICK_STOP_ONLY, false) &&
+                !QuickTunnelController.desiredActive(context)
         NelomaiVpnService.ACTION_KILL_SWITCH_PREFERENCE,
         NelomaiVpnService.ACTION_CANCEL_CLIENT_START, NelomaiVpnService.ACTION_CLIENT_STOP,
         NelomaiVpnService.ACTION_CANCEL_OWNED_REDUNDANT_POLICY,

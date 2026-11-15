@@ -3,15 +3,20 @@ package ru.nelomai.client
 import android.app.Activity
 import android.content.Intent
 import android.os.Bundle
+import ru.nelomai.runtime.v1.RuntimeActivityRecovery
 import ru.nelomai.runtime.v1.SupportDiagnosticsEntry
 
 /** Launcher only: no Tauri, keyring or versioned engine is loaded here. */
 class MainActivity : Activity() {
     private var selection: RuntimeSelectionStore? = null
     private var launchStarted = false
+    private var updateLaunchSession: String? = null
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
         if (routeDiagnostics(intent)) return
+        updateLaunchSession = if (state != null) state.getString("nelomai_update_launch_session")
+            else if (intent.action == Intent.ACTION_MAIN || intent.action == "android.service.quicksettings.action.QS_TILE_PREFERENCES")
+                java.util.UUID.randomUUID().toString() else null
         selection = RuntimeSelectionStore(this)
         setContentView(android.widget.TextView(this).apply {
             text = "Запуск Nelomai…"
@@ -29,7 +34,11 @@ class MainActivity : Activity() {
             stage = SupportStartupStage.LAUNCHER_OWNER_READ
             selection?.read { result ->
                 if (isFinishing || isDestroyed) return@read
-                result.onSuccess { startActivity(Intent(this, RuntimeBootstrapActivity::class.java)); finish() }
+                result.onSuccess {
+                    startActivity(Intent(this, RuntimeBootstrapActivity::class.java)
+                        .putExtra("nelomai_update_launch_session", updateLaunchSession))
+                    finish()
+                }
                     .onFailure { SupportDiagnosticsStartup.showFailure(this, SupportStartupStage.LAUNCHER_OWNER_READ, it) }
             }
         }.onFailure { SupportDiagnosticsStartup.showFailure(this, stage, it) }
@@ -47,12 +56,21 @@ class MainActivity : Activity() {
         return true
     }
     override fun onDestroy() { selection?.close(); super.onDestroy() }
+    override fun onSaveInstanceState(state: Bundle) {
+        state.putString("nelomai_update_launch_session", updateLaunchSession)
+        super.onSaveInstanceState(state)
+    }
 }
 
 /** Runs in :runtime so Binder records the actual admitted child PID. */
 class RuntimeBootstrapActivity : Activity() {
     private lateinit var selection: RuntimeSelectionStore
     private var failureStage: SupportStartupStage? = null
+    private var resumed = false
+    private var recoveryReadPending = false
+    private val ownerRecovery get() = intent.getBooleanExtra(RuntimeActivityRecovery.OWNER_RECOVERY, false)
+    private val recoveryForeground get() = resumed && hasWindowFocus()
+
     override fun onCreate(state: Bundle?) {
         super.onCreate(state)
         selection = RuntimeSelectionStore(this)
@@ -62,8 +80,39 @@ class RuntimeBootstrapActivity : Activity() {
             showFailure(stage, IllegalStateException("bootstrap_failure_restored"))
             return
         }
+        if (ownerRecovery) recoveryReadPending = true else readOwner()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        resumed = true
+        readRecoveryWhenFocused()
+    }
+
+    override fun onPause() {
+        resumed = false
+        super.onPause()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) readRecoveryWhenFocused()
+    }
+
+    private fun readRecoveryWhenFocused() {
+        if (!recoveryReadPending || !recoveryForeground || isFinishing || isDestroyed) return
+        recoveryReadPending = false
+        readOwner()
+    }
+
+    private fun readOwner() {
         selection.read { result ->
             if (isFinishing || isDestroyed) return@read
+            if (ownerRecovery && !recoveryForeground) {
+                // Read again on return: the broker may have changed while we were away.
+                recoveryReadPending = true
+                return@read
+            }
             if (result.isFailure) {
                 showFailure(SupportStartupStage.BOOTSTRAP_OWNER_READ, requireNotNull(result.exceptionOrNull()))
                 return@read
@@ -72,7 +121,7 @@ class RuntimeBootstrapActivity : Activity() {
                 var stage = SupportStartupStage.BOOTSTRAP_PROCESS_CLAIM
                 runCatching {
                     if (RuntimeProcessSelection.needsExit(selected)) {
-                        check(!intent.getBooleanExtra(ru.nelomai.runtime.v1.RuntimeActivityRecovery.MANUAL_RETRY, false)) {
+                        check(!intent.getBooleanExtra(RuntimeActivityRecovery.MANUAL_RETRY, false)) {
                             "runtime_recovery_process_conflict"
                         }
                         startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
@@ -91,6 +140,8 @@ class RuntimeBootstrapActivity : Activity() {
                         val launch = Intent().setClassName(packageName, RuntimeAdapters.activity(selected))
                             .putExtra("runtime_endpoint_v1", fd).putExtra("runtime_bootstrap_v1", bootstrap)
                             .putExtra("runtime_selection_v1", RuntimeSelectionStore.encode(selected))
+                            .putExtra("nelomai_update_protocol", selection.updateProtocol)
+                            .putExtra("nelomai_update_launch_session", intent.getStringExtra("nelomai_update_launch_session"))
                         stage = SupportStartupStage.BOOTSTRAP_ACTIVITY_PREPARE
                         RuntimeAdapters.prepareActivity(selected, launch)
                         stage = SupportStartupStage.BOOTSTRAP_ACTIVITY_START
@@ -106,7 +157,7 @@ class RuntimeBootstrapActivity : Activity() {
     }
     private fun showFailure(stage: SupportStartupStage, error: Throwable) {
         failureStage = stage
-        SupportDiagnosticsStartup.showFailure(this, stage, error)
+        SupportDiagnosticsStartup.showFailure(this, stage, error, ownerRecovery = ownerRecovery)
     }
     override fun onSaveInstanceState(state: Bundle) {
         super.onSaveInstanceState(state)

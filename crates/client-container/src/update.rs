@@ -280,6 +280,52 @@ impl UpdateBarrier {
         self.recover_before(installed_container_version, None).await
     }
 
+    /// Continue only a cancellation already committed by the installer result.
+    /// The same deadline bounds the journal lock, RPCs and persisted retry delay.
+    pub(crate) async fn recover_cancel_before(
+        &self,
+        operation_id: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), UpdateBarrierError> {
+        let _operation = tokio::time::timeout_at(deadline, self.operation.lock())
+            .await
+            .map_err(|_| UpdateBarrierError::Pending)?;
+        loop {
+            let Some(journal) = self.snapshot()? else {
+                return Ok(());
+            };
+            if journal.phase != UpdateJournalPhase::CancelRequested
+                || journal.operation_id != operation_id
+                || journal.source_container != self.coordinator.installed_container_version()
+            {
+                return Err(UpdateBarrierError::Invalid);
+            }
+            match self
+                .coordinator
+                .cancel_update_stop(operation_id, Some(deadline))
+                .await?
+            {
+                crate::SwitchProgress::Ready => {
+                    self.coordinator
+                        .restore_update_selection(journal.previous_slot)?;
+                    return self.remove();
+                }
+                crate::SwitchProgress::Pending {
+                    retry_after_seconds,
+                } => {
+                    tokio::time::timeout_at(
+                        deadline,
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            retry_after_seconds.clamp(1, 30).into(),
+                        )),
+                    )
+                    .await
+                    .map_err(|_| UpdateBarrierError::Pending)?;
+                }
+            }
+        }
+    }
+
     pub(crate) async fn recover_before(
         &self,
         installed_container_version: &str,

@@ -3,6 +3,7 @@ package ru.nelomai.tunnel
 import android.app.Activity
 import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import android.os.SystemClock
@@ -26,6 +27,7 @@ import org.amnezia.awg.config.Config
 import java.io.ByteArrayInputStream
 import java.util.ArrayDeque
 import java.util.UUID
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
@@ -36,9 +38,10 @@ import java.util.concurrent.atomic.AtomicReference
 import org.json.JSONArray
 import org.json.JSONObject
 
-internal const val TUNNEL_API_VERSION = 2
+internal const val TUNNEL_API_VERSION = ru.nelomai.runtime.v1.RuntimeServiceIntents.VPN_API_VERSION
 private const val TUNNEL_NAME = "nelomai"
 private const val QUICK_TILE_SERVICE = "ru.nelomai.client.NelomaiQuickTileService"
+private const val QUICK_TILE_UPDATE = "ru.nelomai.tunnel.QUICK_TILE_UPDATE"
 private const val TUNNEL_OPERATION_WATCHDOG_MILLIS = 40_000L
 private const val METRICS_OPERATION_WATCHDOG_MILLIS = 1_500L
 private const val UDP_REBIND_QUEUE_TIMEOUT_MILLIS = 500L
@@ -331,77 +334,65 @@ internal class TunnelStateGate(
         REBINDING,
     }
 
-    private val state = AtomicReference(initialState.toGateState())
+    data class Start(val decision: TransitionDecision, val revision: Long, val previous: SessionState)
 
-    fun current(): SessionState = state.get().toSessionState()
+    private var state = initialState.toGateState()
+    private var revision = 0L
 
-    fun beginStart(): TransitionDecision {
-        while (true) {
-            when (val current = state.get()) {
-                GateState.RUNNING -> {
-                    if (state.compareAndSet(current, GateState.STARTING)) {
-                        return TransitionDecision.REPLACE
-                    }
-                }
-                GateState.STARTING, GateState.STOPPING, GateState.REBINDING -> {
-                    return TransitionDecision.BUSY
-                }
-                GateState.STOPPED -> {
-                    if (state.compareAndSet(current, GateState.STARTING)) {
-                        return TransitionDecision.PROCEED
-                    }
-                }
-                GateState.FAILED -> {
-                    if (state.compareAndSet(current, GateState.STARTING)) {
-                        return TransitionDecision.REPLACE
-                    }
-                }
-            }
+    @Synchronized fun current(): SessionState = state.toSessionState()
+
+    @Synchronized fun isRebinding(): Boolean = state == GateState.REBINDING
+
+    fun beginStart(): TransitionDecision = beginTrackedStart().decision
+
+    @Synchronized fun beginTrackedStart(): Start {
+        val previous = state.toSessionState()
+        val decision = when (state) {
+            GateState.RUNNING, GateState.FAILED -> TransitionDecision.REPLACE
+            GateState.STOPPED -> TransitionDecision.PROCEED
+            GateState.STARTING, GateState.STOPPING, GateState.REBINDING -> return Start(TransitionDecision.BUSY, revision, previous)
         }
+        advance(GateState.STARTING)
+        return Start(decision, revision, previous)
     }
 
-    fun beginStop(): TransitionDecision {
-        while (true) {
-            when (val current = state.get()) {
-                GateState.STOPPED -> return TransitionDecision.ALREADY_COMPLETE
-                GateState.STOPPING, GateState.REBINDING -> return TransitionDecision.BUSY
-                GateState.STARTING -> {
-                    if (state.compareAndSet(current, GateState.STOPPING)) {
-                        return TransitionDecision.PROCEED
-                    }
-                }
-                GateState.RUNNING, GateState.FAILED -> {
-                    if (state.compareAndSet(current, GateState.STOPPING)) {
-                        return TransitionDecision.PROCEED
-                    }
-                }
-            }
-        }
+    @Synchronized fun ownsStart(start: Start): Boolean = start.revision == revision
+
+    @Synchronized fun completeStart(start: Start, next: SessionState): Boolean {
+        if (start.revision != revision) return false
+        state = next.toGateState()
+        return true
     }
 
-    fun beginRebind(): TransitionDecision {
-        while (true) {
-            when (val current = state.get()) {
-                GateState.RUNNING -> {
-                    if (state.compareAndSet(current, GateState.REBINDING)) {
-                        return TransitionDecision.PROCEED
-                    }
-                }
-                GateState.STARTING, GateState.STOPPING, GateState.REBINDING -> {
-                    return TransitionDecision.BUSY
-                }
-                GateState.STOPPED, GateState.FAILED -> {
-                    return TransitionDecision.ALREADY_COMPLETE
-                }
-            }
+    @Synchronized fun beginStop(): TransitionDecision {
+        when (state) {
+            GateState.STOPPED -> return TransitionDecision.ALREADY_COMPLETE
+            GateState.STOPPING, GateState.REBINDING -> return TransitionDecision.BUSY
+            else -> advance(GateState.STOPPING)
         }
+        return TransitionDecision.PROCEED
     }
 
-    fun cancelRebind(): Boolean =
-        state.compareAndSet(GateState.REBINDING, GateState.RUNNING)
+    @Synchronized fun beginRebind(): TransitionDecision {
+        when (state) {
+            GateState.RUNNING -> advance(GateState.REBINDING)
+            GateState.STARTING, GateState.STOPPING, GateState.REBINDING -> return TransitionDecision.BUSY
+            GateState.STOPPED, GateState.FAILED -> return TransitionDecision.ALREADY_COMPLETE
+        }
+        return TransitionDecision.PROCEED
+    }
 
-    fun complete(next: SessionState) {
-        state.set(next.toGateState())
+    @Synchronized fun cancelRebind(): Boolean {
+        if (state != GateState.REBINDING) return false
+        advance(GateState.RUNNING)
+        return true
+    }
+
+    @Synchronized fun complete(next: SessionState) = advance(next.toGateState())
+
+    private fun advance(next: GateState) {
+        state = next
+        revision++
     }
 
     private fun SessionState.toGateState(): GateState = when (this) {
@@ -504,6 +495,7 @@ private class ManagedTunnel(
 private data class ActiveTunnelSession(
     val generation: Long,
     val clientOperationId: String?,
+    val clientIntentGeneration: Long?,
     val config: Config,
     val options: EffectiveAndroidTunnelOptions,
     var monitor: PhysicalNetworks?,
@@ -516,7 +508,6 @@ private data class ActiveTunnelSession(
     var lastDiagnosticsReceivedBytes: Long? = null,
     var lastDiagnosticsSentBytes: Long? = null,
     var lastNetworkTelemetry: NetworkTelemetry? = null,
-    var lastNetworkTelemetryPollElapsedMillis: Long? = null,
     val recentNetworkTelemetry: ArrayDeque<JSONObject> = ArrayDeque(),
     var lastTunActivityElapsedMillis: Long = startedAtElapsedMillis,
     var lastTunWriteActivityElapsedMillis: Long = startedAtElapsedMillis,
@@ -531,7 +522,11 @@ private data class ActiveTunnelSession(
     var lastTelemetryErrorLoggedElapsedMillis: Long = 0,
     var networkIncidentCount: Int = 0,
     var openNetworkIncidentElapsedMillis: Long? = null,
-)
+) {
+    val latestWireGuardNetwork = AtomicReference<PhysicalNetworkState?>()
+    var appliedWireGuardNetwork: PhysicalNetworkState? = null
+    var wireGuardRecoveryOwnerGeneration: Long? = null
+}
 
 internal enum class UdpControlProbeStage {
     BEFORE_REBIND,
@@ -545,32 +540,8 @@ internal enum class UdpControlProbeAction {
     STOP,
 }
 
-internal enum class NetworkTelemetryMode {
-    DISABLED,
-    PASSIVE,
-    UDP_RECOVERY,
-}
-
-internal fun networkTelemetryMode(transport: String): NetworkTelemetryMode = when (transport) {
-    "wireguard" -> NetworkTelemetryMode.PASSIVE
-    "amneziawg_3" -> NetworkTelemetryMode.UDP_RECOVERY
-    else -> NetworkTelemetryMode.DISABLED
-}
-
-internal fun shouldPollNetworkTelemetry(
-    mode: NetworkTelemetryMode,
-    nowElapsedMillis: Long,
-    lastPollElapsedMillis: Long?,
-): Boolean = when (mode) {
-    NetworkTelemetryMode.DISABLED -> false
-    NetworkTelemetryMode.UDP_RECOVERY -> true
-    NetworkTelemetryMode.PASSIVE -> lastPollElapsedMillis == null ||
-        nowElapsedMillis < lastPollElapsedMillis ||
-        nowElapsedMillis - lastPollElapsedMillis >= PASSIVE_NETWORK_TELEMETRY_INTERVAL_MILLIS
-}
-
-internal fun shouldPersistPeriodicNetworkTelemetry(mode: NetworkTelemetryMode): Boolean =
-    mode == NetworkTelemetryMode.PASSIVE
+internal fun supportsUdpRecovery(transport: String): Boolean =
+    transport == "wireguard" || transport == "amneziawg_3"
 
 internal fun handOffDataPlaneStall(
     leaseId: String?,
@@ -727,6 +698,11 @@ internal object TunnelRuntime {
         Thread(task, "nelomai-tunnel-watchdog").apply { isDaemon = false }
     }
     private val stateGate = TunnelStateGate()
+    private data class StopResult(val state: SessionState, val duration: Long, val error: String? = null)
+    private class NativeStop(var keepForeground: Boolean) {
+        val completion = CompletableFuture<StopResult>()
+    }
+    private var nativeStop: NativeStop? = null // guarded by stateGate
     private val backgroundOperationGate = BackgroundOperationGate()
     private val watchdogGates = TunnelOperationWatchdogGates()
     private val suppressBackendStateChanges = AtomicBoolean(false)
@@ -786,6 +762,8 @@ internal object TunnelRuntime {
 
     fun state(): SessionState = stateGate.current()
 
+    fun rebindInProgress(): Boolean = stateGate.isRebinding()
+
     fun activeLeaseId(): String? = activeSession?.connectionLeaseId
 
     fun start(
@@ -795,6 +773,7 @@ internal object TunnelRuntime {
         onError: (String) -> Unit,
         keepForegroundServiceOnFailure: Boolean = false,
         ownerCurrent: () -> Boolean = { true },
+        admitStart: ((() -> Boolean) -> Long?)? = null,
     ) {
         val applicationContext = context.applicationContext
         val quickPlan = args.copyForQuickPlan()
@@ -817,9 +796,12 @@ internal object TunnelRuntime {
             onError(errorCode(error))
             return
         }
-        val replaceExisting = when (stateGate.beginStart()) {
+        val admission = synchronized(stateGate) {
+            if (nativeStop == null) stateGate.beginTrackedStart() else null
+        }
+        val replaceExisting = when (admission?.decision) {
             TransitionDecision.REPLACE -> true
-            TransitionDecision.BUSY -> {
+            null, TransitionDecision.BUSY -> {
                 args.clearSensitiveConfigurations()
                 quickPlan?.clearSensitiveConfigurations()
                 onError("tunnel_operation_in_progress")
@@ -828,6 +810,15 @@ internal object TunnelRuntime {
             TransitionDecision.PROCEED -> false
             TransitionDecision.ALREADY_COMPLETE -> error("unreachable_start_transition")
         }
+        checkNotNull(admission)
+        val clientIntentGeneration = runCatching { admitStart?.invoke { stateGate.ownsStart(admission) } }.getOrNull()
+        if (admitStart != null && clientIntentGeneration == null) {
+            stateGate.completeStart(admission, admission.previous)
+            args.clearSensitiveConfigurations()
+            quickPlan?.clearSensitiveConfigurations()
+            onError("connection_start_admission_failed")
+            return
+        }
 
         val watchdog = armOperationWatchdog(applicationContext, "start")
         executor.execute {
@@ -835,6 +826,7 @@ internal object TunnelRuntime {
             val memoryBaselineRssBytes = processRssBytes(android.os.Process.myPid())
             var memoryDiagnosticsForFailure: TunnelStartMemoryDiagnostics? = null
             var startTransport: String? = null
+            var startedBackend: GoBackend? = null
             TunnelLog.info(
                 "start.begin",
                 mapOf(
@@ -911,6 +903,12 @@ internal object TunnelRuntime {
                     "wireguard"
                 }
                 startTransport = transport
+                // Capture the authorized intent while this start owns the gate.
+                val wireGuardOwnerGeneration = if (transport == "wireguard") {
+                    readRecoveryEnvelope(applicationContext)?.intent?.generation
+                } else {
+                    null
+                }
                 val preparedAwg3Profile = if (transport == "amneziawg_3") {
                     Awg3ProfileSnapshot.fromInterface(config.getInterface())
                 } else {
@@ -985,7 +983,13 @@ internal object TunnelRuntime {
                     "before_backend_up",
                     transport,
                 )
-                var state = activeBackend.setState(tunnel, Tunnel.State.UP, config)
+                startedBackend = activeBackend
+                suppressBackendStateChanges.set(true)
+                var state = try {
+                    activeBackend.setState(tunnel, Tunnel.State.UP, config)
+                } finally {
+                    suppressBackendStateChanges.set(false)
+                }
                 startMemoryDiagnostics.record(
                     applicationContext,
                     "after_backend_up",
@@ -1004,6 +1008,7 @@ internal object TunnelRuntime {
                         try {
                             activeBackend.setState(tunnel, Tunnel.State.DOWN, null)
                             activeBackend = replaceBackend(applicationContext)
+                            startedBackend = activeBackend
                             state = activeBackend.setState(tunnel, Tunnel.State.UP, config)
                         } finally {
                             suppressBackendStateChanges.set(false)
@@ -1044,31 +1049,27 @@ internal object TunnelRuntime {
                         )
                     }
                 }
-                if (state == Tunnel.State.UP &&
-                    (isClientStartCancelled(args.clientOperationId) || !ownerCurrent())
-                ) {
-                    suppressBackendStateChanges.set(true)
-                    try {
-                        requireState(
-                            requireBackend().setState(tunnel, Tunnel.State.DOWN, null),
-                            Tunnel.State.DOWN,
-                        )
-                    } finally {
-                        suppressBackendStateChanges.set(false)
-                    }
-                    AndroidSplitTunnel.clear()
-                    throw TunnelOperationException("tunnel_start_cancelled")
-                }
                 if (state == Tunnel.State.UP) {
+                    requireCurrentStart()
                     NelomaiVpnService.setPhysicalNetworks(
                         physicalState.networks,
                     )
                 }
                 logStage("start.backend_state_up", backendStartedAt)
                 val resolved = if (state == Tunnel.State.UP) {
+                    val recoveryOwnerGeneration = if (transport == "wireguard" && wireGuardOwnerGeneration == null) {
+                        // Retry a transient store read while this start still owns the gate.
+                        val recovered = readRecoveryEnvelope(applicationContext)?.intent?.generation
+                        requireCurrentStart()
+                        if (recovered == null) TunnelLog.warning("tunnel.udp_recovery_owner_unavailable")
+                        recovered
+                    } else {
+                        wireGuardOwnerGeneration
+                    }
                     val session = ActiveTunnelSession(
                         generation = generation.incrementAndGet(),
                         clientOperationId = args.clientOperationId,
+                        clientIntentGeneration = clientIntentGeneration,
                         config = config,
                         options = options,
                         monitor = monitor,
@@ -1077,7 +1078,7 @@ internal object TunnelRuntime {
                         networkWasUnavailable = !physicalState.available,
                         transport = transport,
                         connectionLeaseId = args.quickConnection?.leaseId,
-                    )
+                    ).also { it.wireGuardRecoveryOwnerGeneration = recoveryOwnerGeneration }
                     activeSession = session
                     try {
                         runTunnelStartupPostActions(
@@ -1105,9 +1106,13 @@ internal object TunnelRuntime {
                     } catch (_: Throwable) {
                         activeSession = null
                         monitor.stop()
+                        suppressBackendStateChanges.set(true)
                         runCatching {
-                            requireBackend().setState(tunnel, Tunnel.State.DOWN, null)
+                            if (activeBackend.setState(tunnel, Tunnel.State.DOWN, null) == Tunnel.State.DOWN) {
+                                startedBackend = null
+                            }
                         }
+                        suppressBackendStateChanges.set(false)
                         AndroidSplitTunnel.clear()
                         throw TunnelOperationException(
                             "physical_network_monitor_unavailable",
@@ -1119,7 +1124,9 @@ internal object TunnelRuntime {
                     AndroidSplitTunnel.clear()
                     SessionState.FAILED
                 }
-                stateGate.complete(resolved)
+                if (!stateGate.completeStart(admission, resolved)) {
+                    throw TunnelOperationException("tunnel_start_cancelled")
+                }
                 if (resolved == SessionState.RUNNING) {
                     runCatching {
                         AutomaticDiagnostics.onTunnelStarted(
@@ -1170,26 +1177,29 @@ internal object TunnelRuntime {
                     }
                 }
                 logStage("start.completed", startedAt, "state=${resolved.wireName}")
+                requireCurrentStart()
                 onSuccess(resolved, elapsedMillis(startedAt))
             } catch (error: Throwable) {
                 args.clearSensitiveConfigurations()
                 quickPlan?.clearSensitiveConfigurations()
-                if (args.startSource == "local_restart" ||
+                if (startedBackend != null || args.startSource == "local_restart" ||
                     (error is TunnelOperationException && error.code == "tunnel_start_cancelled")
                 ) {
-                    // A Stop may have invalidated the generation after native
-                    // UP. Do not leave a rejected replacement physically open.
+                    // Rejection from the completion callback can arrive after native UP.
                     clearActiveSession()
                     suppressBackendStateChanges.set(true)
                     try {
-                        runCatching { requireBackend().setState(tunnel, Tunnel.State.DOWN, null) }
+                        runCatching {
+                            val closingBackend = startedBackend ?: requireBackend()
+                            requireState(closingBackend.setState(tunnel, Tunnel.State.DOWN, null), Tunnel.State.DOWN)
+                        }
                             .onFailure { TunnelLog.warning("start.cancel_cleanup_failed", error = it) }
                     } finally {
                         suppressBackendStateChanges.set(false)
                     }
                 }
                 AndroidSplitTunnel.clear()
-                stateGate.complete(SessionState.FAILED)
+                stateGate.completeStart(admission, SessionState.FAILED)
                 if (!keepForegroundServiceOnFailure) {
                     runTunnelFailureCleanup(
                         optionalDiagnostics = {
@@ -1239,36 +1249,34 @@ internal object TunnelRuntime {
                 return@execute
             }
             val applicationContext = context.applicationContext
-            QuickTunnelController.updateState(
-                applicationContext,
-                SessionState.STOPPING,
-                desiredActive = false,
-            )
+            var cancelledGeneration: Long? = null
+            session?.clientIntentGeneration?.let { expectedGeneration ->
+                QuickTunnelController.updateState(
+                    applicationContext,
+                    SessionState.STOPPING,
+                    desiredActive = false,
+                    expectedGeneration = expectedGeneration,
+                    ownerCurrent = { activeSession === session && stateGate.current() == SessionState.RUNNING },
+                    onDesiredActiveSaved = { cancelledGeneration = it },
+                )
+            }
+            fun completeCancellation(state: SessionState) {
+                cancelledClientStarts.remove(clientOperationId)
+                cancelledGeneration?.let { expectedGeneration ->
+                    QuickTunnelController.updateState(
+                        applicationContext, state, changed = true, expectedGeneration = expectedGeneration,
+                    )
+                }
+            }
             stop(
                 TUNNEL_API_VERSION,
-                { state, _ ->
-                    cancelledClientStarts.remove(clientOperationId)
-                    QuickTunnelController.updateState(
-                        applicationContext,
-                        state,
-                        desiredActive = false,
-                        changed = true,
-                    )
-                    TunnelPlugin.refreshQuickTile(applicationContext)
-                },
+                { state, _ -> completeCancellation(state) },
                 { code ->
-                    cancelledClientStarts.remove(clientOperationId)
                     TunnelLog.warning("client_start.cancel_failed", code)
-                    val state = state()
-                    QuickTunnelController.updateState(
-                        applicationContext,
-                        state,
-                        desiredActive = state == SessionState.RUNNING,
-                        changed = true,
-                    )
-                    TunnelPlugin.refreshQuickTile(applicationContext)
+                    completeCancellation(state())
                 },
                 failedStartOperationId = clientOperationId,
+                onlyClientOperation = clientOperationId,
             )
         }
     }
@@ -1277,9 +1285,14 @@ internal object TunnelRuntime {
         context: Context,
         onSuccess: (SessionState, Long) -> Unit,
         onError: (String) -> Unit,
+        ownerCurrent: () -> Boolean = { true },
     ) {
         val applicationContext = context.applicationContext
         initialize(applicationContext)
+        if (!ownerCurrent()) {
+            onError("tunnel_start_cancelled")
+            return
+        }
         if (!backgroundOperationGate.begin()) {
             onError("tunnel_operation_in_progress")
             return
@@ -1308,6 +1321,7 @@ internal object TunnelRuntime {
             applicationContext,
             SessionState.STARTING,
             desiredActive = true,
+            ownerCurrent = ownerCurrent,
         )) {
             backgroundOperationGate.complete()
             onError("quick_state_persist_failed")
@@ -1319,6 +1333,7 @@ internal object TunnelRuntime {
                 mapOf("layer" to template.connection.layer, "route" to template.connection.routeMode),
             )
             try {
+                if (!ownerCurrent()) throw TunnelOperationException("tunnel_start_cancelled")
                 val result = BackgroundConnectionClient.start(
                     applicationContext,
                     credential,
@@ -1336,7 +1351,7 @@ internal object TunnelRuntime {
                 }
                 fun finishFailedStart(code: String) {
                     scheduleBackgroundStartFailure(
-                        scheduleCleanup = backgroundExecutor::execute,
+                        scheduleCleanup = { cleanup -> backgroundExecutor.execute { cleanup() } },
                         cleanupLease = {
                             BackgroundConnectionClient.stop(
                                 credential,
@@ -1360,17 +1375,15 @@ internal object TunnelRuntime {
                     { state, duration ->
                         val failureCode = backgroundStartFailureCode(state)
                         if (failureCode == null) {
-                            try {
-                                onSuccess(state, duration)
-                            } finally {
-                                backgroundOperationGate.complete()
-                            }
+                            onSuccess(state, duration)
+                            backgroundOperationGate.complete()
                         } else {
                             finishFailedStart(failureCode)
                         }
                     },
                     ::finishFailedStart,
                     keepForegroundServiceOnFailure = true,
+                    ownerCurrent = ownerCurrent,
                 )
             } catch (error: Throwable) {
                 val code = (error as? BackgroundConnectionException)?.code ?: errorCode(error)
@@ -1477,6 +1490,7 @@ internal object TunnelRuntime {
         onError: (String) -> Unit,
         keepForegroundService: Boolean = false,
         failedStartOperationId: String? = null,
+        onlyClientOperation: String? = null,
     ) {
         try {
             validateVersion(apiVersion)
@@ -1488,79 +1502,111 @@ internal object TunnelRuntime {
         // Record the rejected attempt even if native Stop is busy. A later
         // generic compensation retry must not keep its provisional protection.
         failedStartOperationId?.let { NelomaiVpnService.legacyStartRejected(it) }
-        when (stateGate.beginStop()) {
-            TransitionDecision.ALREADY_COMPLETE -> {
-                try { NelomaiVpnService.legacyTransportStopped() }
-                catch (error: Throwable) { onError(errorCode(error)); return }
-                clearActiveSession()
-                applicationContext?.let { context ->
-                    runCatching { AutomaticDiagnostics.onTunnelStopped(context) }
-                        .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
+        var inactiveSession: ActiveTunnelSession? = null
+        val (decision, operation) = synchronized(stateGate) {
+            val current = nativeStop
+            when {
+                onlyClientOperation != null && (stateGate.current() != SessionState.RUNNING ||
+                    activeSession?.clientOperationId != onlyClientOperation) -> TransitionDecision.BUSY to null
+                current != null -> {
+                    current.keepForeground = current.keepForeground || keepForegroundService
+                    TransitionDecision.BUSY to current
                 }
-                if (!keepForegroundService) {
-                    NelomaiVpnService.stopForegroundService()
+                else -> {
+                    val decision = stateGate.beginStop()
+                    if (decision == TransitionDecision.PROCEED) nativeStop = NativeStop(keepForegroundService)
+                    if (decision == TransitionDecision.ALREADY_COMPLETE && activeSession != null) {
+                        inactiveSession = detachActiveSession()
+                    }
+                    decision to nativeStop
                 }
-                onSuccess(SessionState.STOPPED, 0)
-                return
             }
-            TransitionDecision.BUSY -> {
-                onError("tunnel_operation_in_progress")
-                return
-            }
-            TransitionDecision.PROCEED -> Unit
-            TransitionDecision.REPLACE -> error("unreachable_stop_transition")
         }
+        if (decision == TransitionDecision.ALREADY_COMPLETE) {
+            try { NelomaiVpnService.legacyTransportStopped() }
+            catch (error: Throwable) { onError(errorCode(error)); return }
+            inactiveSession?.monitor?.stop()
+            applicationContext?.let { context ->
+                runCatching { AutomaticDiagnostics.onTunnelStopped(context) }
+                    .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
+            }
+            if (!keepForegroundService) NelomaiVpnService.stopForegroundServiceIfIdle()
+            onSuccess(SessionState.STOPPED, 0)
+            return
+        }
+        if (operation == null) {
+            onError("tunnel_operation_in_progress")
+            return
+        }
+        operation.completion.thenAccept { result ->
+            if (result.error != null) onError(result.error) else onSuccess(result.state, result.duration)
+        }
+        if (decision != TransitionDecision.PROCEED) return
 
-        val watchdog = armOperationWatchdog(
-            checkNotNull(applicationContext) { "tunnel_context_unavailable" },
-            "stop",
-        )
-        executor.execute {
-            val startedAt = System.nanoTime()
-            TunnelLog.info("stop.begin")
+        fun completeStop(result: StopResult, watchdog: TunnelOperationWatchdog?) {
             try {
-                failedStartOperationId?.let { NelomaiVpnService.legacyStartRejected(it) }
-                activeSession?.let { session ->
-                    logDataPlaneSnapshot(session, "tunnel_stopping")
-                    logNetworkTelemetrySnapshot(session, "tunnel_stopping")
-                }
-                clearActiveSession()
-                suppressBackendStateChanges.set(true)
-                val state = try {
-                    requireBackend().setState(tunnel, Tunnel.State.DOWN, null)
-                } finally {
-                    suppressBackendStateChanges.set(false)
-                }
-                AndroidSplitTunnel.clear()
-                val resolved = if (state == Tunnel.State.DOWN) {
-                    // Native may already be DOWN after an earlier close failure.
-                    // Retry the service owner's cleanup before acknowledging Stop.
-                    NelomaiVpnService.legacyTransportStopped()
-                    SessionState.STOPPED
-                } else {
-                    SessionState.FAILED
-                }
-                stateGate.complete(resolved)
-                logStage("stop.completed", startedAt, "state=${resolved.wireName}")
-                if (resolved == SessionState.STOPPED) {
+                if (result.state == SessionState.STOPPED) {
                     applicationContext?.let { context ->
                         runCatching { AutomaticDiagnostics.onTunnelStopped(context) }
                             .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
                     }
-                    if (!keepForegroundService) {
-                        NelomaiVpnService.stopForegroundService()
-                    }
                 }
-                onSuccess(resolved, elapsedMillis(startedAt))
-            } catch (error: Throwable) {
-                AndroidSplitTunnel.clear()
-                stateGate.complete(SessionState.FAILED)
-                val code = errorCode(error)
-                TunnelLog.warning("stop.failed", code, error)
-                onError(code)
             } finally {
-                completeOperationWatchdog(watchdog)
+                val keepForeground = synchronized(stateGate) {
+                    stateGate.complete(result.state)
+                    watchdog?.let(::completeOperationWatchdog)
+                    nativeStop = null
+                    operation.keepForeground
+                }
+                try {
+                    if (result.state == SessionState.STOPPED && !keepForeground) {
+                        NelomaiVpnService.stopForegroundServiceIfIdle()
+                    }
+                } finally {
+                    operation.completion.complete(result)
+                }
             }
+        }
+        var watchdog: TunnelOperationWatchdog? = null
+        try {
+            watchdog = armOperationWatchdog(
+                checkNotNull(applicationContext) { "tunnel_context_unavailable" }, "stop",
+            )
+            val armedWatchdog = watchdog
+            executor.execute {
+                val startedAt = System.nanoTime()
+                val result = try {
+                    TunnelLog.info("stop.begin")
+                    activeSession?.let { session ->
+                        logDataPlaneSnapshot(session, "tunnel_stopping")
+                        logNetworkTelemetrySnapshot(session, "tunnel_stopping")
+                    }
+                    clearActiveSession()
+                    suppressBackendStateChanges.set(true)
+                    val state = try {
+                        requireBackend().setState(tunnel, Tunnel.State.DOWN, null)
+                    } finally {
+                        suppressBackendStateChanges.set(false)
+                    }
+                    AndroidSplitTunnel.clear()
+                    val resolved = if (state == Tunnel.State.DOWN) {
+                        NelomaiVpnService.legacyTransportStopped()
+                        SessionState.STOPPED
+                    } else {
+                        SessionState.FAILED
+                    }
+                    logStage("stop.completed", startedAt, "state=${resolved.wireName}")
+                    StopResult(resolved, elapsedMillis(startedAt))
+                } catch (error: Throwable) {
+                    AndroidSplitTunnel.clear()
+                    val code = errorCode(error)
+                    TunnelLog.warning("stop.failed", code, error)
+                    StopResult(SessionState.FAILED, 0, code)
+                }
+                completeStop(result, armedWatchdog)
+            }
+        } catch (error: Throwable) {
+            completeStop(StopResult(SessionState.FAILED, 0, errorCode(error)), watchdog)
         }
     }
 
@@ -1889,6 +1935,8 @@ internal object TunnelRuntime {
         AndroidSplitTunnel.clear()
     }
 
+    fun nativeOperationsBarrier(): java.util.concurrent.Future<*> = executor.submit {}
+
     fun releaseBackend() {
         if (stateGate.current() != SessionState.STOPPED || activeSession != null) return
         synchronized(this) {
@@ -1902,10 +1950,13 @@ internal object TunnelRuntime {
         sessionGeneration: Long,
         physicalState: PhysicalNetworkState,
     ) {
+        activeSession?.takeIf { it.generation == sessionGeneration && it.transport == "wireguard" }
+            ?.latestWireGuardNetwork?.set(physicalState)
         executor.execute {
             val session = activeSession
                 ?.takeIf { it.generation == sessionGeneration }
                 ?: return@execute
+            if (session.transport == "wireguard") session.appliedWireGuardNetwork = physicalState
             if (
                 stateGate.current() !in setOf(
                     SessionState.RUNNING,
@@ -1918,6 +1969,7 @@ internal object TunnelRuntime {
 
             if (!physicalState.available) {
                 session.networkWasUnavailable = true
+                if (session.transport == "wireguard") session.pendingUdpControlProbe = null
                 session.observedNetworkFingerprint = physicalState.fingerprint
                 NelomaiVpnService.setPhysicalNetworks(emptyList())
                 TunnelLog.info("tunnel.network_unavailable")
@@ -1939,8 +1991,19 @@ internal object TunnelRuntime {
                 physicalState.networks,
             )
             val recoveredAfterLoss = session.networkWasUnavailable
+            // Compare the eligible networks and routes after the validation header.
+            val pathChanged = fingerprint.substringAfter('\n') != session.observedNetworkFingerprint.substringAfter('\n')
             session.observedNetworkFingerprint = fingerprint
             session.networkWasUnavailable = false
+            if (session.transport == "wireguard" && (pathChanged || recoveredAfterLoss)) {
+                // A new underlay gives a fresh attempt budget, but still needs
+                // new TUN demand before a probe can be started.
+                session.pendingUdpControlProbe = null
+                session.udpStallStartedElapsedMillis = null
+                session.udpRecoveryAttempts = 0
+                session.udpRecoveryArmed = true
+                session.lastUdpRecoveryElapsedMillis = null
+            }
             if (localRoutes != session.localRoutes) {
                 TunnelLog.info(
                     "tunnel.local_routes_deferred",
@@ -1965,12 +2028,16 @@ internal object TunnelRuntime {
     }
 
     private fun clearActiveSession() {
+        detachActiveSession()?.monitor?.stop()
+    }
+
+    private fun detachActiveSession(): ActiveTunnelSession? {
         dataPlaneFuture?.cancel(false)
         dataPlaneFuture = null
         val session = activeSession
         activeSession = null
         generation.incrementAndGet()
-        session?.monitor?.stop()
+        return session
     }
 
     private fun scheduleDataPlaneDiagnostics(sessionGeneration: Long) {
@@ -1992,11 +2059,7 @@ internal object TunnelRuntime {
                                 DATA_PLANE_DIAGNOSTICS_INTERVAL_SECONDS * 1_000L
                             ) {
                                 logDataPlaneSnapshot(session, "periodic")
-                                if (
-                                    shouldPersistPeriodicNetworkTelemetry(
-                                        networkTelemetryMode(session.transport),
-                                    )
-                                ) {
+                                if (session.transport == "wireguard") {
                                     logNetworkTelemetrySnapshot(
                                         session = session,
                                         reason = "periodic",
@@ -2039,18 +2102,8 @@ internal object TunnelRuntime {
     }
 
     private fun inspectNetworkTelemetry(session: ActiveTunnelSession) {
-        val telemetryMode = networkTelemetryMode(session.transport)
+        if (!supportsUdpRecovery(session.transport)) return
         val now = SystemClock.elapsedRealtime()
-        if (
-            !shouldPollNetworkTelemetry(
-                mode = telemetryMode,
-                nowElapsedMillis = now,
-                lastPollElapsedMillis = session.lastNetworkTelemetryPollElapsedMillis,
-            )
-        ) {
-            return
-        }
-        session.lastNetworkTelemetryPollElapsedMillis = now
         val sample = try {
             networkTelemetry() ?: return
         } catch (error: Throwable) {
@@ -2067,18 +2120,15 @@ internal object TunnelRuntime {
         val tunWriteDelta = counterDelta(previous?.tunWriteBytes, sample.tunWriteBytes)
         val udpReceiveDelta = counterDelta(previous?.udpReceiveBytes, sample.udpReceiveBytes)
         session.lastNetworkTelemetry = sample
+        val demandExpired = now - session.lastTunActivityElapsedMillis > UDP_RECOVERY_TUN_ACTIVITY_WINDOW_MILLIS
         if (tunReadDelta > 0) {
-            if (now - session.lastTunActivityElapsedMillis >
-                UDP_RECOVERY_TUN_ACTIVITY_WINDOW_MILLIS
-            ) {
+            if (demandExpired) {
                 session.udpStallStartedElapsedMillis = now
             } else if (session.udpStallStartedElapsedMillis == null) {
                 session.udpStallStartedElapsedMillis = now
             }
             session.lastTunActivityElapsedMillis = now
-        } else if (now - session.lastTunActivityElapsedMillis >
-            UDP_RECOVERY_TUN_ACTIVITY_WINDOW_MILLIS
-        ) {
+        } else if (demandExpired) {
             session.udpStallStartedElapsedMillis = null
         }
         if (tunWriteDelta > 0) {
@@ -2107,8 +2157,16 @@ internal object TunnelRuntime {
         }
 
         appendNetworkTelemetrySample(session, now, previous, sample)
+        if (!isCurrentUdpRecoverySession(session)) return
 
-        if (telemetryMode == NetworkTelemetryMode.PASSIVE) return
+        if (session.transport == "wireguard" &&
+            (demandExpired || session.udpStallStartedElapsedMillis == null) &&
+            session.pendingUdpControlProbe != null
+        ) {
+            session.pendingUdpControlProbe = null
+            session.udpRecoveryArmed = hasUdpRecoveryBudget(session)
+            return
+        }
 
         session.pendingUdpControlProbe
             ?.takeIf { now >= it.evaluateAtElapsedMillis }
@@ -2117,7 +2175,7 @@ internal object TunnelRuntime {
                     requireBackend().handshakeProbeSucceeded(tunnel, probe.generation)
                 } catch (error: Throwable) {
                     session.pendingUdpControlProbe = null
-                    session.udpRecoveryArmed = true
+                    session.udpRecoveryArmed = hasUdpRecoveryBudget(session)
                     TunnelLog.warning(
                         "tunnel.udp_control_probe_measurement_failed",
                         "udp_control_probe_failed",
@@ -2152,11 +2210,12 @@ internal object TunnelRuntime {
                     ),
                 )
                 session.pendingUdpControlProbe = null
+                if (!canContinueUdpRecovery(session)) return
                 when (action) {
                     UdpControlProbeAction.MARK_TRANSPORT_REACHABLE -> {
-                        session.udpRecoveryAttempts = 0
+                        if (session.transport != "wireguard") session.udpRecoveryAttempts = 0
                         session.udpStallStartedElapsedMillis = null
-                        session.udpRecoveryArmed = true
+                        session.udpRecoveryArmed = hasUdpRecoveryBudget(session)
                     }
                     UdpControlProbeAction.REBIND -> applyUdpRecovery(session, sample)
                     UdpControlProbeAction.RETRY -> session.udpRecoveryArmed = true
@@ -2165,7 +2224,7 @@ internal object TunnelRuntime {
                             "tunnel.udp_recovery_exhausted",
                             "udp_recovery_failed",
                         )
-                        stopAfterUdpRecoveryFailure()
+                        finishFailedUdpRecovery(session)
                         return
                     }
                 }
@@ -2185,8 +2244,10 @@ internal object TunnelRuntime {
             return
         }
 
-        session.udpRecoveryArmed = false
+        if (!hasUdpRecoveryBudget(session)) return
         session.lastUdpRecoveryElapsedMillis = now
+        if (!canContinueUdpRecovery(session)) return
+        session.udpRecoveryArmed = false
         TunnelLog.info(
             "tunnel.udp_stall_detected",
             mapOf(
@@ -2246,6 +2307,45 @@ internal object TunnelRuntime {
         }
     }
 
+    private fun hasUdpRecoveryBudget(session: ActiveTunnelSession): Boolean =
+        session.transport != "wireguard" || session.udpRecoveryAttempts < UDP_RECOVERY_MAX_ATTEMPTS
+
+    private fun isCurrentUdpRecoverySession(session: ActiveTunnelSession): Boolean =
+        activeSession === session &&
+            (session.transport != "wireguard" || (stateGate.current() == SessionState.RUNNING &&
+                !session.networkWasUnavailable &&
+                session.latestWireGuardNetwork.get() === session.appliedWireGuardNetwork))
+
+    private fun canContinueUdpRecovery(session: ActiveTunnelSession): Boolean {
+        val current = isCurrentUdpRecoverySession(session)
+        if (session.transport != "wireguard") return current
+        if (current && wireGuardRecoveryOwnerIsActive(session) && isCurrentUdpRecoverySession(session)) return true
+        // A failed read may be transient. Retry only after the normal cooldown
+        // and a fresh admission check, within the same attempt budget.
+        session.udpRecoveryArmed = hasUdpRecoveryBudget(session)
+        return false
+    }
+
+    private fun wireGuardRecoveryOwnerIsActive(session: ActiveTunnelSession): Boolean {
+        val ownerGeneration = session.wireGuardRecoveryOwnerGeneration ?: return false
+        val context = applicationContext ?: return false
+        // Cancellation is durable before the worker can call TunnelRuntime.stop().
+        val envelope = readRecoveryEnvelope(context) ?: return false
+        if (!envelope.intent.desiredActive || envelope.redundantTransaction != null ||
+            envelope.intent.generation != ownerGeneration
+        ) return false
+        val lease = envelope.leaseTransaction
+        return if (lease == null) {
+            envelope.intent.template == null
+        } else {
+            lease.phase == LeasePhase.ACTIVE_CHECKPOINT && lease.leaseId == session.connectionLeaseId &&
+                !lease.localStopPending && lease.stopOperationId == null
+        }
+    }
+
+    private fun readRecoveryEnvelope(context: Context): AndroidRecoveryEnvelope? =
+        (runCatching { AndroidRecoveryStores.open(context).read() }.getOrNull() as? RecoveryStoreResult.Success)?.value
+
     private fun startUdpControlProbe(
         session: ActiveTunnelSession,
         stage: UdpControlProbeStage,
@@ -2255,7 +2355,14 @@ internal object TunnelRuntime {
     ) {
         val activeBackend = requireBackend()
         val startedAt = SystemClock.elapsedRealtime()
-        val generation = activeBackend.startHandshakeProbe(tunnel)
+        val generation = if (session.transport == "wireguard") {
+            activeBackend.startHandshakeProbe(tunnel) {
+                canStartWireGuardRecovery(session, baseline, activeBackend)
+            }
+        } else {
+            activeBackend.startHandshakeProbe(tunnel)
+        }
+        if (generation == 0L || !canContinueUdpRecovery(session)) return
         val timeoutMillis = activeBackend.handshakeProbeTimeoutMillis(tunnel)
         val completedAt = SystemClock.elapsedRealtime()
         session.pendingUdpControlProbe = PendingUdpControlProbe(
@@ -2281,19 +2388,68 @@ internal object TunnelRuntime {
         )
     }
 
+    private fun wireGuardStallStillPresent(
+        session: ActiveTunnelSession,
+        baseline: NetworkTelemetry,
+        latest: NetworkTelemetry?,
+    ): Boolean = latest != null && latest.tunWriteBytes == baseline.tunWriteBytes &&
+        hasRecentTunnelDemand(session)
+
+    private fun hasRecentTunnelDemand(session: ActiveTunnelSession): Boolean =
+        SystemClock.elapsedRealtime() - session.lastTunActivityElapsedMillis <= UDP_RECOVERY_TUN_ACTIVITY_WINDOW_MILLIS
+
+    private fun canStartWireGuardRecovery(
+        session: ActiveTunnelSession,
+        baseline: NetworkTelemetry,
+        activeBackend: GoBackend,
+    ): Boolean {
+        // Called at the native boundary, after any wait for the VPN service.
+        val latest = runCatching { networkTelemetry(activeBackend) }.getOrNull()
+        if (!canContinueUdpRecovery(session)) return false
+        if (wireGuardStallStillPresent(session, baseline, latest)) return true
+        session.udpRecoveryArmed = hasUdpRecoveryBudget(session)
+        return false
+    }
+
     private fun applyUdpRecovery(session: ActiveTunnelSession, sample: NetworkTelemetry) {
-        session.udpRecoveryAttempts += 1
-        session.lastUdpRecoveryElapsedMillis = SystemClock.elapsedRealtime()
+        if (!isCurrentUdpRecoverySession(session) || !hasUdpRecoveryBudget(session)) return
         val activeBackend = requireBackend()
+        session.udpRecoveryAttempts += 1
         val startedAt = SystemClock.elapsedRealtime()
-        val rebound = try {
-            activeBackend.rebindUdp(tunnel)
-            networkTelemetry(activeBackend) ?: sample
+        session.lastUdpRecoveryElapsedMillis = startedAt
+        val afterRebind = try {
+            if (session.transport == "wireguard") {
+                when (activeBackend.rebindUdp(
+                    tunnel,
+                    { canStartWireGuardRecovery(session, sample, activeBackend) },
+                    { canContinueUdpRecovery(session) },
+                )) {
+                    GoBackend.UdpRebindResult.SKIPPED -> {
+                        session.udpRecoveryAttempts -= 1
+                        session.udpRecoveryArmed = hasUdpRecoveryBudget(session)
+                        return
+                    }
+                    GoBackend.UdpRebindResult.ABORTED -> {
+                        session.udpRecoveryArmed = hasUdpRecoveryBudget(session)
+                        return
+                    }
+                    GoBackend.UdpRebindResult.APPLIED -> Unit
+                }
+            } else {
+                activeBackend.rebindUdp(tunnel)
+            }
+            if (!canContinueUdpRecovery(session)) return
+            networkTelemetry(activeBackend)
         } catch (error: Throwable) {
             TunnelLog.warning("tunnel.udp_recovery_failed", "udp_rebind_failed", error)
-            stopAfterUdpRecoveryFailure()
+            finishFailedUdpRecovery(session)
             return
         }
+        if (session.transport == "wireguard" && !wireGuardStallStillPresent(session, sample, afterRebind)) {
+            session.udpRecoveryArmed = hasUdpRecoveryBudget(session)
+            return
+        }
+        val rebound = afterRebind ?: sample
         val completedAt = SystemClock.elapsedRealtime()
         TunnelLog.info(
             "tunnel.udp_recovery_applied",
@@ -2328,6 +2484,7 @@ internal object TunnelRuntime {
         baseline: NetworkTelemetry,
         cause: Throwable,
     ) {
+        if (!canContinueUdpRecovery(session)) return
         val action = udpControlProbeStartFailureAction(
             stage = stage,
             recoveryAttempts = session.udpRecoveryAttempts,
@@ -2347,15 +2504,20 @@ internal object TunnelRuntime {
             ),
         )
         when (action) {
-            UdpControlProbeAction.REBIND,
-            UdpControlProbeAction.RETRY,
-            -> applyUdpRecovery(session, baseline)
+            UdpControlProbeAction.REBIND -> applyUdpRecovery(session, baseline)
+            UdpControlProbeAction.RETRY -> {
+                if (session.transport == "wireguard") {
+                    session.udpRecoveryArmed = hasUdpRecoveryBudget(session)
+                } else {
+                    applyUdpRecovery(session, baseline)
+                }
+            }
             UdpControlProbeAction.STOP -> {
                 TunnelLog.warning(
                     "tunnel.udp_recovery_exhausted",
                     "udp_recovery_failed",
                 )
-                stopAfterUdpRecoveryFailure()
+                finishFailedUdpRecovery(session)
             }
             UdpControlProbeAction.MARK_TRANSPORT_REACHABLE -> error(
                 "unreachable_successful_probe_start_failure",
@@ -2363,10 +2525,16 @@ internal object TunnelRuntime {
         }
     }
 
-    private fun stopAfterUdpRecoveryFailure() {
-        val session = activeSession
+    private fun finishFailedUdpRecovery(session: ActiveTunnelSession) {
+        if (!canContinueUdpRecovery(session)) return
+        if (session.transport == "wireguard") {
+            // Keep the tunnel and lease. The panel can only replace an AWG3
+            // lease on a dataplane stall; a failed rebind can use its last retry.
+            session.udpRecoveryArmed = hasUdpRecoveryBudget(session)
+            return
+        }
         handOffDataPlaneStall(
-            leaseId = session?.connectionLeaseId,
+            leaseId = session.connectionLeaseId,
             handoff = NelomaiVpnService::reportDataPlaneStall,
             fallback = {
                 // An explicit stop may have taken ownership while native recovery was running.
@@ -2545,7 +2713,7 @@ internal object TunnelRuntime {
         refresh: Boolean = true,
         includeRecentSamples: Boolean = true,
     ) {
-        if (networkTelemetryMode(session.transport) == NetworkTelemetryMode.DISABLED) return
+        if (!supportsUdpRecovery(session.transport)) return
         val now = SystemClock.elapsedRealtime()
         val sample = if (refresh) {
             runCatching { networkTelemetry() }
@@ -2721,7 +2889,7 @@ internal fun shouldRecoverUdpStall(
     millisSinceRecovery: Long?,
     armed: Boolean,
 ): Boolean =
-    transport == "amneziawg_3" &&
+    supportsUdpRecovery(transport) &&
         armed &&
         uptimeMillis >= UDP_RECOVERY_MINIMUM_UPTIME_MILLIS &&
         millisSinceTunActivity in 0..UDP_RECOVERY_TUN_ACTIVITY_WINDOW_MILLIS &&
@@ -2752,7 +2920,6 @@ internal fun udpControlProbeStartFailureAction(
 
 private const val DATA_PLANE_DIAGNOSTICS_INTERVAL_SECONDS = 5L * 60L
 private const val NETWORK_TELEMETRY_INTERVAL_SECONDS = 1L
-private const val PASSIVE_NETWORK_TELEMETRY_INTERVAL_MILLIS = 10_000L
 private const val NETWORK_TELEMETRY_RING_SAMPLES = 45
 private const val MAX_DETAILED_NETWORK_INCIDENTS = 3
 private const val NETWORK_TELEMETRY_ERROR_LOG_INTERVAL_MILLIS = 60_000L
@@ -2889,6 +3056,13 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
 
     companion object {
         fun refreshQuickTile(context: Context) {
+            // requestListeningState does not re-enter an already listening tile.
+            // This wakeup must not advance or acknowledge the UI-change revision.
+            runCatching {
+                context.sendBroadcast(Intent(QUICK_TILE_UPDATE).setPackage(context.packageName))
+            }.onFailure { error ->
+                TunnelLog.warning("quick_state.tile_broadcast_failed", error = error)
+            }
             TileService.requestListeningState(
                 context,
                 ComponentName(context.packageName, QUICK_TILE_SERVICE),

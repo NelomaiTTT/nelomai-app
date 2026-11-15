@@ -9,6 +9,7 @@ struct Tunnel {
     protection: Option<bool>,
     explicit: AtomicUsize,
     scoped: AtomicUsize,
+    peer_eof: AtomicUsize,
 }
 #[async_trait]
 impl TunnelController for Tunnel {
@@ -17,6 +18,10 @@ impl TunnelController for Tunnel {
     }
     async fn stop(&self) -> Result<(), TunnelError> {
         self.explicit.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn stop_on_owner_eof(&self) -> Result<(), TunnelError> {
+        self.peer_eof.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
     async fn stop_if_unowned(&self) -> Result<(), TunnelError> {
@@ -38,6 +43,7 @@ async fn channel_loss_preserves_retained_or_uncertain_protection_but_explicit_st
             protection,
             explicit: AtomicUsize::new(0),
             scoped: AtomicUsize::new(0),
+            peer_eof: AtomicUsize::new(0),
         });
         let local = CoreLocalStop::new(tunnel.clone());
         local.stop_local_on_disconnect().await.unwrap();
@@ -58,4 +64,18 @@ async fn channel_loss_preserves_retained_or_uncertain_protection_but_explicit_st
             usize::from(!preserve) + 2
         );
     }
+}
+
+#[tokio::test]
+async fn broker_eof_leaves_a_protected_vpn_to_its_native_owner() {
+    let tunnel = Arc::new(Tunnel {
+        protection: Some(true),
+        explicit: AtomicUsize::new(0),
+        scoped: AtomicUsize::new(0),
+        peer_eof: AtomicUsize::new(0),
+    });
+    CoreLocalStop::new(tunnel.clone()).stop_local_on_peer_eof().await.unwrap();
+    assert_eq!(tunnel.peer_eof.load(Ordering::SeqCst), 1);
+    assert_eq!(tunnel.scoped.load(Ordering::SeqCst), 0);
+    assert_eq!(tunnel.explicit.load(Ordering::SeqCst), 0);
 }

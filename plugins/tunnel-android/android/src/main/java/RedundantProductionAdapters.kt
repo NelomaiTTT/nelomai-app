@@ -369,25 +369,34 @@ internal class ServiceRedundantConnectionNative(
 
     override fun replacePolicy(
         options: AndroidTunnelOptions,
+        keepTunOnEarlyCancellation: Boolean,
         shouldCancel: () -> Boolean,
-    ): Boolean = synchronized(gate) {
-        val policyPrepare = preparePolicy ?: return@synchronized false
-        val active = activeSlot ?: return@synchronized false
-        if (closedForStop || shouldCancel() || slots[active] == null) {
-            return@synchronized false
+    ): RedundantPolicyReplacement = synchronized(gate) {
+        val policyPrepare = preparePolicy ?: return@synchronized RedundantPolicyReplacement.FAILED
+        val active = activeSlot ?: return@synchronized RedundantPolicyReplacement.FAILED
+        if (closedForStop || slots[active] == null) return@synchronized RedundantPolicyReplacement.FAILED
+        val earlyCancellation = if (keepTunOnEarlyCancellation) {
+            RedundantPolicyReplacement.DEFERRED
+        } else {
+            RedundantPolicyReplacement.FAILED
         }
+        if (shouldCancel()) return@synchronized earlyCancellation
         // These copies live only during replacement and permit a coordinator rollback
         // even if admission fails after the old shared TUN has closed.
         val members = slots.values.sortedBy { if (it.slot == active) 0 else 1 }
         val prepared = mutableListOf<Pair<SlotRuntime, PreparedRedundantConfiguration>>()
+        var replacementStarted = false
         try {
             for (member in members) {
-                if (closedForStop || shouldCancel()) return@synchronized false
+                if (closedForStop) return@synchronized RedundantPolicyReplacement.FAILED
+                if (shouldCancel()) return@synchronized earlyCancellation
                 val bytes = member.configuration.copyOf()
                 try { prepared += member to policyPrepare(bytes, options) }
                 finally { bytes.fill(0) }
             }
-            if (closedForStop || shouldCancel()) return@synchronized false
+            if (closedForStop) return@synchronized RedundantPolicyReplacement.FAILED
+            if (shouldCancel()) return@synchronized earlyCancellation
+            replacementStarted = true
             publishTunReadiness(false)
             session?.let(backend::close)
             session = null
@@ -395,24 +404,25 @@ internal class ServiceRedundantConnectionNative(
             onTunClosed()
             members.forEach { cancelProbeLocked(it) }
             clearStandbyCheckLocked()
-            if (closedForStop || shouldCancel()) return@synchronized false
-            val fd = establishTun(prepared.first().second.config) ?: return@synchronized false
+            if (closedForStop || shouldCancel()) return@synchronized RedundantPolicyReplacement.FAILED
+            val fd = establishTun(prepared.first().second.config)
+                ?: return@synchronized RedundantPolicyReplacement.FAILED
             if (closedForStop || shouldCancel()) {
                 runCatching { closeTunFd(fd) }
-                return@synchronized false
+                return@synchronized RedundantPolicyReplacement.FAILED
             }
             try { captureTransportTun(fd) }
             catch (error: Throwable) { closeTunFd(fd); throw error }
             val newSession = backend.start(fd, active.index, prepared.first().second.userspace)
-                ?: return@synchronized false
+                ?: return@synchronized RedundantPolicyReplacement.FAILED
             session = newSession
             for ((member, config) in prepared.drop(1)) {
                 if (closedForStop || shouldCancel() ||
                     !backend.startSlot(newSession, member.slot.index, config.userspace)
-                ) return@synchronized false
+                ) return@synchronized RedundantPolicyReplacement.FAILED
             }
             if (closedForStop || shouldCancel() || !backend.switchActive(newSession, active.index)) {
-                return@synchronized false
+                return@synchronized RedundantPolicyReplacement.FAILED
             }
             members.forEach { member ->
                 slots[member.slot] = SlotRuntime(member.leaseId, member.slot, member.probe,
@@ -421,16 +431,20 @@ internal class ServiceRedundantConnectionNative(
             }
             transportDiagnostics.begin(elapsedNowMs())
             publishTunReadiness(true)
-            true
+            RedundantPolicyReplacement.APPLIED
         } catch (_: Throwable) {
-            false
+            RedundantPolicyReplacement.FAILED
         } finally {
             prepared.forEach { (_, config) ->
                 config.userspace.fill(0)
                 config.baseConfiguration?.fill(0)
             }
-            if (closedForStop || shouldCancel()) closeForStop()
-            else if (session == null) { closeTransportTun(); onTunClosed() }
+            if (closedForStop || ((replacementStarted || !keepTunOnEarlyCancellation) && shouldCancel())) {
+                closeForStop()
+            } else if (replacementStarted && session == null) {
+                closeTransportTun()
+                onTunClosed()
+            }
         }
     }
 
@@ -520,6 +534,7 @@ internal class ServiceRedundantConnectionNative(
         initialReadiness: Boolean,
         committedStandbyLeaseId: String?,
         freshStart: Boolean,
+        startupStandbyRetryDeadlineMs: Long?,
     ): List<SlotObservation> = synchronized(gate) {
         val nativeSession = session ?: return@synchronized emptyList()
         val epochNow = epochNowMs()
@@ -552,16 +567,20 @@ internal class ServiceRedundantConnectionNative(
             active?.probeFailed == true && activeMetrics != null &&
             !handshakeFresh(activeMetrics, epochNow)
         // Warmup and control-plane commit precede the short initial failover check.
-        // Once a committed member's check starts, never renew it on a failed probe.
         val canStartStandbyCheck = !initialReadiness || slots.values.any {
             it.slot != activeSlot && it.leaseId == committedStandbyLeaseId &&
                 (standbyCheckStartedAtMs != null ||
                     slotReady(it, metricsBySlot.getValue(it.slot.index), epochNow, elapsedNow, initialWarmup))
         }
+        // Only a journaled startup switch can reopen a check, within its original deadline.
+        val startupSwitchNeedsProof = initialReadiness &&
+            startupStandbyRetryDeadlineMs != null && elapsedNow < startupStandbyRetryDeadlineMs
         if (networkAvailable && active != null &&
-            (activeSuspected || initialColdFallback) && canStartStandbyCheck
+            (activeSuspected || initialColdFallback || startupSwitchNeedsProof) && canStartStandbyCheck
         ) {
-            if (standbyCheckStartedAtMs == null) {
+            if (standbyCheckStartedAtMs == null ||
+                (startupSwitchNeedsProof && standbyCheckExpired(elapsedNow))
+            ) {
                 standbyCheckStartedAtMs = elapsedNow
                 standbyCheckFirstProbeAtMs = saturatingAdd(
                     active.lastProbeAtElapsedMs.takeIf { it != Long.MIN_VALUE } ?: elapsedNow,
@@ -571,11 +590,14 @@ internal class ServiceRedundantConnectionNative(
         } else clearStandbyCheckLocked()
         val activeConfirmed = activeHardFailure || (active?.urgentEvidence == true &&
             active.urgentCorroboratedFailures >= REQUIRED_URGENT_FAILURES)
+        // An established session can retry a failed reserve probe in the same check window.
+        val retryFailedStandbyProbe = !initialReadiness
         slots.values.filter { it.slot != activeSlot }.forEach { runtime ->
             val metrics = metricsBySlot.getValue(runtime.slot.index)
             advanceProbeLocked(nativeSession, runtime, elapsedNow,
                 metrics.txPackets, metrics.rxPackets, metrics.sendErrors,
-                holdCompletedStandby = activeConfirmed || initialColdFallback,
+                holdCompletedStandby = activeConfirmed || initialColdFallback || startupSwitchNeedsProof,
+                retryFailedStandbyProbe = retryFailedStandbyProbe,
                 initialWarmup = initialWarmup)
         }
         slots.values.sortedBy { it.slot.index }.map { runtime ->
@@ -609,7 +631,12 @@ internal class ServiceRedundantConnectionNative(
                 // evidence. The next tick starts the confirmed member's fresh check.
                 standbyProbeState = if (initialReadiness && runtime.slot != activeSlot &&
                     runtime.leaseId != committedStandbyLeaseId
-                ) StandbyProbeState.PENDING else standbyProbeStateLocked(runtime, elapsedNow),
+                ) StandbyProbeState.PENDING else standbyProbeStateLocked(runtime, elapsedNow, retryFailedStandbyProbe),
+                successfulProbeValidThroughElapsedMs = if (runtime.consecutiveProbeSuccesses > 0) {
+                    probeResultValidThroughElapsedMs(runtime, elapsedNow)
+                } else null,
+                standbyCheckDeadlineElapsedMs = if (runtime.slot != activeSlot) standbyCheckDeadline() else null,
+                rebindFailureRetryable = runtime.hardFailure && admitted && !closed,
             )
         }
     }
@@ -707,6 +734,7 @@ internal class ServiceRedundantConnectionNative(
         currentRxPackets: Long,
         currentSendErrors: Long,
         holdCompletedStandby: Boolean = false,
+        retryFailedStandbyProbe: Boolean = false,
         initialWarmup: Boolean = false,
     ) {
         if (!networkAvailable) return
@@ -721,7 +749,9 @@ internal class ServiceRedundantConnectionNative(
             clearUrgentFailureLocked(runtime)
         }
         val urgentRxPacketsAtStart = runtime.urgentRxPacketsAtStart
-        if (runtime.urgentEvidence && urgentRxPacketsAtStart != null &&
+        // The reserve's own DNS reply advances the native receive counter.
+        // During a reserve check only its probe status can prove that reply.
+        if (checkStarted == null && runtime.urgentEvidence && urgentRxPacketsAtStart != null &&
             currentRxPackets > urgentRxPacketsAtStart
         ) {
             cancelProbeLocked(runtime)
@@ -776,8 +806,9 @@ internal class ServiceRedundantConnectionNative(
             if (runtime.probeToken != null) return
         }
         if (checkStarted != null && holdCompletedStandby &&
+            (!retryFailedStandbyProbe || !runtime.probeFailed) &&
             runtime.lastCompletedProbeStartedAtMs >= checkStarted &&
-            recentStandbyResult(runtime, elapsedNow)
+            recentProbeResult(runtime, elapsedNow)
         ) return
         val urgent = runtime.urgentEvidence
         val interval = if (runtime.slot == activeSlot || checkStarted != null || initialWarmup) {
@@ -899,32 +930,39 @@ internal class ServiceRedundantConnectionNative(
         standbyCheckFirstProbeAtMs = null
     }
 
-    private fun standbyProbeStateLocked(runtime: SlotRuntime, elapsedNow: Long): StandbyProbeState {
+    private fun standbyProbeStateLocked(
+        runtime: SlotRuntime,
+        elapsedNow: Long,
+        retryFailedStandbyProbe: Boolean,
+    ): StandbyProbeState {
         val since = standbyCheckStartedAtMs?.takeIf { runtime.slot != activeSlot }
             ?: return StandbyProbeState.NOT_REQUIRED
         if (standbyCheckExpired(elapsedNow)) return StandbyProbeState.FAILED
         if (runtime.probe == null || runtime.hardFailure) return StandbyProbeState.FAILED
         if (runtime.probeToken != null) return StandbyProbeState.PENDING
         if (runtime.lastCompletedProbeStartedAtMs >= since && runtime.probeFailed) {
-            return StandbyProbeState.FAILED
+            return if (retryFailedStandbyProbe) StandbyProbeState.PENDING else StandbyProbeState.FAILED
         }
         return if (runtime.lastCompletedProbeStartedAtMs >= since &&
-            runtime.consecutiveProbeSuccesses > 0 && recentStandbyResult(runtime, elapsedNow)
+            runtime.consecutiveProbeSuccesses > 0 && recentProbeResult(runtime, elapsedNow)
         ) StandbyProbeState.SUCCEEDED else StandbyProbeState.PENDING
     }
 
-    private fun recentStandbyResult(runtime: SlotRuntime, elapsedNow: Long): Boolean =
-        runtime.lastCompletedProbeStartedAtMs != Long.MIN_VALUE &&
-            elapsedNow >= runtime.lastCompletedProbeStartedAtMs &&
-            // Native reports success when polled, not its receive timestamp. Allow
-            // one health tick to observe it; pending probes still time out at 2s.
-            elapsedNow - runtime.lastCompletedProbeStartedAtMs <=
-                ACTIVE_PROBE_TIMEOUT_MILLIS + PROBE_RESULT_POLL_GRACE_MILLIS
+    private fun recentProbeResult(runtime: SlotRuntime, elapsedNow: Long): Boolean =
+        probeResultValidThroughElapsedMs(runtime, elapsedNow)?.let { elapsedNow <= it } == true
+
+    private fun probeResultValidThroughElapsedMs(runtime: SlotRuntime, elapsedNow: Long): Long? {
+        val startedAt = runtime.lastCompletedProbeStartedAtMs
+        if (startedAt == Long.MIN_VALUE || startedAt > elapsedNow) return null
+        // Native reports success when polled, so allow one health tick to observe it.
+        return saturatingAdd(startedAt, ACTIVE_PROBE_TIMEOUT_MILLIS + PROBE_RESULT_POLL_GRACE_MILLIS)
+    }
+
+    private fun standbyCheckDeadline(): Long? =
+        standbyCheckStartedAtMs?.let { saturatingAdd(it, STANDBY_CHECK_BUDGET_MILLIS) }
 
     private fun standbyCheckExpired(elapsedNow: Long): Boolean =
-        standbyCheckStartedAtMs?.let { started ->
-            elapsedNow >= started && elapsedNow - started >= STANDBY_CHECK_BUDGET_MILLIS
-        } ?: false
+        standbyCheckDeadline()?.let { elapsedNow >= it } == true
 
     private fun clearUrgentFailureLocked(runtime: SlotRuntime) {
         runtime.urgentStartedAtElapsedMs = null
