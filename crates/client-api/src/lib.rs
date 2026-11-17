@@ -603,12 +603,27 @@ impl ClientApi {
         &self,
         request: &RecoverableRefreshRequest,
     ) -> Result<TokenResponse, ClientApiError> {
-        self.send_json(
-            self.http
-                .post(self.endpoint("auth/refresh-recoverable")?)
-                .json(request),
-        )
-        .await
+        let response = self
+            .send_request(
+                self.http
+                    .post(self.endpoint("auth/refresh-recoverable")?)
+                    .json(request),
+            )
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            // The refresh broker only needs the status and retry delay.
+            // Reading the error body could exhaust the IPC deadline.
+            let retry_after_seconds =
+                parse_retry_after_seconds(response.headers().get(RETRY_AFTER));
+            if retry_after_seconds.is_some() {
+                return Err(ClientApiError::InvalidErrorResponse {
+                    status,
+                    retry_after_seconds,
+                });
+            }
+        }
+        Self::json_response(response).await
     }
 }
 
@@ -843,7 +858,10 @@ pub enum ClientApiError {
         retry_after_seconds: Option<u64>,
     },
     #[error("panel returned an invalid error response ({status})")]
-    InvalidErrorResponse { status: StatusCode },
+    InvalidErrorResponse {
+        status: StatusCode,
+        retry_after_seconds: Option<u64>,
+    },
     #[error("{code}")]
     InvalidPayload { code: &'static str },
     #[error("{code}: payload exceeds the {limit_bytes}-byte limit")]
@@ -867,7 +885,7 @@ impl UpdateBootstrapFailure {
             }
             ClientApiError::ControlTransportUnavailable => true,
             ClientApiError::Api { status, .. }
-            | ClientApiError::InvalidErrorResponse { status } => status.is_server_error(),
+            | ClientApiError::InvalidErrorResponse { status, .. } => status.is_server_error(),
             _ => false,
         };
         if temporary {
@@ -966,6 +984,10 @@ impl ClientApiError {
             Self::Api {
                 retry_after_seconds,
                 ..
+            }
+            | Self::InvalidErrorResponse {
+                retry_after_seconds,
+                ..
             } => *retry_after_seconds,
             _ => None,
         }
@@ -974,7 +996,7 @@ impl ClientApiError {
     pub fn disables_new_connection_intent_operations(&self) -> bool {
         matches!(
             self,
-            Self::Api { status, .. } | Self::InvalidErrorResponse { status }
+            Self::Api { status, .. } | Self::InvalidErrorResponse { status, .. }
                 if *status == StatusCode::NOT_FOUND
         ) || matches!(
             self.stable_code(),
@@ -1501,7 +1523,10 @@ impl ClientApi {
         let response = self.send_request(request).await?;
         let status = response.status();
         if !status.is_success() {
-            return Err(ClientApiError::InvalidErrorResponse { status });
+            return Err(ClientApiError::InvalidErrorResponse {
+                status,
+                retry_after_seconds: parse_retry_after_seconds(response.headers().get(RETRY_AFTER)),
+            });
         }
         Self::read_limited_json(
             response,
@@ -2382,11 +2407,7 @@ impl ClientApi {
 
     async fn api_error(response: Response, status: StatusCode) -> ClientApiError {
         let retry_after_seconds = parse_retry_after_seconds(response.headers().get(RETRY_AFTER));
-        let payload = response
-            .json::<ErrorPayload>()
-            .await
-            .map_err(|_| ClientApiError::InvalidErrorResponse { status });
-        match payload {
+        match response.json::<ErrorPayload>().await {
             Ok(payload) => ClientApiError::Api {
                 status,
                 request_id: payload.request_id,
@@ -2394,7 +2415,10 @@ impl ClientApi {
                 message: payload.message,
                 retry_after_seconds,
             },
-            Err(error) => error,
+            Err(_) => ClientApiError::InvalidErrorResponse {
+                status,
+                retry_after_seconds,
+            },
         }
     }
 }
@@ -2691,6 +2715,7 @@ mod tests {
 
         let malformed_missing = ClientApiError::InvalidErrorResponse {
             status: StatusCode::NOT_FOUND,
+            retry_after_seconds: None,
         };
         assert!(malformed_missing.disables_new_connection_intent_operations());
 

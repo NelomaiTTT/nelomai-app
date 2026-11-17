@@ -714,7 +714,7 @@ impl From<ClientApiError> for CoreApiError {
                 message,
                 retry_after_seconds,
             },
-            ClientApiError::InvalidErrorResponse { status } if status.is_server_error() => {
+            ClientApiError::InvalidErrorResponse { status, .. } if status.is_server_error() => {
                 Self::Retryable
             }
             ClientApiError::InvalidPayload { code }
@@ -1282,6 +1282,8 @@ pub enum CoreError {
     AuthenticationOutcomeUnknown,
     #[error("требуется восстановление авторизации контейнером")]
     AuthRecoveryRequired,
+    #[error("обновление авторизации ещё не завершилось")]
+    AuthRefreshPending,
     #[error("требуется вход в приложение")]
     SignedOut,
     #[error("срок доступа истёк")]
@@ -3704,8 +3706,10 @@ where
                 }
                 self.logger.record(CoreLogEvent {
                     kind: if desktop_cleanup_pending
-                        && matches!(error, CoreError::Api(CoreApiError::Retryable))
-                    {
+                        && matches!(
+                            error,
+                            CoreError::AuthRefreshPending | CoreError::Api(CoreApiError::Retryable)
+                        ) {
                         "connection.stop_cleanup_pending"
                     } else {
                         "connection.stop_failed"
@@ -6480,7 +6484,9 @@ fn phase_for_start_error(error: &CoreError) -> Phase {
         }
         CoreError::UpdateRequired => Phase::UpdateRequired,
         CoreError::StartCancelled => Phase::Ready,
-        CoreError::Api(CoreApiError::Retryable) => Phase::ServerUnavailable,
+        CoreError::AuthRefreshPending | CoreError::Api(CoreApiError::Retryable) => {
+            Phase::ServerUnavailable
+        }
         CoreError::Api(CoreApiError::Rejected { code, .. }) if transient_start_rejection(code) => {
             Phase::ServerUnavailable
         }
@@ -6494,7 +6500,7 @@ fn phase_for_start_error(error: &CoreError) -> Phase {
 
 fn start_error_preserves_operation(error: &CoreError) -> bool {
     match error {
-        CoreError::StartCancelled => true,
+        CoreError::StartCancelled | CoreError::AuthRefreshPending => true,
         CoreError::Api(CoreApiError::Retryable) => {
             classify_recovery("transport_error", RecoveryPolicyContext::default())
                 .preserves_operation()

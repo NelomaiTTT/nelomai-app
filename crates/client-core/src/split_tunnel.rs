@@ -1728,7 +1728,7 @@ where
             .await;
         let revision = match self.request_split_tunnel_revision(&mut access_token).await {
             Ok(revision) => revision,
-            Err(CoreError::Api(CoreApiError::Retryable)) => {
+            Err(CoreError::AuthRefreshPending | CoreError::Api(CoreApiError::Retryable)) => {
                 state.last_revision_check_unix = Some(now_unix);
                 self.split_tunnel_store
                     .save(&state)
@@ -1796,7 +1796,7 @@ where
 
         let policy = match self.request_split_tunnel_policy(&mut access_token).await {
             Ok(policy) => policy,
-            Err(CoreError::Api(CoreApiError::Retryable)) => {
+            Err(CoreError::AuthRefreshPending | CoreError::Api(CoreApiError::Retryable)) => {
                 self.split_tunnel_store
                     .save(&state)
                     .map_err(|_| CoreError::Storage)?;

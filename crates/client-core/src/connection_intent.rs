@@ -120,6 +120,10 @@ pub struct RecoveryPolicyContext {
 
 pub fn classify_recovery(code: &str, context: RecoveryPolicyContext) -> RecoveryDecision {
     match code {
+        // The credential owner controls when the next refresh HTTP request can
+        // run, including Retry-After. Recheck access without advancing the
+        // connection's network backoff or allocating another Start operation.
+        "auth_refresh_pending" => RecoveryDecision::RetryAfter(2),
         "transport_error"
         | "http_5xx"
         | "connection_unavailable"

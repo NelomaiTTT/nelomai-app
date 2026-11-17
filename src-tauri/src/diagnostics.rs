@@ -85,6 +85,7 @@ pub(crate) struct ConnectionIntentDiagnosticActions {
 pub(crate) struct ConnectionIntentDiagnosticsEpisode {
     report_queued: bool,
     notification_sent: bool,
+    auth_wait_since: Option<std::time::Instant>,
 }
 
 impl ConnectionIntentDiagnosticsEpisode {
@@ -92,9 +93,26 @@ impl ConnectionIntentDiagnosticsEpisode {
         &mut self,
         delay_seconds: u64,
     ) -> ConnectionIntentDiagnosticActions {
+        self.auth_wait_since = None;
         if delay_seconds < 300 {
             return ConnectionIntentDiagnosticActions::default();
         }
+        self.observe_slow_recovery()
+    }
+
+    pub(crate) fn observe_auth_retry(
+        &mut self,
+        now: std::time::Instant,
+    ) -> ConnectionIntentDiagnosticActions {
+        let since = *self.auth_wait_since.get_or_insert(now);
+        // Short local checks should still report a persistent auth outage.
+        if now.saturating_duration_since(since) < Duration::from_secs(120) {
+            return ConnectionIntentDiagnosticActions::default();
+        }
+        self.observe_slow_recovery()
+    }
+
+    fn observe_slow_recovery(&mut self) -> ConnectionIntentDiagnosticActions {
         let actions = ConnectionIntentDiagnosticActions {
             queue_report: !self.report_queued,
             notify_user: !self.notification_sent,
@@ -170,6 +188,7 @@ impl ConnectionIntentReasonClass {
             | "awg3_profile_apply_failed"
             | "awg3_profile_transform_mismatch" => Self::Profile,
             "signed_out"
+            | "auth_refresh_pending"
             | "access_expired"
             | "background_credential_unavailable"
             | "invalid_background_token"
@@ -1932,6 +1951,29 @@ mod tests {
                 queue_report: true,
                 notify_user: true,
             },
+        );
+    }
+
+    #[test]
+    fn short_auth_rechecks_still_report_a_prolonged_wait_once() {
+        let mut episode = ConnectionIntentDiagnosticsEpisode::default();
+        let start = std::time::Instant::now();
+        for second in [0, 2, 119] {
+            assert_eq!(
+                episode.observe_auth_retry(start + Duration::from_secs(second)),
+                ConnectionIntentDiagnosticActions::default()
+            );
+        }
+        assert_eq!(
+            episode.observe_auth_retry(start + Duration::from_secs(120)),
+            ConnectionIntentDiagnosticActions {
+                queue_report: true,
+                notify_user: true,
+            }
+        );
+        assert_eq!(
+            episode.observe_auth_retry(start + Duration::from_secs(122)),
+            ConnectionIntentDiagnosticActions::default()
         );
     }
 

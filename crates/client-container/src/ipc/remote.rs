@@ -1761,8 +1761,11 @@ impl RuntimeAuthProvider for PrivateRuntimeAuthClient {
                 deadline,
             )
             .await
-            .map_err(core_error)?
-        {
+            .map_err(|error| match error {
+                #[cfg(not(target_os = "android"))]
+                PrivateError::RefreshPending => CoreError::AuthRefreshPending,
+                _ => core_error(error),
+            })? {
             AuthResponseV1::State {
                 state: RuntimeAuthState::LoggedOut,
                 ..

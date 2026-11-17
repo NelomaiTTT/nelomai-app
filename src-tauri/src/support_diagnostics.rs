@@ -213,7 +213,7 @@ async fn send_snapshot(
         ClientApiError::InvalidPayload {
             code: "support_code_invalid",
         } => "support_code_invalid",
-        ClientApiError::InvalidErrorResponse { status } => match status.as_u16() {
+        ClientApiError::InvalidErrorResponse { status, .. } => match status.as_u16() {
             401 if support_code.is_some() => "support_code_invalid",
             404 | 405 => "support_unavailable",
             429 => "support_rate_limited",
@@ -852,6 +852,10 @@ pub(super) fn safe_event(value: Value) -> Option<Map<String, Value>> {
                     (kind, code),
                     ("connection.handshake_wait_timed_out", "initial")
                         | ("connection.handshake_gate_skipped", "metrics_unsupported")
+                        | (
+                            "auth.refresh.pending",
+                            "http_interrupted" | "http_deadline_exceeded"
+                        )
                 )
                 || nelomai_client_updater::is_diagnostic_error_code(code)
                 || matches!(

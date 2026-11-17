@@ -438,6 +438,23 @@ struct RefreshRetry {
     delay: u64,
     terminal: bool,
 }
+
+struct RefreshHttpAttempt<'a> {
+    broker: &'a AuthBroker,
+    ticket: &'a BrokerRequestV1,
+    completed: bool,
+}
+
+impl Drop for RefreshHttpAttempt<'_> {
+    fn drop(&mut self) {
+        // A caller can enforce a shorter deadline than the HTTP request's
+        // own timer. No result branch runs when it drops the exchange.
+        if !self.completed {
+            self.broker
+                .record_refresh("auth.refresh.pending", self.ticket, "http_interrupted");
+        }
+    }
+}
 #[cfg(test)]
 pub(crate) async fn hold_test_issuance(broker: &AuthBroker) -> tokio::sync::MutexGuard<'_, ()> {
     broker.issuance.lock().await
@@ -2634,8 +2651,15 @@ impl AuthBroker {
                 &ticket,
                 ticket.refresh.as_ref().unwrap().mode.as_str(),
             );
+            let mut http = RefreshHttpAttempt {
+                broker: self,
+                ticket: &ticket,
+                completed: false,
+            };
             let result =
                 tokio::time::timeout(REQUEST_TIMEOUT, self.api.refresh_recoverable(&request)).await;
+            http.completed = true;
+            drop(http);
             let response = match result {
                 Ok(Ok(response)) => response,
                 failure => {
@@ -2652,7 +2676,7 @@ impl AuthBroker {
                             );
                         state.terminal = match error {
                             ClientApiError::Api { status, .. }
-                            | ClientApiError::InvalidErrorResponse { status } => {
+                            | ClientApiError::InvalidErrorResponse { status, .. } => {
                                 status.is_client_error()
                                     && status.as_u16() != 429
                                     && status.as_u16() != 408
@@ -2671,6 +2695,8 @@ impl AuthBroker {
                         &ticket,
                         if state.terminal {
                             "rejected"
+                        } else if failure.is_err() {
+                            "http_deadline_exceeded"
                         } else {
                             "retryable"
                         },

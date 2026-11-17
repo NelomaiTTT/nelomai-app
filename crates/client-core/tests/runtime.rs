@@ -2636,7 +2636,7 @@ impl nelomai_client_core::RuntimeAuthProvider for PendingRefreshAuth {
             return self.inner.access(None).await;
         };
         if !self.refresh_available.load(Ordering::SeqCst) {
-            return Err(CoreApiError::Retryable.into());
+            return Err(CoreError::AuthRefreshPending);
         }
         let refreshed = self.inner.access(Some(stale)).await?;
         *pending = None;
@@ -2695,7 +2695,7 @@ async fn desktop_local_stop_remains_pending_until_authorization_and_server_clean
         .push_back(Err(CoreApiError::Unauthorized));
     assert!(matches!(
         core.retry_pending_stop_cleanup().await,
-        Err(CoreError::Api(CoreApiError::Retryable))
+        Err(CoreError::AuthRefreshPending)
     ));
     assert!(owner.pending.lock().await.is_some());
     assert_eq!(core.state().await.phase, Phase::Stopping);
@@ -2720,7 +2720,7 @@ async fn desktop_local_stop_remains_pending_until_authorization_and_server_clean
 
     assert!(matches!(
         core.retry_pending_stop_cleanup().await,
-        Err(CoreError::Api(CoreApiError::Retryable))
+        Err(CoreError::AuthRefreshPending)
     ));
     assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 1);
     assert!(core.local_stop_pending_cleanup().await);
@@ -9981,6 +9981,13 @@ fn connection_intent_explicit_retry_rearms_a_blocked_terminal_intent() {
 }
 
 #[test]
+fn pending_token_refresh_retries_the_same_connection_without_network_backoff() {
+    let decision = classify_recovery("auth_refresh_pending", RecoveryPolicyContext::default());
+    assert_eq!(decision, RecoveryDecision::RetryAfter(2));
+    assert!(decision.preserves_operation());
+}
+
+#[test]
 fn connection_intent_classifier_matches_the_shared_policy_fixture() {
     let raw = std::fs::read_to_string(
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -10274,6 +10281,73 @@ async fn connection_intent_busy_retry_reuses_the_durable_operation_id() {
             "{code} must retry the exact server operation",
         );
     }
+}
+
+#[cfg(not(target_os = "android"))]
+async fn start_waiting_for_authorization(cancel: bool) {
+    let api = Arc::new(MockApi::new(0));
+    api.start_errors
+        .lock()
+        .unwrap()
+        .push_back(CoreApiError::Unauthorized);
+    let store = Arc::new(MemoryStore::new(auth()));
+    let local = nelomai_client_core::CoreLocalStop::new(Arc::new(MemoryTunnel::default()));
+    let owner = Arc::new(PendingRefreshAuth {
+        inner: Arc::new(support::TestOwner::new(
+            api.clone(),
+            store.clone(),
+            local.clone(),
+        )),
+        pending: tokio::sync::Mutex::new(None),
+        refresh_available: AtomicBool::new(false),
+    });
+    let core = nelomai_client_core::ClientCore::new(
+        api.clone(),
+        Arc::new(support::LegacyRuntime::new(store.clone())),
+        owner.clone(),
+        local,
+        Arc::new(MemoryLogger::default()),
+    );
+
+    let epoch = core.begin_start_attempt();
+    assert!(matches!(
+        core.connection_intent_attempt_with_cancellation_epoch(options(), 1_700_000_000, epoch)
+            .await,
+        Err(CoreError::AuthRefreshPending)
+    ));
+    core.finish_start_attempt();
+    let start = store.load().unwrap().unwrap().pending_start.unwrap();
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 1);
+
+    if cancel {
+        assert!(core.signal_start_cancellation());
+    }
+    owner.refresh_available.store(true, Ordering::SeqCst);
+    let retry = core
+        .connection_intent_attempt_with_cancellation_epoch(options(), 1_700_000_002, epoch)
+        .await;
+    if cancel {
+        assert!(matches!(retry, Err(CoreError::StartCancelled)));
+        assert_eq!(api.start_calls.load(Ordering::SeqCst), 1);
+        return;
+    }
+    retry.unwrap();
+    let sent = api.start_requests.lock().unwrap();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0], sent[1]);
+    assert_eq!(sent[1].operation_id, start.operation_id);
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test(start_paused = true)]
+async fn connection_intent_reuses_the_pending_start_after_authorization_recovers() {
+    start_waiting_for_authorization(false).await;
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test(start_paused = true)]
+async fn connection_intent_stop_prevents_replaying_start_after_authorization_recovers() {
+    start_waiting_for_authorization(true).await;
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]

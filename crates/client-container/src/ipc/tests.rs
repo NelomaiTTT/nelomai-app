@@ -2426,7 +2426,10 @@ async fn nlm071_bounded_refresh(expired_replay: bool) {
                 let call = observed.fetch_add(1, Ordering::SeqCst);
                 // Each HTTP operation fits 10s individually. Expired replay
                 // needs a second one under the SAME IPC operation deadline.
-                tokio::time::sleep(Duration::from_secs(if expired_replay { 5 } else { 9 })).await;
+                if call == 0 || expired_replay {
+                    tokio::time::sleep(Duration::from_secs(if expired_replay { 5 } else { 9 }))
+                        .await;
+                }
                 axum::Json(serde_json::json!({
                     "api_version":"1", "request_id":"synthetic", "token_type":"Bearer",
                     "access_token":"recovered-access", "access_expires_in":if expired_replay && call == 0 { 0 } else { 900 },
@@ -2459,19 +2462,12 @@ async fn nlm071_bounded_refresh(expired_replay: bool) {
         .unwrap();
     let old = fixture.client.access(None).await.unwrap();
     let started = Instant::now();
-    let result = fixture
-        .client
-        .request(
-            AuthRequestV1::AccessToken {
-                stamp: Some(crate::ScopeStamp::from_access(&old)),
-                stale: Some(old.clone()),
-            },
-            started + REQUEST_BUDGET,
-        )
-        .await;
-    server.abort();
+    let result = fixture.client.access(Some(&old)).await;
     assert!(
-        matches!(result, Err(PrivateError::RefreshPending)),
+        matches!(
+            result,
+            Err(nelomai_client_core::CoreError::AuthRefreshPending)
+        ),
         "owner must deliver pending instead of closing the peer: {result:?}"
     );
     assert!(started.elapsed() < REQUEST_BUDGET);
@@ -2494,12 +2490,26 @@ async fn nlm071_bounded_refresh(expired_replay: bool) {
     let auth = fixture.auth.load().unwrap().unwrap();
     let pending = auth.broker.unwrap().pending_request.unwrap();
     assert_eq!(pending.kind, BrokerRequestKind::Refresh);
-    let received = requests.lock().unwrap();
-    assert_eq!(
-        pending.operation_id,
-        received.last().unwrap()["operation_id"].as_str().unwrap()
+    {
+        let received = requests.lock().unwrap();
+        assert_eq!(
+            pending.operation_id,
+            received.last().unwrap()["operation_id"].as_str().unwrap()
+        );
+        assert_eq!(received[0]["refresh_token"], "synthetic-refresh");
+        if expired_replay {
+            assert_eq!(received[1]["refresh_token"], "recovered-refresh");
+            assert_ne!(received[0]["operation_id"], received[1]["operation_id"]);
+        }
+    }
+    assert!(
+        fixture.broker.take_refresh_events().iter().any(|event| {
+            event.operation_id == pending.operation_id
+                && event.kind == "auth.refresh.pending"
+                && event.code == "http_interrupted"
+        }),
+        "the interrupted HTTP exchange must be visible even when its caller times out"
     );
-    assert_eq!(received[0]["refresh_token"], "synthetic-refresh");
     assert_eq!(auth.logout_state, LogoutState::Active);
     assert_eq!(
         auth.access_token.as_deref(),
@@ -2509,10 +2519,23 @@ async fn nlm071_bounded_refresh(expired_replay: bool) {
             "synthetic-access"
         })
     );
-    if expired_replay {
-        assert_eq!(received[1]["refresh_token"], "recovered-refresh");
-        assert_ne!(received[0]["operation_id"], received[1]["operation_id"]);
+    if !expired_replay {
+        let access = fixture.client.access(None).await.unwrap();
+        assert_eq!(access.access_token(), "recovered-access");
+        assert!(fixture
+            .auth
+            .load()
+            .unwrap()
+            .unwrap()
+            .broker
+            .unwrap()
+            .pending_request
+            .is_none());
+        let received = requests.lock().unwrap();
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0], received[1]);
     }
+    server.abort();
 }
 
 #[tokio::test]
@@ -2807,16 +2830,103 @@ async fn readmission_rejects_changed_authority_after_scope_check() {
 #[tokio::test]
 async fn private_access_waits_for_live_refresh_without_false_recovery() {
     for stale_request in [false, true] {
-        private_access_during_refresh(stale_request, false).await;
+        private_access_during_refresh(stale_request, None).await;
     }
 }
 
 #[tokio::test]
 async fn private_access_preserves_recovery_after_failed_refresh() {
-    private_access_during_refresh(false, true).await;
+    for body in [
+        r#"{"request_id":"synthetic","code":"refresh_rate_limited","message":"synthetic"}"#,
+        "Too many requests",
+    ] {
+        private_access_during_refresh(false, Some(body)).await;
+    }
 }
 
-async fn private_access_during_refresh(stale_request: bool, fail: bool) {
+#[tokio::test]
+async fn private_access_honors_retry_after_when_error_body_stalls() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let observed = observed.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut chunk = [0; 1024];
+                loop {
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                assert!(request.starts_with(b"POST /api/client/v1/auth/refresh-recoverable "));
+                let attempt = observed.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    // Send complete headers followed by an incomplete body.
+                    socket
+                        .write_all(
+                            concat!(
+                                "HTTP/1.1 429 Too Many Requests\r\n",
+                                "Retry-After: 30\r\n",
+                                "Content-Type: application/json\r\n",
+                                "Content-Length: 100\r\n\r\n{",
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    std::future::pending::<()>().await;
+                } else {
+                    socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                }
+            });
+        }
+    });
+    let fixture = Fixture::new(api, true);
+    let mut initial = fixture.auth.load().unwrap().unwrap();
+    initial.broker.as_mut().unwrap().confirmed_device_id = Some("device".into());
+    fixture.auth.save(&initial).unwrap();
+    fixture
+        .parent
+        .admit_empty_current(&fixture.broker)
+        .await
+        .unwrap();
+    let old = fixture.client.access(None).await.unwrap();
+    let result = fixture
+        .client
+        .request(
+            AuthRequestV1::AccessToken {
+                stamp: Some(crate::ScopeStamp::from_access(&old)),
+                stale: Some(old),
+            },
+            Instant::now() + AUTH_REPLY_MARGIN + Duration::from_secs(2),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(PrivateError::RefreshPending)),
+        "{result:?}"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(matches!(
+        fixture.client.access(None).await,
+        Err(nelomai_client_core::CoreError::AuthRefreshPending)
+    ));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "Retry-After was already sent in complete response headers"
+    );
+    server.abort();
+}
+
+async fn private_access_during_refresh(stale_request: bool, rate_limit_body: Option<&'static str>) {
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let calls = Arc::new(AtomicUsize::new(0));
@@ -2834,8 +2944,13 @@ async fn private_access_during_refresh(stale_request: bool, fail: bool) {
             observed.fetch_add(1, Ordering::SeqCst);
             incoming.notify_one();
             released.notified().await;
-            if fail {
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            if let Some(body) = rate_limit_body {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", "30")],
+                    body,
+                )
+                    .into_response()
             } else {
                 axum::Json(serde_json::json!({
                     "api_version":"1", "request_id":"synthetic", "token_type":"Bearer",
@@ -2876,15 +2991,20 @@ async fn private_access_during_refresh(stale_request: bool, fail: bool) {
     release.notify_one();
     let refreshed = refresh.await.unwrap();
     let result = waiting.await;
-    if fail {
-        assert!(refreshed.is_err());
-        assert!(matches!(
-            result,
-            Err(nelomai_client_core::CoreError::Api(
-                nelomai_client_core::CoreApiError::Retryable
-            ))
-        ));
-        assert!(fixture.client.access(None).await.is_err());
+    if rate_limit_body.is_some() {
+        use nelomai_client_core::CoreError::AuthRefreshPending;
+        assert!(matches!(refreshed, Err(AuthRefreshPending)));
+        assert!(matches!(result, Err(AuthRefreshPending)));
+        // Let the initial local cooldown elapse. The panel's longer delay
+        // must still prevent the next access check from issuing any HTTP.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let retry = tokio::time::timeout(Duration::from_secs(1), fixture.client.access(None)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "Retry-After must prevent repeat HTTP"
+        );
+        assert!(matches!(retry, Ok(Err(AuthRefreshPending))), "{retry:?}");
         assert!(fixture
             .auth
             .load()

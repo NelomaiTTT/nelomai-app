@@ -1052,6 +1052,7 @@ impl CommandError {
         match error {
             CoreError::AuthenticationOutcomeUnknown => Self::new("authentication_outcome_unknown", "Исход входа неизвестен; требуется явный повторный вход"),
             CoreError::AuthRecoveryRequired => Self::new("auth_recovery_required", "Требуется восстановление авторизации и безопасное завершение старого подключения"),
+            CoreError::AuthRefreshPending => Self::new("auth_refresh_pending", "Завершаем обновление авторизации"),
             CoreError::SignedOut => Self::new("signed_out", "Нужно снова войти в приложение"),
             CoreError::AccessExpired => Self::new("access_expired", "Срок доступа уже истёк"),
             CoreError::UpdateRequired => Self::new(

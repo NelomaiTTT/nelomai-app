@@ -612,6 +612,7 @@ fn automatic_upload_error_code(error: &ApplicationError) -> String {
         ApplicationError::Core(error) => match error {
             CoreError::AuthenticationOutcomeUnknown => "authentication_outcome_unknown".to_string(),
             CoreError::AuthRecoveryRequired => "auth_recovery_required".to_string(),
+            CoreError::AuthRefreshPending => "auth_refresh_pending".to_string(),
             CoreError::SignedOut => "signed_out".to_string(),
             CoreError::AccessExpired => "access_expired".to_string(),
             CoreError::UpdateRequired => "update_required".to_string(),
@@ -808,9 +809,9 @@ where
         let ready_role_retry = matches!(
             &result,
             Ok(Err(ApplicationError::Api(CoreApiError::Retryable)
-                | ApplicationError::Core(CoreError::Api(
-                    CoreApiError::Retryable
-                ))))
+                | ApplicationError::Core(
+                    CoreError::AuthRefreshPending | CoreError::Api(CoreApiError::Retryable)
+                )))
         ) && matches!(
             &step,
             Ok(Ok(Some(snapshot))) if {
@@ -2172,6 +2173,8 @@ mod tests {
             ("healthy", 11),
             ("transient_role", 11),
             ("transient_core_role", 11),
+            ("auth_pending_role", 11),
+            ("auth_pending_confirmed_member", 25),
             ("rate_limited", 55),
             ("rejected_without_hint", 25),
             ("unauthorized", 25),
@@ -2195,14 +2198,16 @@ mod tests {
             state.standby_installed(standby, 1).unwrap();
             let promotion = state.promotion_ticket(&scope, Slot::B).unwrap();
             state.promote(promotion, || Ok::<_, ()>(())).unwrap();
-            if case == "confirmed_member" {
+            let confirmed_member =
+                matches!(case, "confirmed_member" | "auth_pending_confirmed_member");
+            if confirmed_member {
                 assert!(state.ack_role(&state.role_update().unwrap(), 1));
             }
             let mut snapshot = Snapshot {
                 session: state.snapshot(),
                 leases: [Some("a".into()), Some("b".into())],
                 current_leases: [Some("a".into()), Some("b".into())],
-                standby_failed: case == "confirmed_member",
+                standby_failed: confirmed_member,
                 stalled: false,
                 primary_ready: case != "unready",
                 standby_ready: true,
@@ -2225,6 +2230,11 @@ mod tests {
                     match case {
                         "healthy" => Ok(None),
                         "transient_role" => Err(ApplicationError::Api(CoreApiError::Retryable)),
+                        "auth_pending_role" | "auth_pending_confirmed_member" => {
+                            Err(ApplicationError::Core(
+                                nelomai_client_core::CoreError::AuthRefreshPending,
+                            ))
+                        }
                         "unauthorized" => Err(ApplicationError::Api(CoreApiError::Unauthorized)),
                         "rejected_without_hint" => {
                             Err(ApplicationError::Api(CoreApiError::Rejected {

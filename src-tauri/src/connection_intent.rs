@@ -1165,6 +1165,8 @@ impl DesktopConnectionIntent {
             return Ok(StartCommandResponse::recovering(Some(next)));
         }
         let code = stable_error_code(&error);
+        let auth_refresh_pending =
+            matches!(error, ApplicationError::Core(CoreError::AuthRefreshPending));
         let retry_after_seconds = error_retry_after_seconds(&error);
         let command_error = CommandError::from(error);
         let reason_class = ConnectionIntentReasonClass::from_code(&code);
@@ -1226,7 +1228,11 @@ impl DesktopConnectionIntent {
                 let delay_seconds = next
                     .map(|next| next.saturating_sub(now).max(0) as u64)
                     .unwrap_or_default();
-                let actions = state.diagnostics_episode.observe_retry(delay_seconds);
+                let actions = if auth_refresh_pending {
+                    state.diagnostics_episode.observe_auth_retry(Instant::now())
+                } else {
+                    state.diagnostics_episode.observe_retry(delay_seconds)
+                };
                 (decision, next, actions, state.retry_count, delay_seconds)
             }
         };
@@ -1798,6 +1804,7 @@ fn stable_error_code(error: &ApplicationError) -> String {
         ApplicationError::Core(error) => match error {
             CoreError::AuthenticationOutcomeUnknown => "authentication_outcome_unknown".to_string(),
             CoreError::AuthRecoveryRequired => "auth_recovery_required".to_string(),
+            CoreError::AuthRefreshPending => "auth_refresh_pending".to_string(),
             CoreError::SignedOut => "signed_out".to_string(),
             CoreError::AccessExpired => "access_expired".to_string(),
             CoreError::UpdateRequired => "update_required".to_string(),
