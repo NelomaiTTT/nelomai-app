@@ -2600,6 +2600,65 @@ fn desktop_pair_fixture() -> (
 }
 
 #[cfg(not(target_os = "android"))]
+#[tokio::test(start_paused = true)]
+async fn desktop_pair_status_and_local_stop_can_run_while_coordination_waits_for_auth() {
+    let (initial, api, store, tunnel) = desktop_pair_fixture();
+    let epoch = initial.begin_start_attempt();
+    initial
+        .desktop_connection_intent_attempt_with_cancellation_epoch(
+            options(),
+            1_700_000_000,
+            true,
+            epoch,
+        )
+        .await
+        .unwrap();
+
+    let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+    let owner = Arc::new(HeldCleanupAuth {
+        inner: Arc::new(support::TestOwner::new(
+            api.clone(),
+            Arc::new(MemoryStore::new(auth())),
+            local.clone(),
+        )),
+        hold_refresh: false,
+        entered: Notify::new(),
+        release: Notify::new(),
+        completed: AtomicUsize::new(0),
+    });
+    let core = PairCore::new(
+        api,
+        store.clone(),
+        owner.clone(),
+        local,
+        Arc::new(MemoryLogger::default()),
+    );
+    let status_deadline = Duration::from_secs(2);
+    let (tick, stopped) = tokio::join!(core.desktop_redundancy_tick(Vec::new()), async {
+        tokio::time::timeout(status_deadline, owner.entered.notified())
+            .await
+            .expect("coordination reached the authorization wait");
+        let snapshot = tokio::time::timeout(status_deadline, core.desktop_redundancy_status())
+            .await
+            .expect("local status must remain available during authorization")
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.primary_ready);
+        tokio::time::timeout(status_deadline, core.stop_locally())
+            .await
+            .expect("local Stop must remain available during authorization")
+            .unwrap();
+        let stopped = store.value.lock().unwrap().desktop_redundancy.clone();
+        owner.release.notify_one();
+        stopped
+    });
+    assert!(tick.unwrap().is_none());
+    assert!(stopped.as_ref().unwrap().stop.is_some());
+    assert_eq!(store.value.lock().unwrap().desktop_redundancy, stopped);
+    assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
+}
+
+#[cfg(not(target_os = "android"))]
 struct PendingRefreshAuth {
     inner: Arc<dyn nelomai_client_core::RuntimeAuthProvider>,
     pending: tokio::sync::Mutex<Option<AccessSnapshot>>,

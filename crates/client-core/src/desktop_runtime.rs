@@ -83,16 +83,33 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
             return Ok(None);
         };
         let cancel_epoch = StartCancellationEpoch(self.start_cancel_epoch.load(Ordering::SeqCst));
-        let (stored, pair, snapshot, access) = {
+        let (auth_scope, mut pair) = {
             let _writer = self.connection_gate.lock().await;
-            let mut stored = self.load_runtime()?;
-            let Some(mut pair) = stored.desktop_redundancy.clone() else {
+            let stored = self.load_runtime()?;
+            let Some(pair) = stored.desktop_redundancy else {
                 return Ok(None);
             };
             if pair.stop.is_some() || stored.pending_compensation_stop.is_some() {
                 return Ok(None);
             }
-            let access = self.access_snapshot().await?;
+            (stored.auth_scope, pair)
+        };
+        // The auth owner may wait for a network refresh. Local Status and Stop
+        // must be able to take the writer while authorization is in flight.
+        let access = self.auth.access(None).await;
+        let (stored, pair, snapshot, access) = {
+            let _writer = self.connection_gate.lock().await;
+            if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
+                return Ok(None);
+            }
+            let mut stored = self.load_runtime()?;
+            if stored.auth_scope != auth_scope
+                || stored.desktop_redundancy.as_ref() != Some(&pair)
+                || stored.pending_compensation_stop.is_some()
+            {
+                return Ok(None);
+            }
+            let access = access?;
             if stored.auth_scope.as_ref()
                 != Some(&RuntimeAuthScope {
                     auth_epoch: access.auth_epoch(),
