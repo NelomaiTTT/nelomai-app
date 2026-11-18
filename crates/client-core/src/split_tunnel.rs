@@ -2105,9 +2105,7 @@ where
             {
                 Ok(_)
                 | Err(CoreError::SplitTunnel(_) | CoreError::Tunnel(_))
-                | Err(CoreError::AuthRefreshPending | CoreError::Api(CoreApiError::Retryable)) => {
-                    ()
-                }
+                | Err(CoreError::AuthRefreshPending | CoreError::Api(CoreApiError::Retryable)) => {}
                 Err(error) => return Err(error),
             }
         }

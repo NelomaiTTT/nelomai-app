@@ -156,6 +156,7 @@ pub(super) fn remove_kernel_member<C: KernelMemberControl>(
 // WG/AWG userspace backends exit when their UAPI socket is removed. The vendor
 // remove_interface also mutates DNS (machine-wide on macOS), so members cannot
 // use that combined operation. Only the session owner calls this under its lock.
+#[cfg(any(target_os = "linux", test))]
 pub(super) fn remove_userspace_member(
     interface: &str,
     identity: SocketIdentity,
