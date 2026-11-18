@@ -65,6 +65,7 @@ struct Panel {
     stopped: Connection,
     current: Connection,
     fail_stop: AtomicBool,
+    fail_unbind: AtomicBool,
     async_stop: AtomicBool,
     starts: StdMutex<Vec<ConnectionStartRequest>>,
     requests: StdMutex<Vec<RedundantStopRequest>>,
@@ -85,6 +86,19 @@ impl CoreApi for Panel {
         request: &ConnectionStartRequest,
     ) -> Result<ConnectionStartResponse, CoreApiError> {
         self.starts.lock().unwrap().push(request.clone());
+        if self.current.session_id.is_none() {
+            let mut response: ConnectionStartResponse = serde_json::from_str(include_str!(
+                "../../contracts/fixtures/valid/connection-start-response.json"
+            ))
+            .unwrap();
+            if self.current.pinned {
+                assert_eq!(request.operation_id, self.current.lease_id);
+                response.connection = self.current.clone();
+                response.connection.status = LeaseStatus::Issued;
+            }
+            response.configuration = "[Peer]\nEndpoint = 192.0.2.1:51820\n".into();
+            return Ok(response);
+        }
         let mut response: ConnectionStartResponse = serde_json::from_str(include_str!(
             "../../contracts/fixtures/valid/connection-start-redundant-response.json"
         ))
@@ -102,9 +116,24 @@ impl CoreApi for Panel {
     async fn stop_connection(
         &self,
         _: &AccessSnapshot,
-        _: &ConnectionOperationRequest,
+        request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
-        panic!("no singleton Stop")
+        assert!(self.current.session_id.is_none());
+        assert_eq!(request.lease_id, self.current.lease_id);
+        if self.fail_stop.load(Ordering::SeqCst) {
+            return Err(CoreApiError::Retryable);
+        }
+        let mut connection = self.stopped.clone();
+        if self.async_stop.load(Ordering::SeqCst) {
+            connection.status = LeaseStatus::Connected;
+            connection.stopped_at = None;
+        }
+        Ok(ConnectionOperationResponse {
+            stop_acceptance: None,
+            api_version: ApiVersion::V1,
+            request_id: "singleton-cleanup".into(),
+            connection,
+        })
     }
     async fn pin_stray(
         &self,
@@ -173,7 +202,15 @@ impl ApplicationApi for Panel {
         panic!("no bind")
     }
     async fn unbind_peer(&self, _: &AccessSnapshot) -> Result<PeerBindingResponse, CoreApiError> {
-        panic!("no unbind")
+        if self.fail_unbind.load(Ordering::SeqCst) {
+            return Err(CoreApiError::Retryable);
+        }
+        Ok(PeerBindingResponse {
+            api_version: ApiVersion::V1,
+            request_id: "peer-unbound".into(),
+            binding: None,
+            configuration: None,
+        })
     }
     async fn server_candidates(
         &self,
@@ -189,6 +226,7 @@ impl ApplicationApi for Panel {
 }
 
 struct Helper {
+    reserve: bool,
     crashed: AtomicBool,
     unknown: AtomicBool,
     starts: std::sync::atomic::AtomicUsize,
@@ -198,10 +236,15 @@ struct Helper {
 #[async_trait]
 impl TunnelController for Helper {
     async fn start(&self, _: TunnelStartRequest) -> Result<(), TunnelError> {
-        panic!("no singleton Start")
+        assert!(!self.reserve);
+        self.crashed.store(false, Ordering::SeqCst);
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
     async fn stop(&self) -> Result<(), TunnelError> {
-        panic!("no singleton Stop")
+        assert!(!self.reserve);
+        self.crashed.store(true, Ordering::SeqCst);
+        Ok(())
     }
     async fn stop_if_unowned(&self) -> Result<(), TunnelError> {
         assert!(self.crashed.load(Ordering::SeqCst));
@@ -311,18 +354,36 @@ struct Fixture {
     generation: IntentGeneration,
 }
 fn fixture(lose_ack: bool) -> Fixture {
+    fixture_with_connection(lose_ack, true, false)
+}
+
+fn fixture_for_reserve(lose_ack: bool, reserve: bool) -> Fixture {
+    fixture_with_connection(lose_ack, reserve, false)
+}
+
+fn fixture_with_connection(lose_ack: bool, reserve: bool, pinned: bool) -> Fixture {
     let response: ConnectionStartResponse = serde_json::from_str(include_str!(
         "../../contracts/fixtures/valid/connection-start-redundant-response.json"
     ))
     .unwrap();
     let session = response.redundancy.unwrap();
     let mut current = response.connection;
-    current.session_id = Some(session.session_id.clone());
+    current.session_id = reserve.then(|| session.session_id.clone());
+    current.pinned = pinned;
+    let session_id = session.session_id.clone();
     current.status = LeaseStatus::Connected;
-    let mut stopped = session.standby.as_ref().unwrap().connection.clone();
+    let mut stopped = if reserve {
+        session.standby.as_ref().unwrap().connection.clone()
+    } else {
+        current.clone()
+    };
     // A full session Stop receipt has no remaining session association.
     stopped.session_id = None;
-    stopped.status = LeaseStatus::Released;
+    stopped.status = if pinned {
+        LeaseStatus::Warm
+    } else {
+        LeaseStatus::Released
+    };
     stopped.stopped_at = Some("2026-09-27T00:00:00Z".into());
     let access = AccessSnapshot::new(
         "synthetic-access".into(),
@@ -349,7 +410,7 @@ fn fixture(lose_ack: bool) -> Fixture {
         family: access.family().into(),
         identity: access.identity().clone(),
     });
-    value.desktop_redundancy = Some(StoredDesktopRedundancy {
+    value.desktop_redundancy = reserve.then_some(StoredDesktopRedundancy {
         primary_reported: true,
         runtime_generation: 1,
         connection_generation: 7,
@@ -365,7 +426,7 @@ fn fixture(lose_ack: bool) -> Fixture {
         runtime: RuntimeSlot::Latest,
         runtime_generation: 1,
         connection_generation: 7,
-        session_id: current.session_id.clone().unwrap(),
+        session_id,
     };
     let mut native = SessionState::new(scope.clone(), Slot::B, 0, 0).unwrap();
     native.primary_started(&scope).unwrap();
@@ -389,6 +450,7 @@ fn fixture(lose_ack: bool) -> Fixture {
         warm_stop_v1: false,
     };
     let helper = Arc::new(Helper {
+        reserve,
         crashed: AtomicBool::new(false),
         unknown: AtomicBool::new(false),
         starts: std::sync::atomic::AtomicUsize::new(0),
@@ -405,6 +467,7 @@ fn fixture(lose_ack: bool) -> Fixture {
         stopped,
         current: current.clone(),
         fail_stop: AtomicBool::new(false),
+        fail_unbind: AtomicBool::new(false),
         async_stop: AtomicBool::new(false),
         starts: StdMutex::new(Vec::new()),
         requests: StdMutex::new(Vec::new()),
@@ -427,7 +490,7 @@ fn fixture(lose_ack: bool) -> Fixture {
     else {
         panic!("new intent")
     };
-    initialize_episode(&mut state, options, generation, 10, true);
+    initialize_episode(&mut state, options, generation, 10, reserve);
     assert!(state.coordinator.begin_attempt(generation));
     assert_eq!(
         state
@@ -438,9 +501,11 @@ fn fixture(lose_ack: bool) -> Fixture {
     state.cancel_epoch = Some(app.start_cancellation_epoch());
     state.armed = true;
     state.owned_lease_id = Some(current.lease_id.clone());
-    assert!(queue_redundant_recovery(
-        &mut state, generation, &current, snapshot, 20
-    ));
+    if reserve {
+        assert!(queue_redundant_recovery(
+            &mut state, generation, &current, snapshot, 20
+        ));
+    }
     Fixture {
         app,
         writers,
@@ -626,6 +691,7 @@ async fn pending_stop_scheduler_delivers_cleanup_receipt_after_retry_once() {
             .is_ok());
         assert!(queue_engine_recovery(
             &mut *fixture.state.lock().await,
+            fixture.generation,
             &completion,
             22
         ));
@@ -673,6 +739,7 @@ async fn pending_stop_scheduler_cancellation_while_cleanup_is_blocked_does_not_r
         crate::retry_pending_stop_once(f.app.retry_pending_stop(), |completion| async move {
             assert!(!queue_engine_recovery(
                 &mut *fixture.state.lock().await,
+                fixture.generation,
                 &completion,
                 22
             ));
@@ -712,12 +779,17 @@ async fn engine_crash_cleanup_preserves_original_start_cancellation_epoch() {
     let completion = f.app.retry_pending_stop().await.unwrap().unwrap();
     let mut intent = f.state.lock().await;
     intent.pending_redundant_recovery = None;
-    assert!(queue_engine_recovery(&mut intent, &completion, 22));
+    assert!(queue_engine_recovery(
+        &mut intent,
+        f.generation,
+        &completion,
+        22
+    ));
     assert_eq!(intent.cancel_epoch, Some(original_epoch));
     assert_eq!(intent.next_retry_at_unix, Some(22));
     assert!(intent.reserve_requested);
     assert!(
-        !queue_engine_recovery(&mut intent, &completion, 22),
+        !queue_engine_recovery(&mut intent, f.generation, &completion, 22),
         "receipt is consumed once"
     );
     let after_cleanup = f.app.begin_start_attempt();
@@ -744,7 +816,12 @@ async fn engine_cleanup_receipt_cannot_restart_after_logout_signal_before_owner_
         .await;
     let completion = f.app.retry_pending_stop().await.unwrap().unwrap();
     let mut state = f.state.lock().await;
-    assert!(queue_engine_recovery(&mut state, &completion, 22));
+    assert!(queue_engine_recovery(
+        &mut state,
+        f.generation,
+        &completion,
+        22
+    ));
     let options = state.options.clone().unwrap();
     let epoch = state.cancel_epoch.unwrap();
     drop(state);
@@ -763,19 +840,70 @@ async fn engine_cleanup_receipt_cannot_restart_after_logout_signal_before_owner_
 
 #[tokio::test]
 async fn manual_stop_cleanup_does_not_arm_engine_recovery() {
-    let f = fixture(false);
+    for reserve in [false, true] {
+        let f = fixture_for_reserve(false, reserve);
+        f.app
+            .bootstrap_without_refresh(1_800_000_000)
+            .await
+            .unwrap();
+        f.helper.crashed.store(true, Ordering::SeqCst);
+        f.app.stop().await.unwrap();
+        let completion = f.app.retry_pending_stop().await.unwrap().unwrap();
+        assert!(!queue_engine_recovery(
+            &mut *f.state.lock().await,
+            f.generation,
+            &completion,
+            22
+        ));
+    }
+}
+
+#[tokio::test]
+async fn journaled_stop_finishes_while_a_cancelled_start_is_unwinding() {
+    let f = fixture_for_reserve(false, false);
     f.app
         .bootstrap_without_refresh(1_800_000_000)
         .await
         .unwrap();
-    f.helper.crashed.store(true, Ordering::SeqCst);
+    {
+        let mut state = f.state.lock().await;
+        let options = state.options.clone().unwrap();
+        state
+            .coordinator
+            .handle_stall(
+                f.generation,
+                StallTrigger {
+                    options,
+                    pinned: false,
+                    transport: RecoveryTransport::Other,
+                },
+            )
+            .unwrap();
+        assert!(state.coordinator.begin_attempt(f.generation));
+        assert!(state.coordinator.cancel_intent(f.generation));
+    }
     f.app.stop().await.unwrap();
-    let completion = f.app.retry_pending_stop().await.unwrap().unwrap();
-    assert!(!queue_engine_recovery(
-        &mut *f.state.lock().await,
-        &completion,
-        22
-    ));
+    assert!(f
+        .journal
+        .value
+        .lock()
+        .unwrap()
+        .pending_compensation_stop
+        .is_some());
+    assert!(f
+        .app
+        .retry_pending_stop_observed(pending_stop_generation(&f.state))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(f
+        .journal
+        .value
+        .lock()
+        .unwrap()
+        .pending_compensation_stop
+        .is_none());
+    assert_eq!(f.app.state().await.phase, Phase::Ready);
 }
 
 #[tokio::test]
@@ -802,15 +930,300 @@ async fn engine_cleanup_receipt_rejects_changed_session_and_intent() {
                 completion.cancel_epoch = f.app.start_cancellation_epoch();
             }
             "generation" => {
+                let options = state.options.clone().unwrap();
+                let previous = state.coordinator.completed_connection().unwrap().clone();
                 state.coordinator.cancel_intent(f.generation);
+                let StartDisposition::Recovering { generation, .. } =
+                    state.coordinator.start_or_resume(options, 21).unwrap()
+                else {
+                    panic!("a new Start was expected");
+                };
+                assert!(state.coordinator.begin_attempt(generation));
+                assert_eq!(
+                    state.coordinator.mark_connected(generation, previous),
+                    RecoveryDecision::Accept
+                );
             }
             _ => unreachable!(),
         }
         assert!(
-            !queue_engine_recovery(&mut state, &completion, 22),
+            !queue_engine_recovery(&mut state, f.generation, &completion, 22),
             "{changed}"
         );
     }
+}
+
+#[tokio::test]
+async fn singleton_engine_crash_restarts_the_same_intent_without_a_foreground_poll() {
+    let f = fixture_for_reserve(false, false);
+    f.app
+        .bootstrap_without_refresh(1_800_000_000)
+        .await
+        .unwrap();
+    assert_eq!(f.app.state().await.phase, Phase::Connected);
+    f.panel.starts.lock().unwrap().clear();
+
+    f.helper.crashed.store(true, Ordering::SeqCst);
+    f.panel.async_stop.store(true, Ordering::SeqCst);
+    let incomplete = f.app.retry_pending_stop().await.unwrap().unwrap();
+    assert_eq!(f.app.state().await.phase, Phase::Stopping);
+    assert!(!queue_engine_recovery(
+        &mut *f.state.lock().await,
+        f.generation,
+        &incomplete,
+        21
+    ));
+    f.panel.async_stop.store(false, Ordering::SeqCst);
+    let mut completion = f.app.retry_pending_stop().await.unwrap().unwrap();
+    assert_eq!(f.app.state().await.phase, Phase::Ready);
+    let (options, cancel_epoch) = {
+        let mut state = f.state.lock().await;
+        let lease = std::mem::replace(&mut completion.connection.lease_id, "other-lease".into());
+        assert!(!queue_engine_recovery(
+            &mut state,
+            f.generation,
+            &completion,
+            22
+        ));
+        completion.connection.lease_id = lease;
+        assert!(queue_engine_recovery(
+            &mut state,
+            f.generation,
+            &completion,
+            22
+        ));
+        assert!(!queue_engine_recovery(
+            &mut state,
+            f.generation,
+            &completion,
+            22
+        ));
+        assert!(state.coordinator.begin_attempt(f.generation));
+        assert!(!state.reserve_requested);
+        (state.options.clone().unwrap(), state.cancel_epoch.unwrap())
+    };
+    f.app.reconcile_pending_operation_for_retry().await.unwrap();
+    let connection = f
+        .app
+        .desktop_connection_intent_attempt_at_epoch(
+            options,
+            1_800_000_001,
+            false,
+            cancel_epoch,
+            || true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(connection.session_id, None);
+    assert_eq!(f.app.state().await.phase, Phase::Connected);
+    assert_eq!(f.helper.starts.load(Ordering::SeqCst), 1);
+    let starts = f.panel.starts.lock().unwrap();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0].layer, Layer::Stray);
+    assert_eq!(starts[0].reserve_enabled, None);
+}
+
+#[tokio::test]
+async fn pinned_singleton_engine_crash_resumes_the_selected_peer() {
+    let f = fixture_with_connection(false, false, true);
+    f.app
+        .bootstrap_without_refresh(1_800_000_000)
+        .await
+        .unwrap();
+    f.panel.starts.lock().unwrap().clear();
+    f.helper.crashed.store(true, Ordering::SeqCst);
+
+    let completion = f.app.retry_pending_stop().await.unwrap().unwrap();
+    assert_eq!(completion.connection.status, LeaseStatus::Warm);
+    let (options, epoch) = {
+        let mut state = f.state.lock().await;
+        assert!(queue_engine_recovery(
+            &mut state,
+            f.generation,
+            &completion,
+            22
+        ));
+        assert!(state.coordinator.begin_attempt(f.generation));
+        (state.options.clone().unwrap(), state.cancel_epoch.unwrap())
+    };
+    let connection = f
+        .app
+        .desktop_connection_intent_attempt_at_epoch(options, 1_800_000_001, false, epoch, || true)
+        .await
+        .unwrap();
+    assert!(connection.pinned);
+    assert_eq!(connection.lease_id, f.panel.current.lease_id);
+    assert_eq!(f.helper.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(f.panel.starts.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn failed_unbind_keeps_the_current_peer_recoverable() {
+    let f = fixture_for_reserve(false, false);
+    f.app
+        .bootstrap_without_refresh(1_800_000_000)
+        .await
+        .unwrap();
+    let epoch = f.state.lock().await.cancel_epoch.unwrap();
+    f.panel.fail_unbind.store(true, Ordering::SeqCst);
+    assert!(f.app.unbind_peer().await.is_err());
+    assert_eq!(f.app.state().await.phase, Phase::Connected);
+    f.app.check_start_cancellation(epoch).unwrap();
+
+    f.helper.crashed.store(true, Ordering::SeqCst);
+    let completion = f.app.retry_pending_stop().await.unwrap().unwrap();
+    f.app
+        .check_start_cancellation(completion.cancel_epoch)
+        .unwrap();
+    assert!(queue_engine_recovery(
+        &mut *f.state.lock().await,
+        f.generation,
+        &completion,
+        22
+    ));
+}
+
+#[tokio::test]
+async fn unbinding_peer_invalidates_a_queued_singleton_restart() {
+    let f = fixture_for_reserve(false, false);
+    f.app
+        .bootstrap_without_refresh(1_800_000_000)
+        .await
+        .unwrap();
+    f.panel.starts.lock().unwrap().clear();
+    f.helper.crashed.store(true, Ordering::SeqCst);
+    let completion = f.app.retry_pending_stop().await.unwrap().unwrap();
+    let (options, epoch) = {
+        let mut state = f.state.lock().await;
+        assert!(queue_engine_recovery(
+            &mut state,
+            f.generation,
+            &completion,
+            22
+        ));
+        (state.options.clone().unwrap(), state.cancel_epoch.unwrap())
+    };
+
+    f.app.unbind_peer().await.unwrap();
+    assert_eq!(f.app.state().await.phase, Phase::NeedsPeerBinding);
+    assert!(matches!(
+        f.app.check_start_cancellation(epoch),
+        Err(ApplicationError::Core(CoreError::StartCancelled))
+    ));
+    assert!(matches!(
+        f.app
+            .desktop_connection_intent_attempt_at_epoch(
+                options,
+                1_800_000_001,
+                false,
+                epoch,
+                || true
+            )
+            .await,
+        Err(ApplicationError::Core(CoreError::StartCancelled))
+    ));
+    assert!(f.panel.starts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn stop_worker_waits_for_the_new_intent_before_claiming_its_crash() {
+    let f = fixture_for_reserve(false, false);
+    f.app
+        .bootstrap_without_refresh(1_800_000_000)
+        .await
+        .unwrap();
+    let lifecycle = f.writers.lifecycle();
+    let written_start = lifecycle.lock().await;
+    let finish_old_attempt = async {
+        let (generation, completion) = f
+            .app
+            .retry_pending_stop_observed(pending_stop_generation(&f.state))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(queue_engine_recovery(
+            &mut *f.state.lock().await,
+            generation,
+            &completion,
+            22
+        ));
+    };
+    tokio::pin!(finish_old_attempt);
+    tokio::select! {
+        biased;
+        _ = &mut finish_old_attempt => panic!("the worker bypassed the lifecycle gate"),
+        _ = std::future::ready(()) => {},
+    }
+    {
+        let mut state = f.state.lock().await;
+        let options = state.options.clone().unwrap();
+        state.coordinator.cancel_intent(f.generation);
+        let StartDisposition::Recovering { generation, .. } =
+            state.coordinator.start_or_resume(options, 21).unwrap()
+        else {
+            panic!("a new Start was expected");
+        };
+        assert!(state.coordinator.begin_attempt(generation));
+        assert_eq!(
+            state
+                .coordinator
+                .mark_connected(generation, f.panel.current.clone()),
+            RecoveryDecision::Accept
+        );
+    }
+    f.helper.crashed.store(true, Ordering::SeqCst);
+    drop(written_start);
+    finish_old_attempt.await;
+}
+
+#[tokio::test]
+async fn stop_worker_does_not_consume_an_outage_before_start_is_published() {
+    let f = fixture_for_reserve(false, false);
+    f.app
+        .bootstrap_without_refresh(1_800_000_000)
+        .await
+        .unwrap();
+    let generation = {
+        let mut state = f.state.lock().await;
+        let options = state.options.clone().unwrap();
+        state.coordinator.cancel_intent(f.generation);
+        let StartDisposition::Recovering { generation, .. } =
+            state.coordinator.start_or_resume(options, 21).unwrap()
+        else {
+            panic!("a new Start was expected");
+        };
+        assert!(state.coordinator.begin_attempt(generation));
+        generation
+    };
+    f.helper.crashed.store(true, Ordering::SeqCst);
+    assert!(f
+        .app
+        .retry_pending_stop_observed(pending_stop_generation(&f.state))
+        .await
+        .unwrap()
+        .is_none());
+    {
+        let mut state = f.state.lock().await;
+        assert_eq!(
+            state
+                .coordinator
+                .mark_connected(generation, f.panel.current.clone()),
+            RecoveryDecision::Accept
+        );
+    }
+    let (observed_generation, completion) = f
+        .app
+        .retry_pending_stop_observed(pending_stop_generation(&f.state))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed_generation, generation);
+    assert!(queue_engine_recovery(
+        &mut *f.state.lock().await,
+        generation,
+        &completion,
+        22
+    ));
 }
 
 #[tokio::test]
@@ -841,7 +1254,12 @@ async fn engine_crash_restarts_same_intent_only_after_cold_cleanup_retry() {
     f.panel.fail_stop.store(false, Ordering::SeqCst);
     let completion = f.app.retry_pending_stop().await.unwrap().unwrap();
     let mut state = f.state.lock().await;
-    assert!(queue_engine_recovery(&mut state, &completion, 22));
+    assert!(queue_engine_recovery(
+        &mut state,
+        f.generation,
+        &completion,
+        22
+    ));
     let options = state.options.clone().unwrap();
     let epoch = state.cancel_epoch.unwrap();
     assert!(state.coordinator.begin_attempt(f.generation));
@@ -914,7 +1332,7 @@ async fn engine_cleanup_acceptance_and_changed_member_preserve_recovery() {
         assert!(f.journal.value.lock().unwrap().desktop_redundancy.is_none());
         let mut state = f.state.lock().await;
         assert!(
-            queue_engine_recovery(&mut state, &completion, 22),
+            queue_engine_recovery(&mut state, f.generation, &completion, 22),
             "changed_member={changed_member}"
         );
         let options = state.options.clone().unwrap();

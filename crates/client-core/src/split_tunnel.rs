@@ -1356,6 +1356,11 @@ where
         // Once native replacement begins, the previous instance may be gone.
         // Keep its options for retry, but only success can confirm them again.
         running.native_confirmed = false;
+        // The same lease can return to an identical Connected state. Discard
+        // status replies sampled before this restart if they arrive afterward.
+        #[cfg(not(target_os = "android"))]
+        self.foreground_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 

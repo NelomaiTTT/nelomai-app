@@ -402,6 +402,10 @@ impl ConnectionIntentCoordinator {
         self.status
     }
 
+    pub const fn attempt_in_progress(&self) -> bool {
+        self.attempt_generation.is_some()
+    }
+
     /// A completed intent, never an in-flight attempt or scheduled recovery.
     pub fn completed_connection(&self) -> Option<&Connection> {
         (self.status == ConnectionIntentStatus::None && self.attempt_generation.is_none())

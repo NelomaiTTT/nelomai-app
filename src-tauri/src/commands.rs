@@ -3337,6 +3337,8 @@ pub async fn app_unbind_peer(
         .unbind_peer()
         .await
         .map_err(CommandError::from)?;
+    #[cfg(not(target_os = "android"))]
+    cancel_desktop_connection_intent(&app).await;
     #[cfg(target_os = "android")]
     let (quick_clear_ticket, quick_plan_result) = ANDROID_UI_START_STOP_COORDINATOR
         .dispatch_projected_clear(|| app.tunnel_android().clear_quick_plan());

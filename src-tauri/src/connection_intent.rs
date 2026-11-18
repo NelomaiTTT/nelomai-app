@@ -390,22 +390,32 @@ impl DesktopConnectionIntent {
         cancelled
     }
 
-    pub(crate) async fn pending_stop_completed(
+    pub(crate) async fn retry_pending_stop(&self) {
+        crate::retry_pending_stop_once(
+            self.application
+                .retry_pending_stop_observed(pending_stop_generation(&self.state)),
+            |(generation, completion)| self.pending_stop_completed(completion, generation),
+        )
+        .await;
+    }
+
+    async fn pending_stop_completed(
         &self,
         completion: nelomai_client_application::PendingStopCompletion,
+        generation: IntentGeneration,
     ) {
-        if self
-            .application
-            .check_start_cancellation(completion.cancel_epoch)
-            .is_err()
-        {
-            return;
-        }
-        let queued = queue_engine_recovery(
-            &mut *self.state.lock().await,
-            &completion,
-            crate::current_unix_time(),
-        );
+        let queued = {
+            let mut state = self.state.lock().await;
+            self.application
+                .check_start_cancellation(completion.cancel_epoch)
+                .is_ok()
+                && queue_engine_recovery(
+                    &mut state,
+                    generation,
+                    &completion,
+                    crate::current_unix_time(),
+                )
+        };
         if queued {
             self.diagnostics.record_named(
                 "connection.intent.engine_cleanup_complete",
@@ -413,6 +423,7 @@ impl DesktopConnectionIntent {
                 None,
                 None,
             );
+            self.emit_change(None);
             self.wake.notify_one();
         }
     }
@@ -718,6 +729,9 @@ impl DesktopConnectionIntent {
                 })?,
             )
         };
+        if let Err(error) = self.application.check_start_cancellation(cancel_epoch) {
+            return self.complete_error(generation, error).await;
+        }
         if let Some(initial_preflight) = initial_preflight {
             let resolve_started = Instant::now();
             let resolved = self.resolve_initial_desktop_start(&initial_preflight).await;
@@ -1484,41 +1498,56 @@ where
     }
 }
 
+async fn pending_stop_generation(state: &Mutex<RuntimeState>) -> Option<IntentGeneration> {
+    let state = state.lock().await;
+    (!state.coordinator.attempt_in_progress()).then(|| state.coordinator.generation())
+}
+
 /// Only a completed cleanup of the connected intent can arm a new Start.
 /// An explicit Stop/Logout invalidates its saved epoch before waiting on gates.
 fn queue_engine_recovery(
     state: &mut RuntimeState,
+    generation: IntentGeneration,
     completion: &nelomai_client_application::PendingStopCompletion,
     now: i64,
 ) -> bool {
     if !state.armed
+        || state.coordinator.generation() != generation
         || state.coordinator.status() != ConnectionIntentStatus::None
         || state.cancel_epoch != Some(completion.cancel_epoch)
     {
         return false;
     }
-    let Some(cleaned) = completion.cleaned_pair.as_ref() else {
-        return false;
-    };
     let Some(owned) = state.coordinator.completed_connection() else {
         return false;
     };
     // Failover and member replacement can change the lease projected by the
     // UI. The worker receipt identifies the protected pair that Core retired.
-    if owned.session_id.as_deref() != Some(cleaned.session_id.as_str()) || owned.pinned {
+    let matches_connection = match completion.cleaned_pair.as_ref() {
+        Some(cleaned) => {
+            !owned.pinned && owned.session_id.as_deref() == Some(cleaned.session_id.as_str())
+        }
+        None => {
+            completion.cleaned_singleton
+                && owned.session_id.is_none()
+                && owned.lease_id == completion.connection.lease_id
+                && (!completion.connection.pinned
+                    || completion.connection.status == LeaseStatus::Warm)
+        }
+    };
+    if !matches_connection {
         return false;
     }
     let Some(options) = state.options.clone() else {
         return false;
     };
-    let generation = state.coordinator.generation();
     if state
         .coordinator
         .handle_stall(
             generation,
             StallTrigger {
                 options,
-                pinned: false,
+                pinned: completion.connection.pinned,
                 transport: RecoveryTransport::Other,
             },
         )

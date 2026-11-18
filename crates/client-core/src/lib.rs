@@ -1631,10 +1631,20 @@ where
         if current.phase != Phase::Connected {
             return current;
         }
+        // A local restart can briefly stop the helper. Avoid observing that
+        // interval and leave the writer free to start during the status IPC.
+        #[cfg(not(target_os = "android"))]
+        if self.connection_gate.try_lock().is_err() {
+            return self.state.lock().await.clone();
+        }
         let status = self.tunnel.status().await;
         if self.runtime_channel_closed() {
             return self.disconnected_presentation().await;
         }
+        #[cfg(not(target_os = "android"))]
+        let Ok(_guard) = self.connection_gate.try_lock() else {
+            return self.state.lock().await.clone();
+        };
         let mut state = self.state.lock().await;
         let mut warnings = self.split_tunnel_warning.lock().await;
         if *state != current

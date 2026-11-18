@@ -3035,12 +3035,18 @@ struct CoordinatorTunnel {
     keep_running_on_stop_failure: AtomicBool,
     preserve_restart_intent: AtomicBool,
     independent_native_owner: AtomicBool,
+    block_restart_stop: AtomicBool,
+    restart_stop_entered: Notify,
+    restart_stop_release: Notify,
     restart_starts: AtomicUsize,
     block_restart: AtomicBool,
     restart_release: Notify,
     options: Mutex<Vec<TunnelOptions>>,
     start_metadata: Mutex<Vec<(Option<QuickConnection>, QuickReconnect)>>,
     status: Mutex<TunnelStatus>,
+    block_next_status: AtomicBool,
+    status_entered: Notify,
+    status_release: Notify,
     fail_next_status: AtomicBool,
     fingerprints: Mutex<VecDeque<String>>,
     fingerprint_calls: AtomicUsize,
@@ -3086,11 +3092,14 @@ impl TunnelController for CoordinatorTunnel {
     }
 
     async fn stop_for_restart(&self) -> Result<(), TunnelError> {
-        if self.preserve_restart_intent.load(Ordering::SeqCst) {
-            Ok(())
-        } else {
-            self.stop().await
+        if !self.preserve_restart_intent.load(Ordering::SeqCst) {
+            self.stop().await?;
         }
+        if self.block_restart_stop.load(Ordering::SeqCst) {
+            self.restart_stop_entered.notify_one();
+            self.restart_stop_release.notified().await;
+        }
+        Ok(())
     }
 
     async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError> {
@@ -3142,7 +3151,12 @@ impl TunnelController for CoordinatorTunnel {
         if self.fail_next_status.swap(false, Ordering::SeqCst) {
             return Err(TunnelError::Backend("test_status_failed".to_string()));
         }
-        Ok(*self.status.lock().unwrap())
+        let status = *self.status.lock().unwrap();
+        if self.block_next_status.swap(false, Ordering::SeqCst) {
+            self.status_entered.notify_one();
+            self.status_release.notified().await;
+        }
+        Ok(status)
     }
 
     async fn physical_network_fingerprint(&self) -> Result<Option<String>, TunnelError> {
@@ -3669,6 +3683,90 @@ async fn bootstrap_observation_while_recovery_pending(
     .unwrap();
     assert_eq!(fixture.core.state().await.connection, Some(updated));
     bootstrap
+}
+
+#[tokio::test]
+#[cfg(not(target_os = "android"))]
+async fn pending_stop_observation_does_not_claim_a_desktop_local_restart() {
+    let fixture = Arc::new(restart_metadata_fixture(EgressMode::PreferIpv6).await);
+    let connection = fixture.core.state().await.connection.unwrap();
+    fixture
+        .tunnel
+        .block_restart_stop
+        .store(true, Ordering::SeqCst);
+    let recovery = tokio::spawn({
+        let fixture = fixture.clone();
+        let lease_id = connection.lease_id.clone();
+        async move {
+            fixture
+                .core
+                .recover_stalled_data_plane(&lease_id, StalledDataPlaneRecovery::RestartLocalTunnel)
+                .await
+        }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        fixture.tunnel.restart_stop_entered.notified(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fixture.tunnel.status().await.unwrap(),
+        TunnelStatus::Stopped
+    );
+    let observed = fixture.core.state().await;
+    fixture.tunnel.restart_stop_release.notify_one();
+    assert_eq!(
+        recovery.await.unwrap().unwrap(),
+        StalledDataPlaneRecoveryOutcome::Reconnected
+    );
+    assert_eq!(observed.phase, Phase::Connected);
+    assert_eq!(observed.connection, Some(connection));
+    assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+#[cfg(not(target_os = "android"))]
+async fn delayed_stop_observation_neither_blocks_nor_overwrites_desktop_restart() {
+    let fixture = Arc::new(restart_metadata_fixture(EgressMode::PreferIpv6).await);
+    let connection = fixture.core.state().await.connection.unwrap();
+    *fixture.tunnel.status.lock().unwrap() = TunnelStatus::Stopped;
+    fixture
+        .tunnel
+        .block_next_status
+        .store(true, Ordering::SeqCst);
+    let poll = tokio::spawn({
+        let fixture = fixture.clone();
+        async move { fixture.core.state().await }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        fixture.tunnel.status_entered.notified(),
+    )
+    .await
+    .unwrap();
+    let recovery = fixture
+        .core
+        .recover_stalled_data_plane(
+            &connection.lease_id,
+            StalledDataPlaneRecovery::RestartLocalTunnel,
+        )
+        .await;
+    fixture.tunnel.status_release.notify_one();
+    let observed = poll.await.unwrap();
+    assert_eq!(
+        recovery.unwrap(),
+        StalledDataPlaneRecoveryOutcome::Reconnected
+    );
+    assert_eq!(observed.phase, Phase::Connected);
+    assert_eq!(observed.connection, Some(connection));
+    assert_eq!(
+        fixture.tunnel.status().await.unwrap(),
+        TunnelStatus::Running
+    );
+    assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

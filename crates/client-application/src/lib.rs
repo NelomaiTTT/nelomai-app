@@ -433,6 +433,8 @@ impl ProbeCache {
 #[derive(Debug)]
 pub struct PendingStopCompletion {
     pub cleaned_pair: Option<nelomai_client_tunnel::redundancy::SessionScope>,
+    #[cfg(not(target_os = "android"))]
+    pub cleaned_singleton: bool,
     pub connection: Connection,
     pub cancel_epoch: StartCancellationEpoch,
 }
@@ -728,6 +730,10 @@ where
             }
             Err(error) => return Err(error.into()),
         };
+        // Invalidate the old peer before releasing lifecycle ownership, even
+        // if the local half has to be retried after the panel accepts unbind.
+        #[cfg(not(target_os = "android"))]
+        self.core.signal_start_cancellation();
         self.core.complete_unbind().await?;
         self.clear_probe_cache()?;
         Ok(response)
@@ -1447,26 +1453,70 @@ where
         &self,
     ) -> Result<Option<PendingStopCompletion>, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
-        if !self.core.has_pending_stop_cleanup()?
-            && self.core.state().await.phase != Phase::Stopping
+        self.retry_pending_stop_locked(true).await
+    }
+
+    /// Take the desktop intent snapshot under the same gate as native cleanup.
+    /// An unpublished Start only defers inferred cleanup, not a journaled Stop.
+    #[cfg(not(target_os = "android"))]
+    pub async fn retry_pending_stop_observed<Context>(
+        &self,
+        observe: impl std::future::Future<Output = Option<Context>>,
+    ) -> Result<Option<(Context, PendingStopCompletion)>, ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        let context = observe.await;
+        let completion = self.retry_pending_stop_locked(context.is_some()).await?;
+        Ok(context.zip(completion))
+    }
+
+    async fn retry_pending_stop_locked(
+        &self,
+        infer_stop: bool,
+    ) -> Result<Option<PendingStopCompletion>, ApplicationError> {
+        let cancel_epoch = self.core.start_cancellation_epoch();
+        let pending_cleanup = self.core.has_pending_stop_cleanup()?;
+        if !pending_cleanup && !infer_stop {
+            return Ok(None);
+        }
+        let previous = if pending_cleanup && cfg!(target_os = "android") {
+            None
+        } else {
+            Some(self.core.state().await)
+        };
+        if !pending_cleanup
+            && previous
+                .as_ref()
+                .is_none_or(|state| state.phase != Phase::Stopping)
         {
             return Ok(None);
         }
-        let cancel_epoch = self.core.start_cancellation_epoch();
-        let pair = self.core.desktop_cleanup_scope().ok().flatten();
+        let pair = self.core.desktop_cleanup_scope();
         let Some(connection) = self.core.retry_pending_stop_cleanup().await? else {
             return Ok(None);
         };
         // Both a terminal Stop and an explicit accepted background-cleanup
         // receipt can release local ownership. Core validates the native ACK
         // and panel response before removing this exact protected pair.
-        let cleaned_pair = pair.filter(|_| {
-            self.core.check_start_cancellation(cancel_epoch).is_ok()
-                && matches!(self.core.desktop_cleanup_scope(), Ok(None))
-                && matches!(self.core.has_pending_stop_cleanup(), Ok(false))
-        });
+        let cleanup_confirmed = cfg!(not(target_os = "android"))
+            && self.core.check_start_cancellation(cancel_epoch).is_ok()
+            && matches!(self.core.desktop_cleanup_scope(), Ok(None))
+            && matches!(self.core.has_pending_stop_cleanup(), Ok(false));
+        // Single tunnels receive no pair receipt. Require the exact lease and
+        // the completed cleanup phase before resuming that desktop intent.
+        #[cfg(not(target_os = "android"))]
+        let cleaned_singleton = cleanup_confirmed
+            && matches!(&pair, Ok(None))
+            && connection.session_id.is_none()
+            && previous
+                .and_then(|state| state.connection)
+                .is_some_and(|active| {
+                    active.session_id.is_none() && active.lease_id == connection.lease_id
+                })
+            && self.core.state().await.phase == Phase::Ready;
         Ok(Some(PendingStopCompletion {
-            cleaned_pair,
+            cleaned_pair: pair.ok().flatten().filter(|_| cleanup_confirmed),
+            #[cfg(not(target_os = "android"))]
+            cleaned_singleton,
             connection,
             cancel_epoch,
         }))

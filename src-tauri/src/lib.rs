@@ -761,10 +761,7 @@ fn start_pending_stop_scheduler(
                 _ = application.wait_for_pending_stop() => {},
             }
             #[cfg(not(target_os = "android"))]
-            retry_pending_stop_once(application.retry_pending_stop(), |completion| {
-                intent.pending_stop_completed(completion)
-            })
-            .await;
+            intent.retry_pending_stop().await;
             #[cfg(target_os = "android")]
             let _ = application.retry_pending_stop().await;
         }
@@ -772,15 +769,10 @@ fn start_pending_stop_scheduler(
 }
 
 #[cfg(not(target_os = "android"))]
-async fn retry_pending_stop_once<R, C, F>(retry: R, completed: C)
+async fn retry_pending_stop_once<T, R, C, F>(retry: R, completed: C)
 where
-    R: std::future::Future<
-        Output = Result<
-            Option<nelomai_client_application::PendingStopCompletion>,
-            ApplicationError,
-        >,
-    >,
-    C: FnOnce(nelomai_client_application::PendingStopCompletion) -> F,
+    R: std::future::Future<Output = Result<Option<T>, ApplicationError>>,
+    C: FnOnce(T) -> F,
     F: std::future::Future<Output = ()>,
 {
     if let Ok(Some(completion)) = retry.await {
