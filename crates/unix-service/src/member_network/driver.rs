@@ -4,7 +4,7 @@ use super::journal::ScopedJournal;
 use super::session::SessionNetwork;
 use crate::ServiceTunnelBackend;
 use nelomai_client_tunnel::redundancy::{
-    driver::{NativePair, SessionStore},
+    driver::{NativePair, RouteRefreshError, SessionStore},
     evidence::NativeHealthSample,
     network::{NetworkJournalStore, NetworkSystem},
     session::SessionSnapshot,
@@ -189,15 +189,8 @@ impl<B: ServiceTunnelBackend, N: super::policy::PhysicalPolicyProvider, S: Netwo
             .network
             .resolve_updated_policy(scope, options, Some(endpoint))
             .map_err(|e| self.network.operation_error(Stage::Attach, e))?;
-        let bypass = policy
-            .bypasses
-            .iter()
-            .chain(&policy.retained_routes)
-            .find(|r| r.destination == ipnet::IpNet::from(endpoint))
-            .cloned()
-            .ok_or_else(failed)?;
         self.network
-            .add_standby(scope, member.slot, &config, member.probe.clone(), bypass)
+            .add_standby(scope, member.slot, &config, member.probe.clone(), policy)
             .map_err(|e| self.network.operation_error(Stage::Attach, e))
     }
     fn remove_standby(&mut self, scope: &SessionScope, slot: Slot) -> io::Result<()> {
@@ -244,6 +237,35 @@ impl<B: ServiceTunnelBackend, N: super::policy::PhysicalPolicyProvider, S: Netwo
             }
         }
         Ok(self.network.active().is_some())
+    }
+    fn refresh_split_tunnel(
+        &mut self,
+        scope: &SessionScope,
+        options: &nelomai_client_tunnel::DesktopTunnelOptions,
+    ) -> Result<(), RouteRefreshError> {
+        self.check_scope(scope)
+            .map_err(RouteRefreshError::Unchanged)?;
+        let policy = self
+            .network
+            .resolve_updated_policy(scope, options, None)
+            .map_err(|e| {
+                RouteRefreshError::Unchanged(self.network.operation_error(Stage::Policy, e))
+            })?;
+        let (active, values) = self
+            .network
+            .plan_policy_routes(scope, &policy)
+            .map_err(|e| {
+                RouteRefreshError::Unchanged(self.network.operation_error(Stage::Policy, e))
+            })?;
+        self.network
+            .replace_policy_routes(active, values, policy)
+            .map_err(|e| {
+                e.map_io_error(|error| {
+                    PairFailure::io(Stage::Network, error).into_io(Stage::Policy)
+                })
+            })?;
+        self.options = Some(options.clone());
+        Ok(())
     }
     fn cleanup_pending(&self) -> bool {
         self.network.cleanup_pending()
@@ -523,6 +545,31 @@ mod tests {
             s.calls.push("read network");
             Ok(s.values.get(key).cloned())
         }
+        fn read_many(&mut self, keys: &[ResourceKey]) -> io::Result<Vec<Option<NetworkValue>>> {
+            self.0.borrow_mut().calls.push("read route table");
+            if self.0.borrow().failure == Some("route_table_read") {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            if self.0.borrow().failure == Some("foreign_new_route") {
+                let destination = "198.51.101.0/24".parse().unwrap();
+                let foreign = NetworkValue::Route(RouteValue {
+                    destination,
+                    interface: 6,
+                    ..bypass()
+                });
+                return keys
+                    .iter()
+                    .map(|key| {
+                        if *key == foreign.key() {
+                            Ok(Some(foreign.clone()))
+                        } else {
+                            self.read(key)
+                        }
+                    })
+                    .collect();
+            }
+            keys.iter().map(|key| self.read(key)).collect()
+        }
         fn compare_exchange(
             &mut self,
             key: &ResourceKey,
@@ -549,11 +596,32 @@ mod tests {
             }
             Ok(())
         }
+        fn compare_exchange_prepared(
+            &mut self,
+            key: &ResourceKey,
+            before: Option<&NetworkValue>,
+            after: Option<&NetworkValue>,
+            prepare: Option<&mut dyn FnMut() -> io::Result<()>>,
+        ) -> Result<(), RouteRefreshError> {
+            self.prepare_exchange(key, before, prepare)?;
+            if self.0.borrow().failure == Some("reject_new_route_write")
+                && before.is_none()
+                && matches!(key, ResourceKey::Route(net, RouteScope::Global) if *net == "198.51.101.0/24".parse().unwrap())
+            {
+                self.0.borrow_mut().calls.push("rejected route write");
+                return Err(RouteRefreshError::Unchanged(
+                    io::ErrorKind::AlreadyExists.into(),
+                ));
+            }
+            // This fixture rejects writes before changing its native map.
+            self.compare_exchange(key, before, after)
+                .map_err(RouteRefreshError::Unchanged)
+        }
     }
     impl super::super::policy::PhysicalPolicyProvider for Network {
         fn resolve_policy(
             &mut self,
-            _: &DesktopTunnelOptions,
+            options: &DesktopTunnelOptions,
             endpoints: &[std::net::IpAddr],
             _: &[nelomai_client_tunnel::redundancy::network::RouteValue],
         ) -> io::Result<NetworkPolicy> {
@@ -565,14 +633,26 @@ mod tests {
                 ));
             }
             Ok(NetworkPolicy {
-                bypasses: endpoints
+                existing: vec![],
+                exclusions: endpoints
                     .iter()
-                    .map(|e| RouteValue {
-                        destination: (*e).into(),
-                        ..bypass()
-                    })
+                    .copied()
+                    .map(ipnet::IpNet::from)
+                    .chain(
+                        options
+                            .excluded_ipv4_cidrs
+                            .iter()
+                            .map(|cidr| cidr.parse().unwrap()),
+                    )
                     .collect(),
-                retained_routes: vec![],
+                retained_routes: if self.0.borrow().failure == Some("retained_preflight") {
+                    vec![RouteValue {
+                        destination: "203.0.113.0/24".parse().unwrap(),
+                        ..bypass()
+                    }]
+                } else {
+                    vec![]
+                },
                 dns_services: vec!["private service".into()],
                 metric: 10,
             })
@@ -790,7 +870,7 @@ mod tests {
         let (mut pair, state) = setup();
         pair.network_mut(&scope())
             .unwrap()
-            .add_standby(&scope(), Slot::B, &config(), probe(), bypass())
+            .add_standby(&scope(), Slot::B, &config(), probe(), policy())
             .unwrap();
         state.borrow_mut().stop_incomplete_a = true;
         state.borrow_mut().bad_identity_slot = Some(TunnelSlot::B);
@@ -846,6 +926,15 @@ mod tests {
             metric: 0,
         }
     }
+    fn policy() -> NetworkPolicy {
+        NetworkPolicy {
+            exclusions: vec![bypass().destination],
+            existing: vec![],
+            retained_routes: vec![],
+            dns_services: vec![],
+            metric: 10,
+        }
+    }
     fn setup() -> (Pair, Rc<RefCell<State>>) {
         let state = Rc::new(RefCell::new(State {
             handshake: Some(NOW - 1000),
@@ -858,18 +947,7 @@ mod tests {
         let mut network =
             SessionNetwork::new(scope(), backends, Network(state.clone()), Store).unwrap();
         network
-            .start_primary(
-                &scope(),
-                Slot::A,
-                &config(),
-                probe(),
-                NetworkPolicy {
-                    bypasses: vec![bypass()],
-                    retained_routes: vec![],
-                    dns_services: vec![],
-                    metric: 10,
-                },
-            )
+            .start_primary(&scope(), Slot::A, &config(), probe(), policy())
             .unwrap();
         let pair = Pair::new(scope(), network).unwrap();
         state.borrow_mut().calls.clear();
@@ -918,6 +996,126 @@ mod tests {
         assert!(!PairControl::cleanup_pending(&pair));
     }
     #[test]
+    fn missing_retained_route_leaves_current_pair_retryable() {
+        assert_failed_refresh_keeps_pair_retryable("retained_preflight", "read network");
+    }
+
+    #[test]
+    fn route_table_read_error_leaves_pair_retryable() {
+        assert_failed_refresh_keeps_pair_retryable("route_table_read", "read route table");
+    }
+
+    #[test]
+    fn conflict_at_new_route_preserves_existing_pair() {
+        assert_failed_refresh_keeps_pair_retryable("foreign_new_route", "read route table");
+    }
+
+    #[test]
+    fn new_route_write_rejection_leaves_existing_pair_retryable() {
+        assert_failed_refresh_keeps_pair_retryable(
+            "reject_new_route_write",
+            "rejected route write",
+        );
+    }
+
+    fn assert_failed_refresh_keeps_pair_retryable(failure: &'static str, call: &'static str) {
+        use nelomai_client_tunnel::redundancy::{control::SessionControl, protocol::Command};
+        let (pair, native) = unstarted();
+        struct SessionJournal;
+        impl nelomai_client_tunnel::redundancy::driver::SessionStore for SessionJournal {
+            fn save(&mut self, _: &SessionSnapshot) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let member = command_member(Slot::A);
+        let options = DesktopTunnelOptions::default();
+        let start = Command::Start {
+            scope: scope(),
+            primary: command_member(Slot::A),
+            options: options.clone(),
+            role_generation: 1,
+            membership_generation: 1,
+            warm_stop_v1: true,
+        };
+        let mut control =
+            SessionControl::prepare(RuntimeSlot::Latest, &start, pair, SessionJournal, 0).unwrap();
+        let before = control.start_primary(&member, &options).unwrap();
+        assert!(before.session.role_confirmed && before.session.committed[0]);
+        let refresh = || Command::RefreshSplitTunnel {
+            scope: scope(),
+            expected_revision: before.session.local_revision,
+            expected_network_epoch: before.session.network_epoch,
+            expected_role_generation: before.session.role_generation,
+            expected_membership_generation: before.session.membership_generation,
+            options: DesktopTunnelOptions {
+                excluded_ipv4_cidrs: vec!["198.51.100.0/24".into()],
+                policy_hash: Some("updated-policy".into()),
+                ..options.clone()
+            },
+        };
+        let routes = native.borrow().values.clone();
+        native.borrow_mut().calls.clear();
+        native.borrow_mut().failure = Some(failure);
+        assert!(control.execute(refresh(), 1).is_err());
+        assert!(native.borrow().calls.contains(&call));
+        if failure != "reject_new_route_write" {
+            assert!(!native.borrow().calls.contains(&"write network"));
+        }
+        assert_eq!(native.borrow().values, routes);
+        let rejected = control.snapshot();
+        native.borrow_mut().failure = None;
+        let retry = control.execute(refresh(), 2);
+        assert!(
+            retry.is_ok(),
+            "failed refresh fenced retry. Cleanup pending: {}, retry: {retry:?}",
+            rejected.cleanup_pending
+        );
+    }
+
+    #[test]
+    fn split_policy_refresh_replaces_bypass_without_restarting_pair() {
+        let (mut pair, state) = unstarted();
+        let mut options = DesktopTunnelOptions {
+            excluded_ipv4_cidrs: vec!["203.0.113.0/24".into()],
+            policy_hash: Some("policy".into()),
+            ..Default::default()
+        };
+        PairControl::start_primary(&mut pair, &scope(), &command_member(Slot::A), &options)
+            .unwrap();
+        let mut standby = command_member(Slot::B);
+        standby.configuration = nelomai_client_tunnel::TunnelConfiguration::new(
+            standby
+                .configuration
+                .expose()
+                .replace("192.0.2.1", "192.0.2.2"),
+        );
+        PairControl::attach(&mut pair, &scope(), &standby).unwrap();
+        let before = state.borrow().values.clone();
+        let through_active = |values: &HashMap<ResourceKey, NetworkValue>, addr: &str| {
+            let ip: std::net::IpAddr = addr.parse().unwrap();
+            values.values().any(|v| matches!(v, NetworkValue::Route(r) if r.scope == RouteScope::Global && r.interface == 10 && r.destination.contains(&ip)))
+        };
+        assert!(!through_active(&before, "203.0.113.1"));
+        assert!(through_active(&before, "198.51.100.1"));
+        state.borrow_mut().calls.clear();
+
+        options.excluded_ipv4_cidrs = vec!["198.51.100.0/24".into()];
+        PairControl::refresh_split_tunnel(&mut pair, &scope(), &options).unwrap();
+        assert_eq!(pair.network.active(), Some(Slot::A));
+        assert!(pair.network.members().view(Slot::B).is_some());
+        let state = state.borrow();
+        assert!(through_active(&state.values, "203.0.113.1"));
+        assert!(!through_active(&state.values, "198.51.100.1"));
+        for endpoint in ["192.0.2.1", "192.0.2.2"] {
+            assert!(!through_active(&state.values, endpoint));
+        }
+        assert!(!state
+            .calls
+            .iter()
+            .any(|call| matches!(*call, "start" | "stop")));
+    }
+
+    #[test]
     fn control_bridge_rejects_wrong_scope_before_discovery_or_member_effects() {
         let (mut pair, state) = unstarted();
         let mut wrong = scope();
@@ -940,7 +1138,7 @@ mod tests {
         for missing in [TunnelSlot::A, TunnelSlot::B] {
             let (mut pair, state) = setup();
             pair.network
-                .add_standby(&scope(), Slot::B, &config(), probe(), bypass())
+                .add_standby(&scope(), Slot::B, &config(), probe(), policy())
                 .unwrap();
             {
                 let mut s = state.borrow_mut();
@@ -966,7 +1164,7 @@ mod tests {
     fn readonly_diagnostics_follow_native_active_and_never_probe_or_mutate() {
         let (mut pair, state) = setup();
         pair.network
-            .add_standby(&scope(), Slot::B, &config(), probe(), bypass())
+            .add_standby(&scope(), Slot::B, &config(), probe(), policy())
             .unwrap();
         state.borrow_mut().calls.clear();
         assert_eq!(
@@ -1016,7 +1214,7 @@ mod tests {
     fn physical_discovery_is_independent_of_member_identity_but_metrics_remain_fenced() {
         let (mut pair, state) = setup();
         pair.network
-            .add_standby(&scope(), Slot::B, &config(), probe(), bypass())
+            .add_standby(&scope(), Slot::B, &config(), probe(), policy())
             .unwrap();
         let mut wrong = scope();
         wrong.connection_generation += 1;
@@ -1190,7 +1388,7 @@ mod tests {
         let (mut pair, state) = setup();
         pair.network_mut(&scope())
             .unwrap()
-            .add_standby(&scope(), Slot::B, &config(), probe(), bypass())
+            .add_standby(&scope(), Slot::B, &config(), probe(), policy())
             .unwrap();
         pair.select_active(&scope(), Slot::B).unwrap();
         assert_eq!(pair.network.active(), Some(Slot::B));
@@ -1205,7 +1403,7 @@ mod tests {
         let (mut pair, state) = setup();
         pair.network_mut(&scope())
             .unwrap()
-            .add_standby(&scope(), Slot::B, &config(), probe(), bypass())
+            .add_standby(&scope(), Slot::B, &config(), probe(), policy())
             .unwrap();
         state.borrow_mut().fail_binding_release = true;
         assert!(pair

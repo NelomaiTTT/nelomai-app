@@ -44,6 +44,7 @@ const FULL_SYNC_SECONDS: i64 = 24 * 60 * 60;
 const FAILED_POLICY_RETRY_SECONDS: i64 = 60 * 60;
 const PHYSICAL_NETWORK_RETRY_SECONDS: i64 = 5 * 60;
 const UNKNOWN_PHYSICAL_NETWORK: &str = "restore_requires_network_revalidation";
+const DEFAULT_ROUTES_RESTORED: &str = "split_tunnel_default_routes_restored";
 
 #[cfg(not(target_os = "android"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +54,7 @@ pub(crate) struct DesktopDomainRefresh {
     network: u64,
     membership: u64,
     policy: String,
+    revision: SplitTunnelRevision,
     next_attempt: i64,
 }
 
@@ -63,6 +65,7 @@ pub(crate) struct RunningSplitTunnelOptions {
     // Default has neither; even a genuine empty plan must have an owner.
     available_to: Option<(String, crate::StartCancellationEpoch)>,
     native_confirmed: bool,
+    equivalent_policy_hash: Option<String>,
 }
 
 impl RunningSplitTunnelOptions {
@@ -75,7 +78,16 @@ impl RunningSplitTunnelOptions {
             options,
             available_to: Some((lease_id.to_owned(), epoch)),
             native_confirmed: true,
+            equivalent_policy_hash: None,
         }
+    }
+
+    fn restart_options(&self) -> TunnelOptions {
+        let mut options = self.options.clone();
+        if let Some(hash) = &self.equivalent_policy_hash {
+            options.policy_hash = Some(hash.clone());
+        }
+        options
     }
 
     fn is_available_for(&self, lease_id: &str, epoch: crate::StartCancellationEpoch) -> bool {
@@ -429,6 +441,23 @@ impl EffectiveSplitTunnelPolicy {
                 code: error.stable_code(),
             })?;
 
+        if capabilities.address_split_tunnel
+            && matches!(
+                capabilities.platform,
+                TunnelPlatform::Linux | TunnelPlatform::Macos
+            )
+        {
+            nelomai_client_tunnel::Ipv4RoutePlan::from_options(
+                &DesktopTunnelOptions::from_tunnel_options(&options),
+            )
+            .and_then(|plan| {
+                plan.validate_unix_route_budget(capabilities.platform == TunnelPlatform::Macos)
+            })
+            .map_err(|error| SplitTunnelPolicyError::InvalidTunnelOptions {
+                code: error.stable_code(),
+            })?;
+        }
+
         Ok(Self {
             active: true,
             options,
@@ -615,7 +644,7 @@ struct DomainResolutionOutcome {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum DomainResolutionMode {
+pub(crate) enum DomainResolutionMode {
     Refresh,
     ResolveMissing,
     CachedOnly,
@@ -753,27 +782,54 @@ pub enum SplitTunnelSyncOutcome {
     UnsupportedPolicy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
+pub struct SavedSplitTunnelAddressRules {
+    pub policy: SplitTunnelPolicy,
+    pub apply_issue: Option<CoreError>,
+    pub warning: Option<String>,
+}
+
+struct AddressEditEpochs {
+    runtime_stop: u64,
+    start: crate::StartCancellationEpoch,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum ConnectedPolicyApplyOutcome {
+    PreparationFailed(String),
+    LocalOnly,
     Unchanged,
+    #[cfg(not(target_os = "android"))]
+    Deferred,
     ConfigurationUnavailable,
     AppliedWithoutReconnect,
     Applied,
     RolledBack,
+    DefaultRoutesRestored,
     StopFailed,
     Failed,
 }
 
 impl ConnectedPolicyApplyOutcome {
     fn reconnected(self) -> bool {
-        matches!(self, Self::Applied | Self::RolledBack | Self::Failed)
+        matches!(
+            self,
+            Self::Applied | Self::RolledBack | Self::DefaultRoutesRestored | Self::Failed
+        )
     }
 
-    fn error_code(self) -> Option<&'static str> {
+    fn error_code(&self) -> Option<&'static str> {
         match self {
-            Self::Unchanged | Self::AppliedWithoutReconnect | Self::Applied => None,
+            Self::Unchanged
+            | Self::PreparationFailed(_)
+            | Self::LocalOnly
+            | Self::AppliedWithoutReconnect
+            | Self::Applied => None,
+            #[cfg(not(target_os = "android"))]
+            Self::Deferred => Some("split_tunnel_apply_deferred"),
             Self::ConfigurationUnavailable => Some("split_tunnel_saved_connection_unavailable"),
             Self::RolledBack => Some("split_tunnel_apply_failed"),
+            Self::DefaultRoutesRestored => Some(DEFAULT_ROUTES_RESTORED),
             Self::StopFailed => Some("split_tunnel_stop_failed"),
             Self::Failed => Some("split_tunnel_rollback_failed"),
         }
@@ -799,6 +855,27 @@ where
 
     pub fn cached_split_tunnel_policy(&self) -> Result<Option<SplitTunnelPolicy>, CoreError> {
         self.cached_policy_for_start()
+    }
+
+    pub async fn saved_split_tunnel_policy(&self) -> Result<Option<SplitTunnelPolicy>, CoreError> {
+        let epoch = self.start_cancellation_epoch();
+        let _guard = self.split_tunnel_gate.lock().await;
+        if self.auth.state().await? != nelomai_client_api::RuntimeAuthState::Active {
+            return Err(CoreError::SignedOut);
+        }
+        self.ensure_start_not_cancelled(epoch)?;
+        let state = self
+            .split_tunnel_store
+            .load()
+            .map_err(|_| CoreError::Storage)?;
+        Ok(state
+            .cached_policy
+            .as_ref()
+            .filter(|policy| {
+                !policy_is_superseded(&state, policy)
+                    && validate_split_tunnel_policy(policy).is_ok()
+            })
+            .cloned())
     }
 
     pub async fn split_tunnel_capabilities(&self) -> Result<TunnelCapabilities, CoreError> {
@@ -873,7 +950,7 @@ where
             let running = self.split_tunnel_options.lock().await;
             running
                 .is_available_for(&connection.lease_id, cancel_epoch)
-                .then(|| running.options.clone())
+                .then(|| running.restart_options())
         };
         let Some(options) = options else {
             self.physical_network_change.lock().await.reset();
@@ -967,6 +1044,8 @@ where
         if !allowed() {
             return Ok(PhysicalNetworkPollOutcome::RetryDeferred);
         }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let options = self.automatic_restart_split_tunnel_options(options).await?;
         self.retire_split_tunnel_confirmation(&connection, cancel_epoch)
             .await?;
         let stop_result = self.tunnel.stop_for_restart().await;
@@ -1141,8 +1220,10 @@ where
                 // running owner untouched until its options can be recovered.
                 return Ok(crate::StalledDataPlaneRecoveryOutcome::Skipped);
             }
-            running.options.clone()
+            running.restart_options()
         };
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let options = self.automatic_restart_split_tunnel_options(options).await?;
         self.begin_recovery_episode(
             &connection,
             crate::ConnectOptions {
@@ -1365,24 +1446,44 @@ where
                     .load(std::sync::atomic::Ordering::SeqCst),
             ),
         );
+        if confirmed
+            && capabilities.platform == TunnelPlatform::Windows
+            && running.options.policy_hash.is_none()
+            && running.options.exclude_local_networks
+        {
+            // An ordinary Windows session started with LAN-only defaults defers
+            // the first policy until the next explicit Start.
+            return Ok(false);
+        }
         // A stored working hash is not an attestation of an independently
         // started Android tunnel. A save may require a replacement even when
         // the request is identical to the cache, so obtain confirmation first.
         if capabilities.platform == TunnelPlatform::Android && !confirmed {
             return Ok(true);
         }
-        let Some(policy) = self.cached_policy_for_start()? else {
-            return Ok(false);
+        #[cfg(not(target_os = "android"))]
+        if matches!(
+            capabilities.platform,
+            TunnelPlatform::Macos | TunnelPlatform::Linux | TunnelPlatform::Windows
+        ) && self.load_runtime()?.desktop_redundancy.is_some()
+        {
+            return Ok(false); // Retained pairs replace routes in place.
+        }
+        let stored = self
+            .split_tunnel_store
+            .load()
+            .map_err(|_| CoreError::Storage)?;
+        let Some(policy) = stored.cached_policy.as_ref().filter(|policy| {
+            !policy_is_superseded(&stored, policy) && validate_split_tunnel_policy(policy).is_ok()
+        }) else {
+            // An ordinary Save can return a new plan that requires Stop/Start.
+            return Ok(true);
         };
         let packages = self
             .split_tunnel_packages
             .read()
             .map(|packages| packages.clone())
             .unwrap_or_default();
-        let stored = self
-            .split_tunnel_store
-            .load()
-            .map_err(|_| CoreError::Storage)?;
         // Compare using last-good addresses for exactly the domains still in
         // the policy. Preflight is observational and must not perform DNS I/O.
         let resolved_domains = policy
@@ -1398,7 +1499,7 @@ where
             .flat_map(|item| item.ipv4_cidrs.iter().cloned())
             .collect::<Vec<_>>();
         let current = EffectiveSplitTunnelPolicy::build_with_resolved_domains(
-            &policy,
+            policy,
             &packages,
             capabilities,
             connection.layer,
@@ -1406,7 +1507,7 @@ where
             &resolved_domains,
         )
         .map_err(|error| CoreError::SplitTunnel(error.stable_code().to_string()))?;
-        let mut proposed = policy;
+        let mut proposed = policy.clone();
         proposed.mode = request.mode;
         proposed.exclude_local_networks = request.exclude_local_networks;
         proposed.selected_packages = request
@@ -1452,7 +1553,7 @@ where
         now_unix: i64,
         resolver: F,
         observation: Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>,
-        force: bool,
+        explicit_apply: Option<(DomainResolutionMode, crate::StartCancellationEpoch)>,
     ) -> Result<Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>, CoreError>
     where
         F: Fn(String) -> Fut + Clone,
@@ -1467,22 +1568,50 @@ where
         let Some(policy) = state.cached_policy.clone() else {
             return Ok(None);
         };
+        let force = explicit_apply.is_some();
+        let revision = policy_revision(&policy);
+        let policy_changed = state.working_policy_hash.as_deref()
+            != Some(policy.policy_hash.as_str())
+            || state.working_policy_revision.as_ref() != Some(&revision);
+        let refresh_domains = policy.enabled
+            && policy
+                .address_rules
+                .iter()
+                .any(|rule| rule.kind == SplitTunnelAddressRuleKind::Domain);
         if pair.stop.is_some()
             || stored.pending_compensation_stop.is_some()
-            || (!force
-                && (!policy.enabled
-                    || !policy
-                        .address_rules
-                        .iter()
-                        .any(|r| r.kind == SplitTunnelAddressRuleKind::Domain)))
-            || self.tunnel.capabilities().await?.platform != TunnelPlatform::Windows
+            || policy_is_superseded(state, &policy)
+            || (!force && !policy_changed && !refresh_domains)
         {
             return Ok(None);
         }
-        let cancel = crate::StartCancellationEpoch(
-            self.start_cancel_epoch
-                .load(std::sync::atomic::Ordering::SeqCst),
+        let capabilities = self.tunnel.capabilities().await?;
+        if !matches!(
+            capabilities.platform,
+            TunnelPlatform::Windows | TunnelPlatform::Macos | TunnelPlatform::Linux
+        ) {
+            return Ok(None);
+        }
+        let unix_desktop = matches!(
+            capabilities.platform,
+            TunnelPlatform::Macos | TunnelPlatform::Linux
         );
+        if observation.is_some() && revision_poll_due(state, now_unix) {
+            return Ok(None);
+        }
+        let apply_pending_policy = !force && policy_changed;
+        let refresh_due = if apply_pending_policy {
+            policy_retry_due(state, &policy, now_unix)
+        } else {
+            refresh_domains
+        };
+        if !force && !refresh_due {
+            return Ok(None);
+        }
+        let cancel = explicit_apply
+            .map(|(_, epoch)| epoch)
+            .unwrap_or_else(|| self.start_cancellation_epoch());
+        self.ensure_start_not_cancelled(cancel)?;
         let snapshot = match observation {
             Some(value) => value,
             None => {
@@ -1497,6 +1626,7 @@ where
         desktop_redundancy::validate_snapshot(pair, stored.slot, &snapshot)?;
         if snapshot.session.phase != SessionPhase::Running
             || !snapshot.session.role_confirmed
+            || snapshot.stalled
             || snapshot.cleanup_pending
             || snapshot.retirement_pending
         {
@@ -1508,6 +1638,7 @@ where
             network: snapshot.session.network_epoch,
             membership: snapshot.session.membership_generation,
             policy: policy.policy_hash.clone(),
+            revision,
             next_attempt: now_unix.saturating_add(DOMAIN_REFRESH_SECONDS),
         };
         let previous = self.desktop_domain_refresh.lock().await.clone();
@@ -1517,6 +1648,7 @@ where
                 && old.network == context.network
                 && old.membership == context.membership
                 && old.policy == context.policy
+                && old.revision == context.revision
         });
         if !force
             && same_context
@@ -1537,7 +1669,6 @@ where
             return Err(CoreError::Storage);
         }
         *self.desktop_domain_refresh.lock().await = Some(context);
-        let capabilities = self.tunnel.capabilities().await?;
         let active = capabilities.address_split_tunnel
             && split_tunnel_active(SplitTunnelContext {
                 global_enabled: policy.enabled,
@@ -1552,17 +1683,45 @@ where
                 &policy,
                 &mut resolved_state,
                 now_unix,
-                DomainResolutionMode::Refresh,
+                explicit_apply.map_or(DomainResolutionMode::Refresh, |(mode, _)| mode),
                 resolver,
             )
             .await
         } else {
+            resolved_state.domain_resolutions.clear();
             DomainResolutionOutcome {
                 ipv4_cidrs: Vec::new(),
                 had_failures: false,
                 missing_cache: false,
             }
         };
+        let _writer = self.connection_gate.lock().await;
+        let current = self.load_runtime()?;
+        let current_policy = self
+            .split_tunnel_store
+            .load()
+            .map_err(|_| CoreError::Storage)?;
+        if self.ensure_start_not_cancelled(cancel).is_err()
+            || current.auth_scope != stored.auth_scope
+            || current.desktop_redundancy != stored.desktop_redundancy
+            || current.pending_compensation_stop.is_some()
+            || current_policy.cached_policy.as_ref() != Some(&policy)
+            || policy_is_superseded(&current_policy, &policy)
+        {
+            return Ok(None);
+        }
+        let fresh = self
+            .tunnel
+            .desktop_redundancy_command(Command::Status {
+                scope: snapshot.session.scope.clone(),
+            })
+            .await?;
+        if fresh != snapshot {
+            return Ok(None);
+        }
+        if unix_desktop {
+            self.update_domain_resolution_warning(&resolved).await;
+        }
         if resolved.missing_cache {
             return Err(CoreError::SplitTunnel(
                 "split_tunnel_domain_resolution_unavailable".into(),
@@ -1591,7 +1750,11 @@ where
         } else {
             TunnelOptions::default()
         };
-        if previous_options.policy_hash == options.policy_hash {
+        // Unix uses the per-domain result above: fresh answers replace the
+        // old addresses while failed lookups keep their last good answers.
+        if capabilities.platform == TunnelPlatform::Windows
+            && previous_options.policy_hash == options.policy_hash
+        {
             let mut retained = previous_options.excluded_ipv4_cidrs.clone();
             let mut seen = retained.iter().cloned().collect::<HashSet<_>>();
             for cidr in &options.excluded_ipv4_cidrs {
@@ -1608,69 +1771,67 @@ where
                 .validate()
                 .map_err(|e| CoreError::SplitTunnel(e.stable_code().into()))?;
         }
-        let _writer = self.connection_gate.lock().await;
-        let current = self.load_runtime()?;
-        if self.ensure_start_not_cancelled(cancel).is_err()
-            || current.auth_scope != stored.auth_scope
-            || current.desktop_redundancy != stored.desktop_redundancy
-            || current.pending_compensation_stop.is_some()
-            || self
-                .split_tunnel_store
-                .load()
-                .map_err(|_| CoreError::Storage)?
-                .cached_policy
-                .as_ref()
-                .map(|p| &p.policy_hash)
-                != Some(&policy.policy_hash)
-        {
-            return Ok(None);
-        }
-        let fresh = self
-            .tunnel
-            .desktop_redundancy_command(Command::Status {
-                scope: snapshot.session.scope.clone(),
-            })
-            .await?;
-        if fresh != snapshot {
-            return Ok(None);
-        }
-        if previous.is_confirmed_for(&pair.connection.lease_id, cancel)
+        let pending_result = apply_pending_policy
+            .then(|| applied_policy_result(&policy, now_unix))
+            .transpose()?;
+        let updated = if previous.is_confirmed_for(&pair.connection.lease_id, cancel)
             && previous_options.has_same_effective_routes(&options)
         {
-            *self.split_tunnel_options.lock().await =
-                RunningSplitTunnelOptions::confirmed(options, &pair.connection.lease_id, cancel);
-            state.working_policy_hash = Some(policy.policy_hash);
-            state.domain_resolutions = resolved_state.domain_resolutions;
-            return Ok(Some(fresh));
-        }
-        // Native may commit before its reply is lost or this wait is cancelled.
-        // Keep the restart recipe, but require a fresh exact ACK after dispatch.
-        self.split_tunnel_options.lock().await.native_confirmed = false;
-        let updated = self
-            .tunnel
-            .desktop_redundancy_command(Command::RefreshSplitTunnel {
-                scope: fresh.session.scope.clone(),
-                expected_revision: fresh.session.local_revision,
-                expected_network_epoch: fresh.session.network_epoch,
-                expected_role_generation: fresh.session.role_generation,
-                expected_membership_generation: fresh.session.membership_generation,
-                options: DesktopTunnelOptions::from_tunnel_options(&options),
-            })
-            .await?;
-        let mut expected = fresh.clone();
-        expected.session.local_revision = expected
-            .session
-            .local_revision
-            .checked_add(1)
-            .ok_or(CoreError::Storage)?;
-        if updated != expected {
-            return Err(CoreError::Tunnel("split_tunnel_refresh_unconfirmed".into()));
-        }
+            fresh
+        } else {
+            // Native may commit before its reply is lost or this wait is cancelled.
+            // Keep the restart recipe, but require a fresh exact ACK after dispatch.
+            self.split_tunnel_options.lock().await.native_confirmed = false;
+            let updated = self
+                .tunnel
+                .desktop_redundancy_command(Command::RefreshSplitTunnel {
+                    scope: fresh.session.scope.clone(),
+                    expected_revision: fresh.session.local_revision,
+                    expected_network_epoch: fresh.session.network_epoch,
+                    expected_role_generation: fresh.session.role_generation,
+                    expected_membership_generation: fresh.session.membership_generation,
+                    options: DesktopTunnelOptions::from_tunnel_options(&options),
+                })
+                .await?;
+            let mut expected = fresh;
+            expected.session.local_revision = expected
+                .session
+                .local_revision
+                .checked_add(1)
+                .ok_or(CoreError::Storage)?;
+            if updated != expected {
+                return Err(CoreError::Tunnel("split_tunnel_refresh_unconfirmed".into()));
+            }
+            updated
+        };
+        self.ensure_start_not_cancelled(cancel)?;
         *self.split_tunnel_options.lock().await =
             RunningSplitTunnelOptions::confirmed(options, &pair.connection.lease_id, cancel);
-        state.working_policy_hash = Some(policy.policy_hash);
+        record_working_policy(state, &policy);
         state.domain_resolutions = resolved_state.domain_resolutions;
+        if let Some(result) = pending_result {
+            // Both background callers persist the result with the working hash.
+            clear_policy_failure(state);
+            state.pending_apply_results.push(result);
+        }
         Ok(Some(updated))
+    }
+
+    async fn tracks_split_tunnel_revisions(
+        &self,
+        state: &StoredSplitTunnelState,
+    ) -> Result<bool, CoreError> {
+        if state.observed_panel_revision.is_some() {
+            return Ok(true);
+        }
+        #[cfg(target_os = "android")]
+        return Ok(false);
+        #[cfg(not(target_os = "android"))]
+        Ok(match self.tunnel.capabilities().await?.platform {
+            TunnelPlatform::Macos | TunnelPlatform::Linux => true,
+            TunnelPlatform::Windows => self.load_runtime()?.desktop_redundancy.is_some(),
+            _ => false,
+        })
     }
 
     pub async fn synchronize_split_tunnel(
@@ -1692,62 +1853,61 @@ where
         F: Fn(String) -> Fut + Clone,
         Fut: Future<Output = Option<Vec<String>>>,
     {
+        let epochs = self.address_edit_epochs();
         let _guard = self.split_tunnel_gate.lock().await;
+        self.ensure_address_edit_runtime_current(&epochs)?;
         let mut state = self
             .split_tunnel_store
             .load()
             .map_err(|_| CoreError::Storage)?;
-        #[cfg(not(target_os = "android"))]
-        let refreshed = self
-            .refresh_retained_split_tunnel(&mut state, now_unix, resolver, None, false)
-            .await?;
-        #[cfg(target_os = "android")]
-        let refreshed: Option<()> = {
-            let _ = resolver;
-            None
-        };
-        if refreshed.is_some() {
-            self.split_tunnel_store
-                .save(&state)
-                .map_err(|_| CoreError::Storage)?;
-        }
-        if !force_full
-            && state
-                .last_revision_check_unix
-                .is_some_and(|last| now_unix.saturating_sub(last) < REVISION_POLL_SECONDS)
-        {
-            return Ok(if refreshed.is_some() {
+        let revision_check_due = force_full || revision_poll_due(&state, now_unix);
+        if !revision_check_due {
+            let refreshed = self
+                .refresh_cached_split_tunnel(&mut state, now_unix, resolver, &epochs)
+                .await?;
+            return Ok(if refreshed {
                 SplitTunnelSyncOutcome::Updated { reconnected: false }
             } else {
                 SplitTunnelSyncOutcome::Skipped
             });
         }
 
+        // A due revision check takes precedence over installing cached exclusions.
         let mut access_token = self.access_snapshot().await?;
-        self.flush_pending_apply_results(&mut access_token, &mut state)
-            .await;
         let revision = match self.request_split_tunnel_revision(&mut access_token).await {
             Ok(revision) => revision,
             Err(CoreError::AuthRefreshPending | CoreError::Api(CoreApiError::Retryable)) => {
                 state.last_revision_check_unix = Some(now_unix);
-                self.split_tunnel_store
-                    .save(&state)
-                    .map_err(|_| CoreError::Storage)?;
-                self.set_split_tunnel_warning(
-                    SplitTunnelWarningKind::Sync,
-                    "split_tunnel_cached_offline",
-                )
-                .await;
-                return Ok(SplitTunnelSyncOutcome::CachedOffline);
+                self.flush_pending_apply_results(&mut access_token, &mut state)
+                    .await;
+                return self
+                    .finish_offline_split_tunnel_sync(&mut state, now_unix, Some(resolver), &epochs)
+                    .await;
             }
             Err(error) => return Err(error),
         };
 
+        let track_revision = self.tracks_split_tunnel_revisions(&state).await?;
+        self.ensure_address_edit_runtime_current(&epochs)?;
+        let observed_changed = track_revision && observe_panel_revision(&mut state, &revision);
+        let cached_superseded = state
+            .cached_policy
+            .as_ref()
+            .is_some_and(|policy| policy_is_superseded(&state, policy));
+        state.last_revision_check_unix = Some(now_unix);
+        if observed_changed && cached_superseded {
+            // Retain evidence against the old cache even if loading the new
+            // policy fails or the process exits during the request.
+            self.split_tunnel_store
+                .save(&state)
+                .map_err(|_| CoreError::Storage)?;
+        }
         let force_revision_changed = revision.force_revision > state.last_seen_force_revision;
         let address_revision_changed =
             revision.address_revision != state.last_seen_address_revision;
         let full_sync_due = force_full
             || state.cached_policy.is_none()
+            || cached_superseded
             || state
                 .last_full_sync_unix
                 .is_none_or(|last| now_unix.saturating_sub(last) >= FULL_SYNC_SECONDS)
@@ -1756,7 +1916,23 @@ where
             })
             || force_revision_changed
             || address_revision_changed;
-        state.last_revision_check_unix = Some(now_unix);
+        let (refreshed, refresh_error) = if full_sync_due {
+            (false, None)
+        } else {
+            match self
+                .refresh_cached_split_tunnel(&mut state, now_unix, resolver.clone(), &epochs)
+                .await
+            {
+                Ok(refreshed) => (refreshed, None),
+                Err(error @ (CoreError::SplitTunnel(_) | CoreError::Tunnel(_))) => {
+                    (false, Some(error))
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        self.flush_pending_apply_results(&mut access_token, &mut state)
+            .await;
+        self.ensure_address_edit_runtime_current(&epochs)?;
         if !full_sync_due {
             state.last_seen_force_revision = revision.force_revision;
             state.last_seen_address_revision = revision.address_revision;
@@ -1765,7 +1941,11 @@ where
                     state.working_policy_hash.as_deref() != Some(policy.policy_hash.as_str())
                         && policy_retry_due(&state, policy, now_unix)
                 });
-            if let Some(policy) = needs_retry.then(|| state.cached_policy.clone()).flatten() {
+            if let Some(policy) = (needs_retry
+                && self.ensure_start_not_cancelled(epochs.start).is_ok())
+            .then(|| state.cached_policy.clone())
+            .flatten()
+            {
                 let outcome = self
                     .apply_policy_if_connected(
                         &policy,
@@ -1773,6 +1953,7 @@ where
                         &mut access_token,
                         now_unix,
                         DomainResolutionMode::Refresh,
+                        epochs.start,
                     )
                     .await?;
                 self.split_tunnel_store
@@ -1785,30 +1966,32 @@ where
             self.split_tunnel_store
                 .save(&state)
                 .map_err(|_| CoreError::Storage)?;
+            if let Some(error) = refresh_error {
+                return Err(error);
+            }
             if state.cached_policy.as_ref().is_none_or(|policy| {
                 state.working_policy_hash.as_deref() == Some(policy.policy_hash.as_str())
             }) {
                 self.clear_split_tunnel_warning(SplitTunnelWarningKind::Sync)
                     .await;
             }
-            return Ok(SplitTunnelSyncOutcome::Unchanged);
+            return Ok(if refreshed {
+                SplitTunnelSyncOutcome::Updated { reconnected: false }
+            } else {
+                SplitTunnelSyncOutcome::Unchanged
+            });
         }
 
         let policy = match self.request_split_tunnel_policy(&mut access_token).await {
             Ok(policy) => policy,
             Err(CoreError::AuthRefreshPending | CoreError::Api(CoreApiError::Retryable)) => {
-                self.split_tunnel_store
-                    .save(&state)
-                    .map_err(|_| CoreError::Storage)?;
-                self.set_split_tunnel_warning(
-                    SplitTunnelWarningKind::Sync,
-                    "split_tunnel_cached_offline",
-                )
-                .await;
-                return Ok(SplitTunnelSyncOutcome::CachedOffline);
+                return self
+                    .finish_offline_split_tunnel_sync(&mut state, now_unix, Some(resolver), &epochs)
+                    .await;
             }
             Err(error) => return Err(error),
         };
+        self.ensure_address_edit_runtime_current(&epochs)?;
         if let Err(error) = validate_split_tunnel_policy(&policy) {
             self.split_tunnel_store
                 .save(&state)
@@ -1817,6 +2000,11 @@ where
                 .await;
             return Ok(SplitTunnelSyncOutcome::UnsupportedPolicy);
         }
+        if policy_is_superseded(&state, &policy) {
+            return self
+                .finish_offline_split_tunnel_sync(&mut state, now_unix, None::<F>, &epochs)
+                .await;
+        }
 
         let changed = state
             .cached_policy
@@ -1824,29 +2012,34 @@ where
             .is_none_or(|cached| cached.policy_hash != policy.policy_hash);
         remember_previous_working_policy(&mut state);
         clear_stale_policy_failure(&mut state, &policy);
+        if state.observed_panel_revision.is_some() {
+            observe_panel_revision(&mut state, &policy_revision(&policy));
+        }
         state.cached_policy = Some(policy.clone());
         state.last_full_sync_unix = Some(now_unix);
-        state.last_seen_force_revision = revision.force_revision;
-        state.last_seen_address_revision = revision.address_revision;
+        state.last_seen_force_revision = revision.force_revision.max(policy.force_revision);
+        state.last_seen_address_revision = revision.address_revision.max(policy.address_revision);
         self.split_tunnel_store
             .save(&state)
             .map_err(|_| CoreError::Storage)?;
         self.clear_split_tunnel_warning(SplitTunnelWarningKind::Sync)
             .await;
         let needs_apply = force_full
+            || force_revision_changed
             || changed
             || state.working_policy_hash.as_deref() != Some(policy.policy_hash.as_str())
             || policy
                 .address_rules
                 .iter()
                 .any(|rule| rule.kind == SplitTunnelAddressRuleKind::Domain);
-        let outcome = if needs_apply {
+        let outcome = if needs_apply && self.ensure_start_not_cancelled(epochs.start).is_ok() {
             self.apply_policy_if_connected(
                 &policy,
                 &mut state,
                 &mut access_token,
                 now_unix,
                 DomainResolutionMode::Refresh,
+                epochs.start,
             )
             .await?
         } else {
@@ -1860,6 +2053,73 @@ where
         })
     }
 
+    async fn refresh_cached_split_tunnel<F, Fut>(
+        &self,
+        state: &mut StoredSplitTunnelState,
+        now_unix: i64,
+        resolver: F,
+        epochs: &AddressEditEpochs,
+    ) -> Result<bool, CoreError>
+    where
+        F: Fn(String) -> Fut + Clone,
+        Fut: Future<Output = Option<Vec<String>>>,
+    {
+        self.ensure_address_edit_runtime_current(epochs)?;
+        if self.ensure_start_not_cancelled(epochs.start).is_err() {
+            return Ok(false);
+        }
+        #[cfg(not(target_os = "android"))]
+        let refreshed = self
+            .refresh_retained_split_tunnel(state, now_unix, resolver, None, None)
+            .await?
+            .is_some();
+        #[cfg(target_os = "android")]
+        let refreshed = {
+            let _ = (now_unix, resolver);
+            false
+        };
+        if refreshed {
+            self.ensure_address_edit_runtime_current(epochs)?;
+            self.split_tunnel_store
+                .save(state)
+                .map_err(|_| CoreError::Storage)?;
+        }
+        Ok(refreshed)
+    }
+
+    async fn finish_offline_split_tunnel_sync<F, Fut>(
+        &self,
+        state: &mut StoredSplitTunnelState,
+        now_unix: i64,
+        resolver: Option<F>,
+        epochs: &AddressEditEpochs,
+    ) -> Result<SplitTunnelSyncOutcome, CoreError>
+    where
+        F: Fn(String) -> Fut + Clone,
+        Fut: Future<Output = Option<Vec<String>>>,
+    {
+        if let Some(resolver) = resolver {
+            match self
+                .refresh_cached_split_tunnel(state, now_unix, resolver, epochs)
+                .await
+            {
+                Ok(_)
+                | Err(CoreError::SplitTunnel(_) | CoreError::Tunnel(_))
+                | Err(CoreError::AuthRefreshPending | CoreError::Api(CoreApiError::Retryable)) => {
+                    ()
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.ensure_address_edit_runtime_current(epochs)?;
+        self.split_tunnel_store
+            .save(state)
+            .map_err(|_| CoreError::Storage)?;
+        self.set_split_tunnel_warning(SplitTunnelWarningKind::Sync, "split_tunnel_cached_offline")
+            .await;
+        Ok(SplitTunnelSyncOutcome::CachedOffline)
+    }
+
     pub async fn save_split_tunnel_settings(
         &self,
         request: &SplitTunnelSettingsUpdate,
@@ -1870,6 +2130,7 @@ where
             .split_tunnel_store
             .load()
             .map_err(|_| CoreError::Storage)?;
+        let track_revision = self.tracks_split_tunnel_revisions(&state).await?;
         let mut access_token = self.access_snapshot().await?;
         self.flush_pending_apply_results(&mut access_token, &mut state)
             .await;
@@ -1878,12 +2139,18 @@ where
             .await?;
         validate_split_tunnel_policy(&policy)
             .map_err(|error| CoreError::SplitTunnel(error.stable_code().to_string()))?;
+        if policy_is_superseded(&state, &policy) {
+            return Err(CoreError::SplitTunnel("split_tunnel_cached_offline".into()));
+        }
         let changed = state
             .cached_policy
             .as_ref()
             .is_none_or(|cached| cached.policy_hash != policy.policy_hash);
         remember_previous_working_policy(&mut state);
         clear_stale_policy_failure(&mut state, &policy);
+        if track_revision {
+            observe_panel_revision(&mut state, &policy_revision(&policy));
+        }
         state.cached_policy = Some(policy.clone());
         state.last_full_sync_unix = Some(now_unix);
         state.last_revision_check_unix = Some(now_unix);
@@ -1908,6 +2175,7 @@ where
                 &mut access_token,
                 now_unix,
                 DomainResolutionMode::CachedOnly,
+                self.start_cancellation_epoch(),
             )
             .await?
         } else {
@@ -1922,11 +2190,35 @@ where
         Ok(policy)
     }
 
+    fn address_edit_epochs(&self) -> AddressEditEpochs {
+        AddressEditEpochs {
+            runtime_stop: self
+                .runtime_stop_epoch
+                .load(std::sync::atomic::Ordering::SeqCst),
+            start: self.start_cancellation_epoch(),
+        }
+    }
+
+    fn ensure_address_edit_runtime_current(
+        &self,
+        epochs: &AddressEditEpochs,
+    ) -> Result<(), CoreError> {
+        if self
+            .runtime_stop_epoch
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != epochs.runtime_stop
+        {
+            return Err(CoreError::StartCancelled);
+        }
+        Ok(())
+    }
+
     pub async fn add_split_tunnel_address_rule(
         &self,
         request: &SplitTunnelAddressRuleUpdate,
         now_unix: i64,
-    ) -> Result<SplitTunnelPolicy, CoreError> {
+    ) -> Result<SavedSplitTunnelAddressRules, CoreError> {
+        let epochs = self.address_edit_epochs();
         let _guard = self.split_tunnel_gate.lock().await;
         let normalized_request = SplitTunnelAddressRuleUpdate {
             value: normalize_address_rule_input(&request.value)
@@ -1940,11 +2232,21 @@ where
         let mut access_token = self.access_snapshot().await?;
         self.flush_pending_apply_results(&mut access_token, &mut state)
             .await;
+        let track_revision = self.tracks_split_tunnel_revisions(&state).await?;
+        self.ensure_address_edit_runtime_current(&epochs)?;
+        self.ensure_start_not_cancelled(epochs.start)?;
         let policy = self
             .request_add_split_tunnel_address_rule(&mut access_token, &normalized_request)
             .await?;
-        self.apply_updated_address_rule_policy(policy, &mut state, &mut access_token, now_unix)
-            .await
+        self.apply_updated_address_rule_policy(
+            policy,
+            &mut state,
+            &mut access_token,
+            now_unix,
+            track_revision,
+            epochs,
+        )
+        .await
     }
 
     pub async fn remove_split_tunnel_address_rule(
@@ -1952,8 +2254,16 @@ where
         rule_id: i64,
         scope: SplitTunnelAddressRuleScope,
         now_unix: i64,
-    ) -> Result<SplitTunnelPolicy, CoreError> {
+    ) -> Result<SavedSplitTunnelAddressRules, CoreError> {
+        let epochs = self.address_edit_epochs();
         let _guard = self.split_tunnel_gate.lock().await;
+        if rule_id <= 0 {
+            return Err(CoreError::SplitTunnel(
+                SplitTunnelPolicyError::InvalidAddressRule
+                    .stable_code()
+                    .into(),
+            ));
+        }
         let mut state = self
             .split_tunnel_store
             .load()
@@ -1961,11 +2271,21 @@ where
         let mut access_token = self.access_snapshot().await?;
         self.flush_pending_apply_results(&mut access_token, &mut state)
             .await;
+        let track_revision = self.tracks_split_tunnel_revisions(&state).await?;
+        self.ensure_address_edit_runtime_current(&epochs)?;
+        self.ensure_start_not_cancelled(epochs.start)?;
         let policy = self
             .request_remove_split_tunnel_address_rule(&mut access_token, rule_id, scope)
             .await?;
-        self.apply_updated_address_rule_policy(policy, &mut state, &mut access_token, now_unix)
-            .await
+        self.apply_updated_address_rule_policy(
+            policy,
+            &mut state,
+            &mut access_token,
+            now_unix,
+            track_revision,
+            epochs,
+        )
+        .await
     }
 
     async fn apply_updated_address_rule_policy(
@@ -1974,35 +2294,85 @@ where
         state: &mut StoredSplitTunnelState,
         access_token: &mut AccessSnapshot,
         now_unix: i64,
-    ) -> Result<SplitTunnelPolicy, CoreError> {
+        track_revision: bool,
+        epochs: AddressEditEpochs,
+    ) -> Result<SavedSplitTunnelAddressRules, CoreError> {
+        // A local Stop can cancel route application after the panel has
+        // committed the mutation. Keep the policy for the next Start. A stop
+        // from the auth owner (logout, transition, or channel loss) fences
+        // the response itself, and account changes drain the split writer.
         validate_split_tunnel_policy(&policy)
             .map_err(|error| CoreError::SplitTunnel(error.stable_code().to_string()))?;
+        if policy_is_superseded(state, &policy) {
+            return Err(CoreError::SplitTunnel("split_tunnel_cached_offline".into()));
+        }
         remember_previous_working_policy(state);
         clear_stale_policy_failure(state, &policy);
+        if track_revision {
+            observe_panel_revision(state, &policy_revision(&policy));
+        }
         state.cached_policy = Some(policy.clone());
         state.last_full_sync_unix = Some(now_unix);
         state.last_revision_check_unix = Some(now_unix);
         state.last_seen_force_revision = policy.force_revision;
         state.last_seen_address_revision = policy.address_revision;
+        self.ensure_address_edit_runtime_current(&epochs)?;
         self.split_tunnel_store
             .save(state)
             .map_err(|_| CoreError::Storage)?;
-        let outcome = self
+        let apply_issue = match self
             .apply_policy_if_connected(
                 &policy,
                 state,
                 access_token,
                 now_unix,
                 DomainResolutionMode::Refresh,
+                epochs.start,
             )
-            .await?;
+            .await
+        {
+            Ok(ConnectedPolicyApplyOutcome::PreparationFailed(code)) => {
+                Some(CoreError::SplitTunnel(code))
+            }
+            Ok(ConnectedPolicyApplyOutcome::LocalOnly) => Some(CoreError::SplitTunnel(
+                "split_tunnel_policy_deferred".into(),
+            )),
+            Ok(outcome) => outcome
+                .error_code()
+                .map(|code| CoreError::SplitTunnel(code.into())),
+            Err(issue @ (CoreError::SplitTunnel(_) | CoreError::Tunnel(_))) => Some(issue),
+            Err(error) => return Err(error),
+        };
+        self.ensure_start_not_cancelled(epochs.start)?;
         self.split_tunnel_store
             .save(state)
             .map_err(|_| CoreError::Storage)?;
-        if let Some(code) = outcome.error_code() {
-            return Err(CoreError::SplitTunnel(code.to_string()));
+        let warning = self.split_tunnel_warning().await;
+        self.ensure_start_not_cancelled(epochs.start)?;
+        Ok(SavedSplitTunnelAddressRules {
+            policy,
+            apply_issue,
+            warning,
+        })
+    }
+
+    async fn update_domain_resolution_warning(&self, outcome: &DomainResolutionOutcome) {
+        if outcome.missing_cache {
+            self.set_split_tunnel_warning(
+                SplitTunnelWarningKind::Dns,
+                "split_tunnel_domain_resolution_unavailable",
+            )
+            .await;
+        } else if outcome.had_failures {
+            self.set_split_tunnel_warning(
+                SplitTunnelWarningKind::Dns,
+                "split_tunnel_domain_resolution_failed",
+            )
+            .await;
+        } else {
+            self.clear_split_tunnel_warning(SplitTunnelWarningKind::Dns)
+                .await;
         }
-        Ok(policy)
     }
 
     async fn effective_tunnel_options_with_state(
@@ -2020,32 +2390,17 @@ where
             .read()
             .map(|packages| packages.clone())
             .unwrap_or_default();
-        let address_rules_active = capabilities.address_split_tunnel
-            && split_tunnel_active(SplitTunnelContext {
-                global_enabled: policy.enabled,
-                platform: capabilities.platform,
-                android_api_level: capabilities.android_api_level,
-                layer,
-                route_mode,
-            });
+        let active = split_tunnel_active(SplitTunnelContext {
+            global_enabled: policy.enabled,
+            platform: capabilities.platform,
+            android_api_level: capabilities.android_api_level,
+            layer,
+            route_mode,
+        });
+        let address_rules_active = capabilities.address_split_tunnel && active;
         let resolved_domains = if address_rules_active {
             let outcome = resolve_policy_domains(policy, state, now_unix, domain_resolution).await;
-            if outcome.missing_cache {
-                self.set_split_tunnel_warning(
-                    SplitTunnelWarningKind::Dns,
-                    "split_tunnel_domain_resolution_unavailable",
-                )
-                .await;
-            } else if outcome.had_failures {
-                self.set_split_tunnel_warning(
-                    SplitTunnelWarningKind::Dns,
-                    "split_tunnel_domain_resolution_failed",
-                )
-                .await;
-            } else {
-                self.clear_split_tunnel_warning(SplitTunnelWarningKind::Dns)
-                    .await;
-            }
+            self.update_domain_resolution_warning(&outcome).await;
             if outcome.missing_cache {
                 return Err(CoreError::SplitTunnel(
                     SplitTunnelPolicyError::DomainResolutionUnavailable
@@ -2165,31 +2520,21 @@ where
                 .map_err(|_| CoreError::Storage);
         }
         remember_previous_working_policy(&mut state);
-        state.working_policy_hash = Some(policy.policy_hash.clone());
+        record_working_policy(&mut state, policy);
+        state
+            .pending_apply_results
+            .push(applied_policy_result(policy, now_unix)?);
         self.split_tunnel_store
             .save(&state)
             .map_err(|_| CoreError::Storage)?;
-        let result = SplitTunnelApplyResult {
-            format_version: policy.format_version,
-            revision: policy.revision,
-            force_revision: policy.force_revision,
-            address_revision: policy.address_revision,
-            policy_hash: policy.policy_hash.clone(),
-            status: SplitTunnelApplyStatus::Applied,
-            error_code: None,
-            applied_at: rfc3339(now_unix)?,
-        };
         if let Some(access_token) = access_token {
             self.flush_pending_apply_results(access_token, &mut state)
                 .await;
-            self.report_or_queue_apply_result(access_token, &mut state, result)
-                .await;
-        } else {
-            state.pending_apply_results.push(result);
+            self.split_tunnel_store
+                .save(&state)
+                .map_err(|_| CoreError::Storage)?;
         }
-        self.split_tunnel_store
-            .save(&state)
-            .map_err(|_| CoreError::Storage)
+        Ok(())
     }
 
     pub(crate) async fn retry_pending_split_tunnel_results(&self) {
@@ -2213,27 +2558,36 @@ where
             .split_tunnel_store
             .load()
             .map_err(|_| CoreError::Storage)?;
+        if state
+            .cached_policy
+            .as_ref()
+            .is_some_and(|policy| policy_is_superseded(&state, policy))
+        {
+            return Ok(None);
+        }
         let failed_cached_policy = state
             .cached_policy
             .as_ref()
             .zip(state.failed_policy_hash.as_deref())
             .is_some_and(|(policy, failed_hash)| policy.policy_hash == failed_hash);
         if failed_cached_policy {
-            if let Some(policy) = working_policy(&state)
-                .filter(|policy| validate_split_tunnel_policy(policy).is_ok())
-                .cloned()
+            if let Some(policy) =
+                working_policy(&state).filter(|policy| validate_split_tunnel_policy(policy).is_ok())
             {
-                return Ok(Some(policy));
+                return Ok((!policy_is_superseded(&state, policy)).then(|| policy.clone()));
             }
         }
         Ok(state
             .cached_policy
+            .as_ref()
             .filter(|policy| validate_split_tunnel_policy(policy).is_ok())
             .or_else(|| {
-                state
-                    .previous_working_policy
-                    .filter(|policy| validate_split_tunnel_policy(policy).is_ok())
-            }))
+                state.previous_working_policy.as_ref().filter(|policy| {
+                    !policy_is_superseded(&state, policy)
+                        && validate_split_tunnel_policy(policy).is_ok()
+                })
+            })
+            .cloned())
     }
 
     async fn apply_policy_if_connected(
@@ -2243,11 +2597,9 @@ where
         access_token: &mut AccessSnapshot,
         now_unix: i64,
         domain_resolution: DomainResolutionMode,
+        cancel_epoch: crate::StartCancellationEpoch,
     ) -> Result<ConnectedPolicyApplyOutcome, CoreError> {
-        let cancel_epoch = crate::StartCancellationEpoch(
-            self.start_cancel_epoch
-                .load(std::sync::atomic::Ordering::SeqCst),
-        );
+        self.ensure_start_not_cancelled(cancel_epoch)?;
         let current = {
             let current_state = self.state.lock().await;
             (current_state.phase == Phase::Connected)
@@ -2259,30 +2611,32 @@ where
         };
         let stored = self.load_runtime()?;
         #[cfg(not(target_os = "android"))]
-        if stored.desktop_redundancy.is_some()
-            && self.tunnel.capabilities().await?.platform == TunnelPlatform::Windows
-        {
+        if let Some(resolution) = match stored.desktop_redundancy.as_ref() {
+            Some(_) => match self.tunnel.capabilities().await?.platform {
+                TunnelPlatform::Macos | TunnelPlatform::Linux => Some(domain_resolution),
+                TunnelPlatform::Windows => Some(DomainResolutionMode::Refresh),
+                _ => None,
+            },
+            None => None,
+        } {
             if self
-                .refresh_retained_split_tunnel(state, now_unix, resolve_domain_ipv4, None, true)
+                .refresh_retained_split_tunnel(
+                    state,
+                    now_unix,
+                    resolve_domain_ipv4,
+                    None,
+                    Some((resolution, cancel_epoch)),
+                )
                 .await?
                 .is_none()
             {
-                return Ok(ConnectedPolicyApplyOutcome::Unchanged);
+                return Ok(ConnectedPolicyApplyOutcome::Deferred);
             }
             clear_policy_failure(state);
             self.report_or_queue_apply_result(
                 access_token,
                 state,
-                SplitTunnelApplyResult {
-                    format_version: policy.format_version,
-                    revision: policy.revision,
-                    force_revision: policy.force_revision,
-                    address_revision: policy.address_revision,
-                    policy_hash: policy.policy_hash.clone(),
-                    status: SplitTunnelApplyStatus::Applied,
-                    error_code: None,
-                    applied_at: rfc3339(now_unix)?,
-                },
+                applied_policy_result(policy, now_unix)?,
             )
             .await;
             return Ok(ConnectedPolicyApplyOutcome::AppliedWithoutReconnect);
@@ -2312,17 +2666,17 @@ where
         {
             Ok(options) => options,
             Err(CoreError::SplitTunnel(code)) => {
-                self.set_split_tunnel_warning(SplitTunnelWarningKind::Sync, code)
+                self.set_split_tunnel_warning(SplitTunnelWarningKind::Sync, code.clone())
                     .await;
                 mark_policy_failure(state, policy, now_unix);
-                return Ok(ConnectedPolicyApplyOutcome::Unchanged);
+                return Ok(ConnectedPolicyApplyOutcome::PreparationFailed(code));
             }
             Err(error) => return Err(error),
         };
         let previous = self.split_tunnel_options.lock().await.clone();
         let mut previous_options = if previous.is_available_for(&connection.lease_id, cancel_epoch)
         {
-            previous.options.clone()
+            previous.restart_options()
         } else {
             TunnelOptions::default()
         };
@@ -2349,10 +2703,10 @@ where
                     Err(CoreError::SplitTunnel(code)) => {
                         // Replacement needs a known rollback plan. Do not
                         // turn a missing domain cache into default routes.
-                        self.set_split_tunnel_warning(SplitTunnelWarningKind::Sync, code)
+                        self.set_split_tunnel_warning(SplitTunnelWarningKind::Sync, code.clone())
                             .await;
                         mark_policy_failure(state, policy, now_unix);
-                        return Ok(ConnectedPolicyApplyOutcome::Unchanged);
+                        return Ok(ConnectedPolicyApplyOutcome::PreparationFailed(code));
                     }
                     Err(error) => return Err(error),
                 };
@@ -2380,11 +2734,18 @@ where
             && (previous.is_confirmed_for(&connection.lease_id, cancel_epoch)
                 || inactive_android_split)
         {
-            // No native action occurred. Retain the actual dispatched options,
-            // including DNS and native hash; only policy bookkeeping changes.
-            // Inactive Android split also must not attest reconstructed options.
+            // The native instance still has the dispatched DNS and hash. The
+            // confirmed routes can be reused under the equivalent current policy.
+            if state.observed_panel_revision.is_some()
+                && previous.is_confirmed_for(&connection.lease_id, cancel_epoch)
+            {
+                self.split_tunnel_options
+                    .lock()
+                    .await
+                    .equivalent_policy_hash = new_options.policy_hash.clone();
+            }
             state.domain_resolutions = proposed_state.domain_resolutions;
-            state.working_policy_hash = Some(policy.policy_hash.clone());
+            record_working_policy(state, policy);
             clear_policy_failure(state);
             if self.split_tunnel_store.save(state).is_err() {
                 self.set_split_tunnel_warning(
@@ -2424,7 +2785,7 @@ where
                 "split_tunnel_policy_deferred",
             )
             .await;
-            return Ok(ConnectedPolicyApplyOutcome::Unchanged);
+            return Ok(ConnectedPolicyApplyOutcome::LocalOnly);
         }
         let Some(configuration) = configuration else {
             const ERROR_CODE: &str = "split_tunnel_saved_connection_unavailable";
@@ -2530,7 +2891,7 @@ where
                 .initialize_physical_network_detector(&new_options)
                 .await;
             state.domain_resolutions = proposed_state.domain_resolutions;
-            state.working_policy_hash = Some(policy.policy_hash.clone());
+            record_working_policy(state, policy);
             clear_policy_failure(state);
             self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
                 .await;
@@ -2545,11 +2906,17 @@ where
             )
         } else {
             self.ensure_start_not_cancelled(cancel_epoch)?;
+            let previous_had_policy = previous_options.policy_hash.is_some();
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            let rollback_options =
+                restart_options_for_current_split_policy(state, previous_options);
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            let rollback_options = previous_options;
             let rollback = self
                 .tunnel
                 .start_for_restart(nelomai_client_tunnel::TunnelStartRequest {
                     configuration: nelomai_client_tunnel::TunnelConfiguration::new(configuration),
-                    options: previous_options.clone(),
+                    options: rollback_options.clone(),
                     quick_reconnect: nelomai_client_tunnel::QuickReconnect::Disabled,
                     quick_connection: Some(local_restart_connection(&connection)),
                     redundancy: None,
@@ -2557,28 +2924,39 @@ where
                 .await;
             self.ensure_offline_start_current(cancel_epoch).await?;
             if rollback.is_ok() {
-                state.domain_resolutions = previous_state.domain_resolutions;
+                let (outcome, status, error_code) =
+                    if previous_had_policy && rollback_options.policy_hash.is_none() {
+                        state.working_policy_hash = None;
+                        state.working_policy_revision = None;
+                        state.previous_working_policy = None;
+                        state.domain_resolutions.clear();
+                        (
+                            ConnectedPolicyApplyOutcome::DefaultRoutesRestored,
+                            SplitTunnelApplyStatus::Failed,
+                            DEFAULT_ROUTES_RESTORED,
+                        )
+                    } else {
+                        state.domain_resolutions = previous_state.domain_resolutions;
+                        (
+                            ConnectedPolicyApplyOutcome::RolledBack,
+                            SplitTunnelApplyStatus::RolledBack,
+                            "split_tunnel_apply_failed",
+                        )
+                    };
                 mark_policy_failure(state, policy, now_unix);
                 *self.split_tunnel_options.lock().await = RunningSplitTunnelOptions::confirmed(
-                    previous_options.clone(),
+                    rollback_options.clone(),
                     &connection.lease_id,
                     cancel_epoch,
                 );
                 state.applied_physical_network_fingerprint = self
-                    .initialize_physical_network_detector(&previous_options)
+                    .initialize_physical_network_detector(&rollback_options)
                     .await;
                 self.publish_local_start_state(cancel_epoch, Phase::Connected, connection)
                     .await?;
-                self.set_split_tunnel_warning(
-                    SplitTunnelWarningKind::Operation,
-                    "split_tunnel_apply_failed",
-                )
-                .await;
-                (
-                    ConnectedPolicyApplyOutcome::RolledBack,
-                    SplitTunnelApplyStatus::RolledBack,
-                    Some("split_tunnel_apply_failed".to_string()),
-                )
+                self.set_split_tunnel_warning(SplitTunnelWarningKind::Operation, error_code)
+                    .await;
+                (outcome, status, Some(error_code.to_string()))
             } else {
                 mark_policy_failure(state, policy, now_unix);
                 *self.split_tunnel_options.lock().await = RunningSplitTunnelOptions::default();
@@ -2640,6 +3018,29 @@ where
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    async fn automatic_restart_split_tunnel_options(
+        &self,
+        options: TunnelOptions,
+    ) -> Result<TunnelOptions, CoreError> {
+        if options.policy_hash.is_none() {
+            return Ok(options);
+        }
+        let state = self
+            .split_tunnel_store
+            .load()
+            .map_err(|_| CoreError::Storage)?;
+        let options = restart_options_for_current_split_policy(&state, options);
+        if options.policy_hash.is_none() {
+            self.set_split_tunnel_warning(
+                SplitTunnelWarningKind::Sync,
+                "split_tunnel_policy_unavailable",
+            )
+            .await;
+        }
+        Ok(options)
+    }
+
     pub(crate) async fn restore_running_split_tunnel_options(
         &self,
         connection: &nelomai_contracts::Connection,
@@ -2666,7 +3067,7 @@ where
             // them before reconstruction so failure cannot reuse that plan.
             *running = RunningSplitTunnelOptions::default();
         }
-        let Ok(state) = self.split_tunnel_store.load() else {
+        let Ok(mut state) = self.split_tunnel_store.load() else {
             return;
         };
         // A retained pair can outlive an interrupted native apply/persistence.
@@ -2674,17 +3075,26 @@ where
         let retained_pair = self
             .load_runtime()
             .is_ok_and(|state| state.desktop_redundancy.is_some());
+        let working = working_policy(&state).cloned();
+        let superseded = working
+            .as_ref()
+            .is_some_and(|policy| policy_is_superseded(&state, policy));
         let restored_is_confirmed = !retained_pair
+            && !superseded
             && matches!(self.tunnel.capabilities().await,
             Ok(capabilities) if capabilities.platform != TunnelPlatform::Android);
-        let options = match working_policy(&state) {
+        let options = match working.filter(|_| !superseded) {
             Some(policy) => {
-                self.effective_tunnel_options(
-                    policy,
+                // Reconstruct from the cached plan already in use. Do not
+                // fetch new answers or put a stale store snapshot back while a
+                // concurrent sync publishes a newer authoritative revision.
+                self.effective_tunnel_options_with_state(
+                    &policy,
                     connection.layer,
                     connection.route_mode,
+                    &mut state,
                     OffsetDateTime::now_utc().unix_timestamp(),
-                    false,
+                    DomainResolutionMode::CachedOnly,
                 )
                 .await
             }
@@ -2717,6 +3127,7 @@ where
                         options: options.clone(),
                         available_to: Some((connection.lease_id.clone(), cancel_epoch)),
                         native_confirmed: false,
+                        equivalent_policy_hash: None,
                     }
                 };
             }
@@ -2929,6 +3340,92 @@ fn working_policy(state: &StoredSplitTunnelState) -> Option<&SplitTunnelPolicy> 
         .into_iter()
         .chain(state.previous_working_policy.as_ref())
         .find(|policy| policy.policy_hash == working_hash)
+}
+
+fn revision_poll_due(state: &StoredSplitTunnelState, now_unix: i64) -> bool {
+    state
+        .last_revision_check_unix
+        .is_none_or(|last| now_unix.saturating_sub(last) >= REVISION_POLL_SECONDS)
+}
+
+fn policy_revision(policy: &SplitTunnelPolicy) -> SplitTunnelRevision {
+    SplitTunnelRevision {
+        enabled: policy.enabled,
+        revision: policy.revision,
+        force_revision: policy.force_revision,
+        address_revision: policy.address_revision,
+    }
+}
+
+fn observe_panel_revision(
+    state: &mut StoredSplitTunnelState,
+    revision: &SplitTunnelRevision,
+) -> bool {
+    let Some(known) = state.observed_panel_revision.as_mut() else {
+        state.observed_panel_revision = Some(revision.clone());
+        return true;
+    };
+    let previous = known.clone();
+    if revision.revision >= known.revision {
+        known.revision = revision.revision;
+        known.enabled = revision.enabled;
+    }
+    known.force_revision = known.force_revision.max(revision.force_revision);
+    known.address_revision = known.address_revision.max(revision.address_revision);
+    *known != previous
+}
+
+fn policy_is_superseded(state: &StoredSplitTunnelState, policy: &SplitTunnelPolicy) -> bool {
+    state.observed_panel_revision.as_ref().is_some_and(|known| {
+        policy.revision < known.revision
+            || policy.force_revision < known.force_revision
+            || policy.address_revision < known.address_revision
+            || (policy.revision == known.revision && policy.enabled != known.enabled)
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn restart_options_for_current_split_policy(
+    state: &StoredSplitTunnelState,
+    options: TunnelOptions,
+) -> TunnelOptions {
+    let Some(hash) = options.policy_hash.as_deref() else {
+        return options;
+    };
+    if state.observed_panel_revision.is_none()
+        || state
+            .cached_policy
+            .iter()
+            .chain(state.previous_working_policy.iter())
+            .any(|policy| policy.policy_hash == hash && !policy_is_superseded(state, policy))
+    {
+        return options;
+    }
+    TunnelOptions {
+        dns_servers: options.dns_servers,
+        ..TunnelOptions::default()
+    }
+}
+
+fn record_working_policy(state: &mut StoredSplitTunnelState, policy: &SplitTunnelPolicy) {
+    state.working_policy_hash = Some(policy.policy_hash.clone());
+    state.working_policy_revision = Some(policy_revision(policy));
+}
+
+fn applied_policy_result(
+    policy: &SplitTunnelPolicy,
+    now_unix: i64,
+) -> Result<SplitTunnelApplyResult, CoreError> {
+    Ok(SplitTunnelApplyResult {
+        format_version: policy.format_version,
+        revision: policy.revision,
+        force_revision: policy.force_revision,
+        address_revision: policy.address_revision,
+        policy_hash: policy.policy_hash.clone(),
+        status: SplitTunnelApplyStatus::Applied,
+        error_code: None,
+        applied_at: rfc3339(now_unix)?,
+    })
 }
 
 fn rfc3339(unix_timestamp: i64) -> Result<String, CoreError> {

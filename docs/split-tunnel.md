@@ -45,8 +45,18 @@ shown as locked outside the VPN rather than as selected applications.
 ## Address and local-network rules
 
 The panel sends compact IPv4 CIDRs. Android passes them to `VpnService` route
-exclusion. Desktop helpers install direct routes through the physical gateway.
-Neither implementation produces a large inverse `AllowedIPs` list.
+exclusion. Windows installs direct routes through the physical gateway. Linux
+and macOS apply exclusions to the destinations routed over the tunnel. The
+peer configuration keeps its original `AllowedIPs`, and excluded traffic
+follows the existing OS routes. Linux and macOS check the expanded route
+count before applying a policy. Many scattered exclusions can exceed the
+16,384-route budget even when the list itself is shorter. The client reserves
+space for both VPN peer endpoints and, on macOS, for the two unspecified
+addresses that preserve the system defaults. It reports the limit instead of
+replacing the running routes with a partial plan. After
+a newer authoritative revision is recorded, an automatic reconnect must
+not reinstall superseded direct bypasses; a failed new plan does not grant
+permission to reuse rules that it may have revoked.
 
 The application also accepts personal IPv4 addresses, domain names, and full
 HTTP(S) URLs. For a URL the native core extracts its normalized hostname before
@@ -55,7 +65,7 @@ a defensive fallback for older clients. Path, port, query, and fragment do not
 affect routing. The two scopes are explicit:
 `Для этого устройства` applies only to the current application device, while
 `Для всех моих` is delivered to every application device of the same account.
-IPv4 values become `/32` direct routes. Domains are normalized by the panel and
+IPv4 values become `/32` exclusions. Domains are normalized by the panel and
 resolved to IPv4 on the device whenever the effective policy is applied; the
 normal 24-hour full-policy refresh resolves them again. Resolution is
 asynchronous, runs in a bounded parallel batch, and keeps the last successfully
@@ -73,11 +83,19 @@ included in the opaque physical-network fingerprint used to detect a network
 change. VPN, loopback, multicast, link-local, any-local, IPv6, and host-only
 `/32` routes are ignored.
 
-Desktop helpers own every direct route they create. Linux and macOS persist
-non-secret cleanup state in their root-owned runtime directory as
-`routes-state.json` with mode `0600`. Windows stores equivalent service-owned
-state in `%ProgramData%\Nelomai\Tunnel\routes-state.json`. Stop, uninstall, and
-startup recovery remove only the exact recorded routes.
+macOS keeps the unspecified IPv4 and IPv6 host addresses outside the tunnel's
+route prefixes. XNU treats a route whose destination starts at the all-zero
+address as a primary default even with a nonzero prefix length. Preserving the
+system default lets the panel socket use its bound physical interface while
+ordinary traffic to the same server still follows the tunnel.
+
+On Linux, ordinary WireGuard and AWG3 routes refer to the owned tunnel
+interface. The kernel removes them when the helper tears down that interface.
+The helper records its identity for same-boot recovery in the root-owned
+`ordinary-routing/ordinary-link.json`. macOS journals ordinary tunnel routes in
+`ordinary-routing/ordinary-routes.json`. Both paths are under the helper's
+runtime directory. Windows records its direct routes in the service-owned
+`%ProgramData%\Nelomai\Tunnel\routes-state.json`.
 
 While a desktop tunnel with address exclusions is active, the app checks the
 physical network every 30 seconds. The privileged helper returns only a
@@ -135,17 +153,19 @@ installed-package inventory.
 
 ## Desktop recovery checks
 
-The following commands show only Nelomai-owned state and do not print
-WireGuard configuration or access tokens:
+On Linux, select the ordinary tunnel interface for the active transport.
+These commands inspect routing and journal metadata.
 
 ```bash
 # Linux
-sudo ip -4 route show metric 42760
-sudo ls -l /var/run/nelomai/routes-state.json
+interface=nlm-wg0   # Use nlm-awg0 for AWG3.
+ip -4 route show table main dev "$interface"
+ip -6 route show table main dev "$interface"
+sudo ls -l /var/run/nelomai/ordinary-routing/ordinary-link.json
 
 # macOS
 sudo route -n get default
-sudo ls -l /var/run/nelomai/routes-state.json
+sudo ls -l /var/run/nelomai/ordinary-routing/ordinary-routes.json
 ```
 
 On Windows, inspect routes with metric `42760` and the service-owned state:

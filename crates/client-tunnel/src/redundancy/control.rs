@@ -4,7 +4,7 @@
 
 use crate::{
     redundancy::{
-        driver::{NativePair, SessionDriver, SessionStore, TickResult},
+        driver::{NativePair, RouteRefreshError, SessionDriver, SessionStore, TickResult},
         protocol::{uuid, Command, Member, Snapshot},
         session::{SessionPhase, SessionSnapshot, SessionState},
         SessionScope, Slot,
@@ -73,8 +73,10 @@ pub trait PairControl: NativePair {
         &mut self,
         _scope: &SessionScope,
         _options: &DesktopTunnelOptions,
-    ) -> io::Result<()> {
-        Err(io::ErrorKind::Unsupported.into())
+    ) -> Result<(), RouteRefreshError> {
+        Err(RouteRefreshError::Unchanged(
+            io::ErrorKind::Unsupported.into(),
+        ))
     }
     fn cleanup_pending(&self) -> bool;
 }

@@ -2,7 +2,7 @@
 //! lifecycle, resolver and reverse-path-filter ownership are connected.
 
 use ipnet::IpNet;
-use nelomai_client_tunnel::redundancy::network::*;
+use nelomai_client_tunnel::redundancy::{driver::RouteRefreshError, network::*};
 use serde_json::{Map, Value};
 use std::{io, net::IpAddr};
 
@@ -46,12 +46,13 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
         &mut self,
         options: &nelomai_client_tunnel::DesktopTunnelOptions,
         endpoints: &[IpAddr],
-        owned: &[IpNet],
+        owned: &[RouteValue],
     ) -> io::Result<super::session::NetworkPolicy> {
         self.verify_resolver()?;
         let physical = self.resolve_physical_routes(options, endpoints, owned)?;
         Ok(super::session::NetworkPolicy {
-            bypasses: physical.bypasses,
+            exclusions: physical.exclusions,
+            existing: physical.existing,
             retained_routes: physical.retained_routes,
             dns_services: Vec::new(),
             metric: 42,
@@ -128,7 +129,7 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
     }
     fn table(&self, scope: RouteScope) -> io::Result<u32> {
         match scope {
-            RouteScope::Global => Ok(254),
+            RouteScope::Global | RouteScope::LinuxMainPriority(_) => Ok(254),
             RouteScope::Member(i) => Ok(self.member(i)?.table),
             RouteScope::WindowsInterface(_) => Err(invalid()),
         }
@@ -227,6 +228,14 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
                 }
                 continue;
             }
+            let metric = row
+                .get("metric")
+                .map(|_| number(row, "metric"))
+                .transpose()?
+                .unwrap_or(0);
+            if matches!(scope, RouteScope::LinuxMainPriority(priority) if metric != priority) {
+                continue;
+            }
             let mut accepted = vec![
                 "dst", "dev", "gateway", "protocol", "scope", "metric", "flags", "type", "table",
                 "pref",
@@ -272,26 +281,53 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
                     return Err(invalid());
                 }
             }
-            let metric = row
-                .get("metric")
-                .map(|_| number(row, "metric"))
-                .transpose()?
-                .unwrap_or(0);
-            if result
-                .replace(NetworkValue::Route(RouteValue {
-                    destination,
-                    scope,
-                    interface,
-                    gateway,
-                    metric,
-                }))
-                .is_some()
-            {
-                return Err(invalid());
+            if let Some(NetworkValue::Route(previous)) = &result {
+                if !retained || previous.metric == metric {
+                    return Err(invalid());
+                }
+                if previous.metric < metric {
+                    continue;
+                }
             }
+            result = Some(NetworkValue::Route(RouteValue {
+                destination,
+                scope,
+                interface,
+                gateway,
+                metric,
+            }));
         }
         Ok(result)
     }
+    fn verify_member_rule_row(
+        &self,
+        row: &serde_json::Map<String, Value>,
+        member: &MemberTable,
+    ) -> io::Result<()> {
+        only_keys(
+            row,
+            &[
+                "priority",
+                "src",
+                "table",
+                "protocol",
+                "oif",
+                "oif_detached",
+            ],
+        )?;
+        let (name, absent) = self.rule_name(member.interface)?;
+        if string(row, "src")? != "all"
+            || number(row, "table")? != member.table
+            || number(row, "protocol")? != 4
+            || string(row, "oif")? != name
+            || row.contains_key("oif_detached") != absent
+            || row.get("oif_detached").is_some_and(|v| !v.is_null())
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
     fn read_rule(&mut self, ipv6: bool, priority: u32) -> io::Result<Option<NetworkValue>> {
         let member = self
             .members
@@ -312,27 +348,7 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
             if number(row, "priority")? != priority {
                 continue;
             }
-            only_keys(
-                row,
-                &[
-                    "priority",
-                    "src",
-                    "table",
-                    "protocol",
-                    "oif",
-                    "oif_detached",
-                ],
-            )?;
-            let (name, absent) = self.rule_name(member.interface)?;
-            if string(row, "src")? != "all"
-                || number(row, "table")? != member.table
-                || number(row, "protocol")? != 4
-                || string(row, "oif")? != name
-                || row.contains_key("oif_detached") != absent
-                || row.get("oif_detached").is_some_and(|v| !v.is_null())
-            {
-                return Err(invalid());
-            }
+            self.verify_member_rule_row(row, &member)?;
             if result
                 .replace(self.member_rule(member.interface, ipv6)?)
                 .is_some()
@@ -345,11 +361,13 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
     fn validate(&self, value: &NetworkValue) -> io::Result<()> {
         match value {
             NetworkValue::Route(r) => {
-                if r.interface == 0
+                if self.member(r.interface).is_err()
+                    || r.gateway.is_some()
                     || r.destination != r.destination.trunc()
                     || r.gateway
                         .is_some_and(|g| g.is_ipv4() != r.destination.addr().is_ipv4())
                     || matches!(r.scope,RouteScope::Member(i) if i!=r.interface)
+                    || matches!(r.scope, RouteScope::LinuxMainPriority(priority) if priority != r.metric)
                 {
                     return Err(invalid());
                 }
@@ -378,9 +396,7 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
                     "proto".into(),
                     "4".into(),
                 ];
-                if let Some(gateway) = r.gateway {
-                    args.extend(["via".into(), gateway.to_string()]);
-                } else if r.destination.addr().is_ipv4() {
+                if r.destination.addr().is_ipv4() {
                     args.extend(["scope".into(), "link".into()]);
                 }
                 args
@@ -406,6 +422,72 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
 }
 
 impl<C: LinuxNetworkCommands> NetworkSystem for LinuxNetwork<C> {
+    fn check_main_routes(
+        &mut self,
+        present: &[&RouteValue],
+        target: &[&RouteValue],
+    ) -> io::Result<()> {
+        use std::collections::{HashMap, HashSet};
+        let prefixes: HashSet<_> = present
+            .iter()
+            .chain(target)
+            .map(|r| r.destination)
+            .collect();
+        let mut remaining: HashMap<_, _> = present
+            .iter()
+            .map(|&r| ((r.destination, r.metric), r))
+            .collect();
+        let conflict = || io::Error::other("foreign_route_conflict");
+        for ipv6 in [false, true] {
+            if !prefixes
+                .iter()
+                .any(|prefix| prefix.addr().is_ipv6() == ipv6)
+            {
+                continue;
+            }
+            // Data AllowedIPs may include a family that physical endpoint
+            // discovery did not need. Check its RPDB as part of FIB validation.
+            self.verify_main_rules(ipv6)?;
+            let text = self.commands.ip(&[
+                "-j".into(),
+                "-N".into(),
+                family(ipv6).into(),
+                "route".into(),
+                "show".into(),
+                "table".into(),
+                "main".into(),
+            ])?;
+            for row in rows(&text)? {
+                let object = row.as_object().ok_or_else(invalid)?;
+                let prefix = physical::destination(object, ipv6)?;
+                if !prefixes.contains(&prefix) {
+                    continue;
+                }
+                let metric = object
+                    .get("metric")
+                    .map(|_| number(object, "metric"))
+                    .transpose()?
+                    .unwrap_or(0);
+                let expected = remaining.remove(&(prefix, metric)).ok_or_else(conflict)?;
+                if self.route_from_rows(
+                    prefix,
+                    expected.scope,
+                    false,
+                    std::slice::from_ref(&row),
+                    true,
+                )? != Some(NetworkValue::Route(expected.clone()))
+                {
+                    return Err(conflict());
+                }
+            }
+        }
+        if remaining.is_empty() {
+            Ok(())
+        } else {
+            Err(conflict())
+        }
+    }
+
     fn member_started(
         &mut self,
         slot: nelomai_client_tunnel::redundancy::Slot,
@@ -563,6 +645,47 @@ impl<C: LinuxNetworkCommands> NetworkSystem for LinuxNetwork<C> {
             NetworkValue::LinkDnsRoute(interface),
         ])
     }
+    fn verify_physical_endpoint(
+        &mut self,
+        endpoint: IpAddr,
+        retained: &[RouteValue],
+    ) -> io::Result<()> {
+        let expected = super::session::expected_egress(endpoint, retained)?;
+        let text = self.commands.ip(&[
+            "-j".into(),
+            "-N".into(),
+            family(endpoint.is_ipv6()).into(),
+            "route".into(),
+            "get".into(),
+            endpoint.to_string(),
+        ])?;
+        let rows = rows(&text)?;
+        let [row] = rows.as_slice() else {
+            return Err(invalid());
+        };
+        let row = row.as_object().ok_or_else(invalid)?;
+        let dst = string(row, "dst")?
+            .parse::<IpAddr>()
+            .map_err(|_| invalid())?;
+        let gateway = row
+            .get("gateway")
+            .map(|_| {
+                string(row, "gateway")?
+                    .parse::<IpAddr>()
+                    .map_err(|_| invalid())
+            })
+            .transpose()?;
+        if dst != endpoint
+            || self.name(expected.interface)? != string(row, "dev")?
+            || gateway != expected.gateway
+            || row.get("type").is_some_and(|v| v != "unicast")
+            || row.get("table").is_some() && number(row, "table")? != 254
+        {
+            return Err(io::Error::other("physical_route_changed"));
+        }
+        Ok(())
+    }
+
     fn verify_retained_route(&mut self, route: &RouteValue) -> io::Result<bool> {
         if route.scope != RouteScope::Global {
             return Err(invalid());
@@ -570,7 +693,16 @@ impl<C: LinuxNetworkCommands> NetworkSystem for LinuxNetwork<C> {
         Ok(self.read_route_mode(route.destination, route.scope, true)?
             == Some(NetworkValue::Route(route.clone())))
     }
-    fn route_resources(&self, route: RouteValue) -> io::Result<Vec<NetworkValue>> {
+    fn route_resources(&self, mut route: RouteValue) -> io::Result<Vec<NetworkValue>> {
+        if route.scope == RouteScope::Global {
+            // Linux keys these rows by priority as well as prefix. Give each
+            // interface a stable priority so promotion can add before delete.
+            route.metric = route
+                .metric
+                .checked_add(route.interface)
+                .ok_or_else(invalid)?;
+            route.scope = RouteScope::LinuxMainPriority(route.metric);
+        }
         let mut values = vec![NetworkValue::Route(route.clone())];
         self.validate(&values[0])?;
         if let RouteScope::Member(interface) = route.scope {
@@ -631,37 +763,58 @@ impl<C: LinuxNetworkCommands> NetworkSystem for LinuxNetwork<C> {
         before: Option<&NetworkValue>,
         after: Option<&NetworkValue>,
     ) -> io::Result<()> {
+        self.compare_exchange_prepared(key, before, after, None)
+            .map_err(Into::into)
+    }
+
+    fn compare_exchange_prepared(
+        &mut self,
+        key: &ResourceKey,
+        before: Option<&NetworkValue>,
+        after: Option<&NetworkValue>,
+        prepare: Option<&mut dyn FnMut() -> io::Result<()>>,
+    ) -> Result<(), RouteRefreshError> {
+        let unchanged = RouteRefreshError::Unchanged;
         if matches!(key, ResourceKey::LinkDns(_) | ResourceKey::LinkDnsRoute(_)) {
-            return self.compare_link_dns(key, before, after);
+            return self.compare_link_dns(key, before, after, prepare);
         }
         for value in [before, after].into_iter().flatten() {
             if value.key() != *key {
-                return Err(invalid());
+                return Err(unchanged(invalid()));
             }
-            self.validate(value)?;
+            self.validate(value).map_err(unchanged)?;
         }
         if let Some(value) = after {
             match value {
                 NetworkValue::Route(r) => {
-                    self.name(r.interface)?;
+                    self.name(r.interface).map_err(unchanged)?;
                 }
                 NetworkValue::BoundRule(r) => {
-                    self.name(r.interface)?;
+                    self.name(r.interface).map_err(unchanged)?;
                 }
-                _ => return Err(invalid()),
+                _ => return Err(unchanged(invalid())),
             }
         }
-        if self.read(key)?.as_ref() != before {
-            return Err(io::Error::other("network_resource_changed"));
-        }
         if before == after {
-            return Ok(());
+            return self.prepare_exchange(key, before, None);
         }
+        self.prepare_exchange(key, before, prepare)?;
         if let Some(value) = before {
             self.mutate(false, value)?;
         }
         if let Some(value) = after {
-            self.mutate(true, value)?;
+            if let Err(error) = self.mutate(true, value) {
+                if matches!(value, NetworkValue::Route(_))
+                    && error.kind() == io::ErrorKind::AlreadyExists
+                {
+                    return Err(if before.is_none() {
+                        unchanged(error)
+                    } else {
+                        RouteRefreshError::RouteAddConflict(error)
+                    });
+                }
+                return Err(error.into());
+            }
         }
         Ok(())
     }
@@ -772,6 +925,16 @@ impl LinuxNetworkCommands for NativeLinuxCommands {
                 .env("LC_ALL", "C"),
             crate::process::COMMAND_TIMEOUT,
         )?;
+        if !output.status.success()
+            && args.get(1).is_some_and(|resource| resource == "route")
+            && args.get(2).is_some_and(|action| action == "add")
+            && output
+                .stderr
+                .split(|byte| *byte == b'\n')
+                .any(|line| line == b"RTNETLINK answers: File exists")
+        {
+            return Err(io::ErrorKind::AlreadyExists.into());
+        }
         if !output.status.success() {
             return Err(io::Error::other("linux_pair_network_command_failed"));
         }

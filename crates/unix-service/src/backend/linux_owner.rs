@@ -29,10 +29,54 @@ pub(super) struct LinuxIdentity {
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Intent {
-    boot: String,
-    transport: MemberTransport,
-    group: u32,
+pub(super) struct Intent {
+    pub(super) boot: String,
+    pub(super) transport: MemberTransport,
+    pub(super) group: u32,
+}
+
+impl Intent {
+    pub(super) fn new(transport: MemberTransport, boot: &str) -> io::Result<Self> {
+        if !valid_boot(boot) {
+            return Err(invalid());
+        }
+        // The journal retains launch authority. Linux applies IFLA_GROUP
+        // atomically with exclusive WireGuard creation.
+        let mut nonce = [0u8; 4];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut nonce)?;
+        let group = u32::from_ne_bytes(nonce) & i32::MAX as u32;
+        if group == 0 {
+            return Err(invalid());
+        }
+        Ok(Self {
+            boot: boot.into(),
+            transport,
+            group,
+        })
+    }
+
+    pub(super) fn valid(&self) -> bool {
+        valid_boot(&self.boot) && (1..=i32::MAX as u32).contains(&self.group)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn interface(&self, mode: super::redundancy::ResourceMode) -> &'static str {
+        mode.linux_interface(self.transport.into())
+    }
+
+    pub(super) fn matches_kernel(&self, identity: &LinuxIdentity) -> bool {
+        self.transport == MemberTransport::WireGuard
+            && identity.proof == (NativeProof::Kernel { group: self.group })
+    }
+}
+
+impl From<MemberTransport> for nelomai_client_tunnel::TunnelTransport {
+    fn from(transport: MemberTransport) -> Self {
+        match transport {
+            MemberTransport::WireGuard => Self::WireGuard,
+            MemberTransport::AmneziaWg3 => Self::AmneziaWg3,
+        }
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -130,23 +174,9 @@ impl LinuxOwner {
     }
     pub(super) fn begin(&mut self, transport: MemberTransport, boot: &str) -> io::Result<u32> {
         self.ensure_fresh()?;
-        if !valid_boot(boot) {
-            return Err(invalid());
-        }
-        // Birth correlation marker, not a credential. Scope and launch authority
-        // remain in the private journal; Linux applies IFLA_GROUP during create.
-        let mut nonce = [0u8; 4];
-        std::fs::File::open("/dev/urandom")?.read_exact(&mut nonce)?;
-        // Existing iproute2 parses group through a nonnegative signed int.
-        let group = u32::from_ne_bytes(nonce) & i32::MAX as u32;
-        if group == 0 {
-            return Err(invalid());
-        }
-        let phase = Phase::Starting(Intent {
-            boot: boot.into(),
-            transport,
-            group,
-        });
+        let intent = Intent::new(transport, boot)?;
+        let group = intent.group;
+        let phase = Phase::Starting(intent);
         if let Err(error) = self.save(phase.clone()) {
             // An fsync error may occur after rename: never allow a second launch.
             self.state = Some(phase);
@@ -250,29 +280,24 @@ impl LinuxOwner {
 fn valid_boot(boot: &str) -> bool {
     !boot.is_empty() && boot.len() <= 128 && !boot.chars().any(char::is_control)
 }
-fn valid_intent(intent: &Intent) -> bool {
-    valid_boot(&intent.boot) && intent.group != 0
-}
 fn valid_identity(identity: &LinuxIdentity, intent: &Intent, slot: TunnelSlot) -> bool {
-    use nelomai_client_tunnel::TunnelTransport;
-    let transport = match intent.transport {
-        MemberTransport::WireGuard => TunnelTransport::WireGuard,
-        MemberTransport::AmneziaWg3 => TunnelTransport::AmneziaWg3,
-    };
-    valid_intent(intent)
+    intent.valid()
         && identity.boot == intent.boot
         && identity.index > 0
         && identity.interface
-            == super::redundancy::ResourceMode::Member(slot).linux_interface(transport)
+            == super::redundancy::ResourceMode::Member(slot)
+                .linux_interface(intent.transport.into())
         && match (&identity.proof, intent.transport) {
-            (NativeProof::Kernel { group }, MemberTransport::WireGuard) => *group == intent.group,
+            (NativeProof::Kernel { .. }, MemberTransport::WireGuard) => {
+                intent.matches_kernel(identity)
+            }
             (NativeProof::Userspace(socket), MemberTransport::AmneziaWg3) => socket.inode > 0,
             _ => false,
         }
 }
 fn valid_phase(phase: &Phase, slot: TunnelSlot) -> bool {
     match phase {
-        Phase::Starting(intent) => valid_intent(intent),
+        Phase::Starting(intent) => intent.valid(),
         Phase::Owned {
             intent, identity, ..
         } => valid_identity(identity, intent, slot),

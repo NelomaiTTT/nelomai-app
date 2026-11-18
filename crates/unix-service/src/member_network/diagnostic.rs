@@ -2,7 +2,7 @@
 use super::{policy::PhysicalPolicyProvider, session::NetworkPolicy};
 use crate::ServiceError;
 use nelomai_client_tunnel::{
-    redundancy::{network::*, Slot},
+    redundancy::{driver::RouteRefreshError, network::*, Slot},
     DesktopTunnelOptions,
 };
 use serde::Serialize;
@@ -69,6 +69,18 @@ impl PairFailure {
             return Self {
                 stage,
                 ..previous.clone()
+            };
+        }
+        if error
+            .get_ref()
+            .is_some_and(|error| error.is::<RouteOwnershipUnconfirmed>())
+        {
+            return Self {
+                stage,
+                origin: stage,
+                cause: "network_route_ownership_unconfirmed",
+                native_status: None,
+                kind: error.kind(),
             };
         }
         let cause = match error.kind() {
@@ -186,6 +198,24 @@ fn resource_stage(key: &ResourceKey, write: bool) -> Stage {
     }
 }
 impl<N: NetworkSystem> NetworkSystem for DiagnosticNetwork<N> {
+    fn journal_each_write(&self) -> bool {
+        true
+    }
+
+    fn observe_routes_on_close(&self) -> bool {
+        self.0.observe_routes_on_close()
+    }
+
+    fn check_main_routes(
+        &mut self,
+        present: &[&RouteValue],
+        target: &[&RouteValue],
+    ) -> io::Result<()> {
+        self.0
+            .check_main_routes(present, target)
+            .map_err(|error| context(Stage::Network, error))
+    }
+
     fn member_started(&mut self, slot: Slot, interface: u32) -> io::Result<()> {
         self.0
             .member_started(slot, interface)
@@ -215,6 +245,15 @@ impl<N: NetworkSystem> NetworkSystem for DiagnosticNetwork<N> {
         self.0
             .route_resources(route)
             .map_err(|e| context(Stage::RoutePlan, e))
+    }
+    fn verify_physical_endpoint(
+        &mut self,
+        endpoint: IpAddr,
+        retained: &[RouteValue],
+    ) -> io::Result<()> {
+        self.0
+            .verify_physical_endpoint(endpoint, retained)
+            .map_err(|e| context(Stage::RouteRead, e))
     }
     fn verify_retained_route(&mut self, route: &RouteValue) -> io::Result<bool> {
         self.0
@@ -249,6 +288,17 @@ impl<N: NetworkSystem> NetworkSystem for DiagnosticNetwork<N> {
         self.0
             .compare_exchange(key, before, after)
             .map_err(|e| context(resource_stage(key, true), e))
+    }
+    fn compare_exchange_prepared(
+        &mut self,
+        key: &ResourceKey,
+        before: Option<&NetworkValue>,
+        after: Option<&NetworkValue>,
+        prepare: Option<&mut dyn FnMut() -> io::Result<()>>,
+    ) -> Result<(), RouteRefreshError> {
+        self.0
+            .compare_exchange_prepared(key, before, after, prepare)
+            .map_err(|e| e.map_io_error(|e| context(resource_stage(key, true), e)))
     }
 }
 impl<N: PhysicalPolicyProvider> PhysicalPolicyProvider for DiagnosticNetwork<N> {

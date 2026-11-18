@@ -236,7 +236,7 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
                     now,
                     crate::split_tunnel::resolve_domain_ipv4,
                     Some(snapshot.clone()),
-                    false,
+                    None,
                 )
                 .await?
             {

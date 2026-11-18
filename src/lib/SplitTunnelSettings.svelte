@@ -8,6 +8,7 @@
     type SplitTunnelSettingsUpdate,
     type SplitTunnelState,
     type SplitTunnelAddressRule,
+    type SplitTunnelAddressRuleChange,
   } from "./split-tunnel";
   import { commandMessage } from "./native-client";
 
@@ -32,11 +33,11 @@
     onaddaddressrule?: (
       value: string,
       scope: SplitTunnelAddressRule["scope"],
-    ) => Promise<void>;
+    ) => Promise<SplitTunnelAddressRuleChange | null>;
     onremoveaddressrule?: (
       ruleId: number,
       scope: SplitTunnelAddressRule["scope"],
-    ) => Promise<void>;
+    ) => Promise<SplitTunnelAddressRuleChange | null>;
   } = $props();
 
   let mode = $state<SplitTunnelMode>(initialMode());
@@ -45,7 +46,7 @@
   let search = $state("");
   let showSystem = $state(false);
   let localBusy = $state(false);
-  let localError = $state<string | null>(null);
+  let localFeedback = $state<{ kind: "error" | "notice"; message: string } | null>(null);
   let addressValue = $state("");
 
   let rows = $derived(
@@ -110,7 +111,7 @@
   async function save() {
     if (localBusy || busy) return;
     localBusy = true;
-    localError = null;
+    localFeedback = null;
     try {
       const saved = await onsave(
         settingsUpdate(
@@ -123,7 +124,7 @@
       );
       if (saved) onclose();
     } catch (reason) {
-      localError = commandMessage(reason, "split_tunnel");
+      localFeedback = { kind: "error", message: commandMessage(reason, "split_tunnel") };
     } finally {
       localBusy = false;
     }
@@ -132,11 +133,11 @@
   async function refresh() {
     if (localBusy || busy) return;
     localBusy = true;
-    localError = null;
+    localFeedback = null;
     try {
       await onrefresh();
     } catch {
-      localError = "Не удалось обновить настройки";
+      localFeedback = { kind: "error", message: "Не удалось обновить настройки" };
     } finally {
       localBusy = false;
     }
@@ -146,12 +147,17 @@
     const value = addressValue.trim();
     if (!value || !onaddaddressrule || localBusy || busy) return;
     localBusy = true;
-    localError = null;
+    localFeedback = null;
     try {
-      await onaddaddressrule(value, scope);
-      addressValue = "";
+      const result = await onaddaddressrule(value, scope);
+      if (result) {
+        addressValue = "";
+        if (result.pendingMessage) {
+          localFeedback = { kind: "notice", message: result.pendingMessage };
+        }
+      }
     } catch (reason) {
-      localError = commandMessage(reason, "split_tunnel");
+      localFeedback = { kind: "error", message: commandMessage(reason, "split_tunnel") };
     } finally {
       localBusy = false;
     }
@@ -160,11 +166,14 @@
   async function removeAddressRule(rule: SplitTunnelAddressRule) {
     if (!onremoveaddressrule || localBusy || busy) return;
     localBusy = true;
-    localError = null;
+    localFeedback = null;
     try {
-      await onremoveaddressrule(rule.id, rule.scope);
+      const result = await onremoveaddressrule(rule.id, rule.scope);
+      if (result?.pendingMessage) {
+        localFeedback = { kind: "notice", message: result.pendingMessage };
+      }
     } catch (reason) {
-      localError = commandMessage(reason, "split_tunnel");
+      localFeedback = { kind: "error", message: commandMessage(reason, "split_tunnel") };
     } finally {
       localBusy = false;
     }
@@ -364,8 +373,8 @@
       </div>
     {/if}
 
-    {#if localError}
-      <p class="error" aria-live="polite">{localError}</p>
+    {#if localFeedback}
+      <p class={localFeedback.kind} aria-live="polite">{localFeedback.message}</p>
     {/if}
 
     <footer>

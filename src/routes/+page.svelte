@@ -84,6 +84,8 @@
     type InstalledApplication,
     type SplitTunnelSettingsUpdate,
     type SplitTunnelAddressRule,
+    type SplitTunnelAddressRuleChange,
+    type SavedSplitTunnelAddressRules,
     type SplitTunnelState,
   } from "$lib/split-tunnel";
   import { UpdateOfferRefresher } from "$lib/update-offer-refresher";
@@ -178,6 +180,7 @@
   let splitTunnelApplications = $state<InstalledApplication[]>([]);
   let splitTunnelOpen = $state(false);
   let splitTunnelBusy = $state(false);
+  let splitTunnelRequestId = 0;
   let splitTunnelLoaded = $state(false);
   let runtimeWarning = $state<string | null>(null);
   let notifications = $state<AppNotification[]>([]);
@@ -1174,6 +1177,8 @@
       diagnosticsStatus = null;
       observeUpdateStatus(null);
       updateDialogId = null;
+      splitTunnelRequestId++;
+      splitTunnelBusy = false;
       splitTunnelState = null;
       splitTunnelApplications = [];
       splitTunnelOpen = false;
@@ -1452,27 +1457,33 @@
       return;
     }
     if (splitTunnelBusy) return;
+    const requestId = ++splitTunnelRequestId;
+    const observedBootstrap = bootstrap;
+    const isCurrent = () => requestId === splitTunnelRequestId && bootstrap === observedBootstrap;
     splitTunnelBusy = true;
     try {
       const applications =
         await nativeClient.splitTunnelInstalledApplications();
-      if (runtimeChannelClosed) return;
+      if (!isCurrent() || runtimeChannelClosed) return;
       const state = force
         ? await nativeClient.refreshSplitTunnel()
         : await nativeClient.splitTunnelState();
-      if (runtimeChannelClosed) return;
+      if (!isCurrent() || runtimeChannelClosed) return;
       splitTunnelApplications = applications;
       splitTunnelState = state;
       runtimeWarning = state.warning;
     } catch (reason) {
+      if (!isCurrent()) return;
       if (applyRuntimeChannelClosure(reason) || runtimeChannelClosed) {
         if (force) throw reason;
         return;
       }
       if (force) throw new Error("split_tunnel_refresh_failed");
     } finally {
-      splitTunnelLoaded = true;
-      splitTunnelBusy = false;
+      if (requestId === splitTunnelRequestId) {
+        splitTunnelLoaded = isCurrent();
+        splitTunnelBusy = false;
+      }
     }
   }
 
@@ -1529,26 +1540,46 @@
     }
   }
 
-  async function addSplitTunnelAddressRule(
+  function addSplitTunnelAddressRule(
     value: string,
     scope: SplitTunnelAddressRule["scope"],
-  ): Promise<void> {
-    requireRuntimeChannelOpen();
-    const state = await nativeClient.addSplitTunnelAddressRule(value, scope);
-    requireRuntimeChannelOpen();
-    splitTunnelState = state;
-    runtimeWarning = state.warning;
+  ): Promise<SplitTunnelAddressRuleChange | null> {
+    return changeSplitTunnelAddressRule(() => nativeClient.addSplitTunnelAddressRule(value, scope));
   }
 
-  async function removeSplitTunnelAddressRule(
+  function removeSplitTunnelAddressRule(
     ruleId: number,
     scope: SplitTunnelAddressRule["scope"],
-  ): Promise<void> {
+  ): Promise<SplitTunnelAddressRuleChange | null> {
+    return changeSplitTunnelAddressRule(() => nativeClient.removeSplitTunnelAddressRule(ruleId, scope));
+  }
+
+  async function changeSplitTunnelAddressRule(
+    change: () => Promise<SavedSplitTunnelAddressRules>,
+  ): Promise<SplitTunnelAddressRuleChange | null> {
     requireRuntimeChannelOpen();
-    const state = await nativeClient.removeSplitTunnelAddressRule(ruleId, scope);
-    requireRuntimeChannelOpen();
-    splitTunnelState = state;
-    runtimeWarning = state.warning;
+    if (splitTunnelBusy || !splitTunnelState) return null;
+    const requestId = ++splitTunnelRequestId;
+    const observedBootstrap = bootstrap;
+    const actionEpoch = connectionActionState.epoch;
+    const isCurrent = () => requestId === splitTunnelRequestId && !runtimeChannelClosed && bootstrap === observedBootstrap &&
+      isCurrentConnectionAction(connectionActionState, actionEpoch);
+    splitTunnelBusy = true;
+    try {
+      const saved = await change();
+      if (!isCurrent() || !splitTunnelState) return null;
+      splitTunnelState = saved.state;
+      runtimeWarning = saved.state.warning;
+      return {
+        pendingMessage: saved.applyIssue ? `Изменение сохранено. ${saved.applyIssue.message}` : null,
+      };
+    } catch (reason) {
+      if (!isCurrent()) return null;
+      applyRuntimeChannelClosure(reason);
+      throw reason;
+    } finally {
+      if (requestId === splitTunnelRequestId) splitTunnelBusy = false;
+    }
   }
 
   function updateProgress(status: UpdateStatus): string {

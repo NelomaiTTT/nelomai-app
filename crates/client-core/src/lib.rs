@@ -94,6 +94,7 @@ pub struct CoreLocalStop<T> {
     tunnel: Arc<T>,
     state: Arc<Mutex<CoreState>>,
     epoch: Arc<AtomicU64>,
+    runtime_stop_epoch: Arc<AtomicU64>,
     wake: Arc<Notify>,
     writers: Arc<RuntimeWriterGates>,
     stop_gate: Arc<Mutex<()>>,
@@ -104,6 +105,7 @@ impl<T: TunnelController> CoreLocalStop<T> {
             tunnel,
             state: Arc::new(Mutex::new(CoreState::default())),
             epoch: Arc::new(AtomicU64::new(0)),
+            runtime_stop_epoch: Arc::new(AtomicU64::new(0)),
             wake: Arc::new(Notify::new()),
             writers: Arc::new(RuntimeWriterGates::default()),
             stop_gate: Arc::new(Mutex::new(())),
@@ -135,6 +137,7 @@ impl<T: TunnelController> CoreLocalStop<T> {
     where
         T: 'static,
     {
+        self.runtime_stop_epoch.fetch_add(1, Ordering::SeqCst);
         let epoch = {
             let mut state = self.state.lock().await;
             let epoch = self.epoch.fetch_add(1, Ordering::SeqCst) + 1;
@@ -228,7 +231,8 @@ enum HandshakeWaitOutcome {
 
 pub use split_tunnel::{
     split_tunnel_active, validate_split_tunnel_policy, EffectiveSplitTunnelPolicy,
-    PhysicalNetworkPollOutcome, SplitTunnelContext, SplitTunnelPolicyError, SplitTunnelSyncOutcome,
+    PhysicalNetworkPollOutcome, SavedSplitTunnelAddressRules, SplitTunnelContext,
+    SplitTunnelPolicyError, SplitTunnelSyncOutcome,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1383,6 +1387,7 @@ pub struct ClientCore<A, S, T, L> {
     foreground_intent: Mutex<Option<(u64, NativeConnectionIntent)>>,
     runtime_writers: Arc<RuntimeWriterGates>,
     start_cancel_epoch: Arc<AtomicU64>,
+    runtime_stop_epoch: Arc<AtomicU64>,
     local_stop_gate: Arc<Mutex<()>>,
     start_in_progress: AtomicBool,
     pending_start_active: AtomicBool,
@@ -1454,6 +1459,7 @@ where
             foreground_intent: Mutex::new(None),
             runtime_writers: local.writers.clone(),
             start_cancel_epoch: local.epoch.clone(),
+            runtime_stop_epoch: local.runtime_stop_epoch.clone(),
             local_stop_gate: local.stop_gate.clone(),
             start_in_progress: AtomicBool::new(false),
             pending_start_active: AtomicBool::new(pending_start_active),
@@ -1933,6 +1939,7 @@ where
     }
 
     pub async fn sign_out(&self) -> Result<(), CoreError> {
+        self.runtime_stop_epoch.fetch_add(1, Ordering::SeqCst);
         self.signal_start_cancellation();
         // The owner durably fences auth before its neutral local-stop callback;
         // it must not wait for Core's issuance, split or lifecycle gates.

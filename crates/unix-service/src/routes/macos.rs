@@ -150,49 +150,12 @@ impl RouteBackend for SystemRouteBackend {
         )
     }
 
-    fn owned_route(&self, egress: &Self::Egress, network: Ipv4Net) -> OwnedRoute {
-        OwnedRoute {
-            destination: network.to_string(),
-            interface_identifier: egress.interface.clone(),
-            gateway: Some(egress.gateway.clone()),
-            metric: None,
-        }
-    }
-
-    fn add_route(&self, route: &OwnedRoute) -> Result<(), ServiceError> {
-        mutate_route("add", route)
-    }
-
-    fn route_exists(&self, route: &OwnedRoute) -> Result<bool, ServiceError> {
-        let output = output_with_timeout(
-            Command::new(ROUTE)
-                .args(["-n", "get", "-net", &route.destination])
-                .env("LANG", "C")
-                .env("LC_ALL", "C"),
-            COMMAND_TIMEOUT,
-        )
-        .map_err(|_| ServiceError::Backend("route_command_failed".to_string()))?;
-        if !output.status.success() {
-            let error = String::from_utf8_lossy(&output.stderr);
-            return if error.contains("not in table") || error.contains("not found") {
-                Ok(false)
-            } else {
-                Err(ServiceError::Backend("route_command_failed".to_string()))
-            };
-        }
-        route_lookup_matches(&output.stdout, route)
-    }
-
     fn route_presence(
         &self,
         routes: &[OwnedRoute],
     ) -> Result<Vec<Option<RouteScope>>, ServiceError> {
         let output = run(NETSTAT, &["-rn", "-f", "inet"])?;
         route_table_presence(&output.stdout, routes)
-    }
-
-    fn remove_route(&self, route: &OwnedRoute, scope: RouteScope) -> Result<(), ServiceError> {
-        cleanup_route(route, scope)
     }
 }
 
@@ -275,109 +238,6 @@ fn parse_netstat_destination(value: &str) -> Option<Ipv4Net> {
     padded[..octets.len()].copy_from_slice(&octets);
     let network = Ipv4Net::new(Ipv4Addr::from(padded), prefix).ok()?;
     Ipv4Net::new(network.network(), prefix).ok()
-}
-
-fn route_lookup_matches(output: &[u8], route: &OwnedRoute) -> Result<bool, ServiceError> {
-    let expected = canonical_destination(route)?;
-    let gateway = route
-        .gateway
-        .as_deref()
-        .ok_or_else(|| ServiceError::Backend("route_state_invalid".to_string()))?;
-    let mut destination = None;
-    let mut mask = None;
-    let mut actual_gateway = None;
-    let mut interface = None;
-    for line in String::from_utf8_lossy(output).lines() {
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        match key.trim() {
-            "destination" => destination = value.trim().parse::<Ipv4Addr>().ok(),
-            "mask" => mask = parse_ipv4_mask(value.trim()),
-            "gateway" => actual_gateway = Some(value.trim().to_string()),
-            "interface" => interface = Some(value.trim().to_string()),
-            _ => {}
-        }
-    }
-    Ok(destination == Some(expected.network())
-        && mask == Some(expected.prefix_len())
-        && actual_gateway.as_deref() == Some(gateway)
-        && interface.as_deref() == Some(route.interface_identifier.as_str()))
-}
-
-fn parse_ipv4_mask(value: &str) -> Option<u8> {
-    let mask = if let Some(hex) = value.strip_prefix("0x") {
-        u32::from_str_radix(hex, 16).ok()?
-    } else {
-        u32::from_be_bytes(value.parse::<Ipv4Addr>().ok()?.octets())
-    };
-    let prefix = mask.count_ones() as u8;
-    (mask
-        == if prefix == 0 {
-            0
-        } else {
-            u32::MAX << (32 - prefix)
-        })
-    .then_some(prefix)
-}
-
-fn mutate_route(action: &str, route: &OwnedRoute) -> Result<(), ServiceError> {
-    let gateway = route
-        .gateway
-        .as_deref()
-        .ok_or_else(|| ServiceError::Backend("route_state_invalid".to_string()))?;
-    let arguments = route_arguments(action, route, gateway);
-    run_route_mutation(action, &arguments)
-}
-
-fn cleanup_route(route: &OwnedRoute, scope: RouteScope) -> Result<(), ServiceError> {
-    let gateway = route
-        .gateway
-        .as_deref()
-        .ok_or_else(|| ServiceError::Backend("route_state_invalid".to_string()))?;
-    let arguments = route_cleanup_arguments(route, gateway, scope);
-    run_route_mutation("delete", &arguments)
-}
-
-fn run_route_mutation(action: &str, arguments: &[&str]) -> Result<(), ServiceError> {
-    let output = output_with_timeout(
-        Command::new(ROUTE)
-            .args(arguments)
-            .env("LANG", "C")
-            .env("LC_ALL", "C"),
-        COMMAND_TIMEOUT,
-    )
-    .map_err(|_| ServiceError::Backend("route_command_failed".to_string()))?;
-    if output.status.success()
-        || (action == "delete" && String::from_utf8_lossy(&output.stderr).contains("not in table"))
-    {
-        Ok(())
-    } else {
-        Err(ServiceError::Backend(format!("route_{action}_failed")))
-    }
-}
-
-fn route_arguments<'a>(action: &'a str, route: &'a OwnedRoute, gateway: &'a str) -> [&'a str; 5] {
-    ["-n", action, "-net", &route.destination, gateway]
-}
-
-fn route_cleanup_arguments<'a>(
-    route: &'a OwnedRoute,
-    gateway: &'a str,
-    scope: RouteScope,
-) -> Vec<&'a str> {
-    match scope {
-        RouteScope::Unscoped => route_arguments("delete", route, gateway).to_vec(),
-        RouteScope::InterfaceScoped => vec![
-            "-n",
-            "delete",
-            "-net",
-            "-ifscope",
-            &route.interface_identifier,
-            &route.destination,
-            gateway,
-        ],
-    }
 }
 
 fn run(path: &str, arguments: &[&str]) -> Result<Output, ServiceError> {
@@ -568,28 +428,6 @@ default            192.168.3.1        UGScIg                en0\n";
     }
 
     #[test]
-    fn route_lookup_requires_the_exact_owned_route() {
-        let route = OwnedRoute {
-            destination: "203.0.113.0/24".to_string(),
-            interface_identifier: "en0".to_string(),
-            gateway: Some("192.168.3.1".to_string()),
-            metric: None,
-        };
-        let output = b"   route to: 203.0.113.0\n\
-destination: 203.0.113.0\n\
-       mask: 255.255.255.0\n\
-    gateway: 192.168.3.1\n\
-  interface: en0\n";
-
-        assert!(route_lookup_matches(output, &route).unwrap());
-        assert!(!route_lookup_matches(
-            b"destination: 203.0.113.0\nmask: 255.255.255.0\ngateway: 192.168.4.1\ninterface: en0\n",
-            &route,
-        )
-        .unwrap());
-    }
-
-    #[test]
     fn route_table_presence_matches_owned_routes_from_one_snapshot() {
         let routes = vec![
             OwnedRoute {
@@ -669,52 +507,6 @@ Destination        Gateway            Flags               Netif Expire\n\
         assert_eq!(
             parse_netstat_destination("203.0.113.8"),
             Some("203.0.113.8/32".parse().unwrap())
-        );
-    }
-
-    #[test]
-    fn route_mutation_is_unscoped_so_regular_traffic_uses_the_direct_route() {
-        let route = OwnedRoute {
-            destination: "203.0.113.0/24".to_string(),
-            interface_identifier: "en7".to_string(),
-            gateway: Some("192.168.1.1".to_string()),
-            metric: None,
-        };
-
-        assert_eq!(
-            route_arguments("delete", &route, "192.168.1.1").as_slice(),
-            ["-n", "delete", "-net", "203.0.113.0/24", "192.168.1.1",].as_slice()
-        );
-    }
-
-    #[test]
-    fn route_cleanup_selects_the_recorded_route_scope() {
-        let route = OwnedRoute {
-            destination: "203.0.113.0/24".to_string(),
-            interface_identifier: "en7".to_string(),
-            gateway: Some("192.168.1.1".to_string()),
-            metric: None,
-        };
-
-        let unscoped = route_cleanup_arguments(&route, "192.168.1.1", RouteScope::Unscoped);
-        let scoped = route_cleanup_arguments(&route, "192.168.1.1", RouteScope::InterfaceScoped);
-
-        assert_eq!(
-            unscoped.as_slice(),
-            ["-n", "delete", "-net", "203.0.113.0/24", "192.168.1.1",].as_slice()
-        );
-        assert_eq!(
-            scoped.as_slice(),
-            [
-                "-n",
-                "delete",
-                "-net",
-                "-ifscope",
-                "en7",
-                "203.0.113.0/24",
-                "192.168.1.1",
-            ]
-            .as_slice()
         );
     }
 }

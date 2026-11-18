@@ -1,4 +1,6 @@
-use std::io::{self, Read, Write};
+#[cfg(any(target_os = "linux", test))]
+use std::io::Write;
+use std::io::{self, Read};
 use std::os::unix::process::CommandExt;
 use std::process::ExitStatus;
 use std::process::{Command, Output, Stdio};
@@ -65,6 +67,7 @@ fn terminate_process_group_members(process_id: u32) {
     let _ = unsafe { libc::kill(-(process_id as i32), libc::SIGKILL) };
 }
 
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn status_with_timeout(
     command: &mut Command,
     timeout: Duration,

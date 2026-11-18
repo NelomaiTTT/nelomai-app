@@ -82,6 +82,7 @@ type NativeApplication = ClientApplication<
 
 pub(crate) struct SplitTunnelScheduler {
     gate: Mutex<()>,
+    startup_gate: Arc<Mutex<()>>,
 }
 
 pub(crate) struct PushRegistrationScheduler {
@@ -92,7 +93,30 @@ impl SplitTunnelScheduler {
     fn new() -> Self {
         Self {
             gate: Mutex::new(()),
+            startup_gate: Arc::new(Mutex::new(())),
         }
+    }
+
+    pub(crate) async fn schedule_startup_sync(
+        &self,
+        wait_for_initial_policy: bool,
+        sync: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        // Register the empty-cache startup refresh before settings reads or
+        // a tunnel start can proceed. Cached starts stay independent.
+        let guard = if wait_for_initial_policy {
+            Some(self.startup_gate.clone().lock_owned().await)
+        } else {
+            None
+        };
+        tauri::async_runtime::spawn(async move {
+            let _guard = guard;
+            sync.await;
+        });
+    }
+
+    pub(crate) async fn wait_for_startup_sync(&self) {
+        let _guard = self.startup_gate.lock().await;
     }
 
     pub(crate) async fn synchronize(
@@ -105,6 +129,44 @@ impl SplitTunnelScheduler {
             .synchronize_split_tunnel(current_unix_time(), force_full)
             .await
     }
+}
+
+#[tokio::test]
+async fn startup_policy_waits_for_the_registered_initial_sync() {
+    let scheduler = SplitTunnelScheduler::new();
+    let (release, complete) = tokio::sync::oneshot::channel();
+    scheduler
+        .schedule_startup_sync(true, async move {
+            complete.await.unwrap();
+        })
+        .await;
+
+    let mut waiting = Box::pin(scheduler.wait_for_startup_sync());
+    tokio::select! {
+        biased;
+        _ = &mut waiting => panic!("initial split-tunnel sync has not completed"),
+        _ = std::future::ready(()) => (),
+    }
+    release.send(()).unwrap();
+    waiting.await;
+}
+
+#[tokio::test]
+async fn startup_policy_does_not_wait_for_a_background_cached_refresh() {
+    let scheduler = SplitTunnelScheduler::new();
+    let (release, complete) = tokio::sync::oneshot::channel();
+    scheduler
+        .schedule_startup_sync(false, async move {
+            complete.await.unwrap();
+        })
+        .await;
+
+    tokio::select! {
+        biased;
+        _ = scheduler.wait_for_startup_sync() => (),
+        _ = std::future::ready(()) => panic!("cached split-tunnel read was blocked by startup sync"),
+    }
+    release.send(()).unwrap();
 }
 
 impl PushRegistrationScheduler {

@@ -4,6 +4,7 @@ use nelomai_client_storage::{
 };
 use nelomai_contracts::{
     SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelMode, SplitTunnelPolicy,
+    SplitTunnelRevision,
 };
 use std::fs;
 use tempfile::tempdir;
@@ -77,6 +78,8 @@ fn state_from_an_older_application_loads_with_address_defaults() {
     let loaded = store.load().unwrap();
     assert_eq!(loaded.last_seen_force_revision, 2);
     assert_eq!(loaded.last_seen_address_revision, 0);
+    assert_eq!(loaded.observed_panel_revision, None);
+    assert_eq!(loaded.working_policy_revision, None);
     assert!(loaded.domain_resolutions.is_empty());
 }
 
@@ -163,7 +166,19 @@ fn populated_state() -> StoredSplitTunnelState {
     let policy = policy(7);
     StoredSplitTunnelState {
         cached_policy: Some(policy.clone()),
+        observed_panel_revision: Some(SplitTunnelRevision {
+            enabled: false,
+            revision: policy.revision + 1,
+            force_revision: policy.force_revision,
+            address_revision: policy.address_revision,
+        }),
         working_policy_hash: Some(policy.policy_hash.clone()),
+        working_policy_revision: Some(SplitTunnelRevision {
+            enabled: policy.enabled,
+            revision: policy.revision,
+            force_revision: policy.force_revision,
+            address_revision: policy.address_revision,
+        }),
         previous_working_policy: Some(policy),
         applied_physical_network_fingerprint: Some("network-a".to_string()),
         last_full_sync_unix: Some(1_800_000_000),

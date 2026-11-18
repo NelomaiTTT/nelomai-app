@@ -15,7 +15,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use nelomai_client_tunnel::{
     redundancy::{
         control::PairControl,
-        driver::{NativePair, SessionStore},
+        driver::{NativePair, RouteRefreshError, SessionStore},
         evidence::NativeHealthSample,
         network::{
             NetworkJournal, NetworkJournalStore, NetworkOwner, NetworkSystem, NetworkValue,
@@ -2364,9 +2364,9 @@ impl PairControl for Control {
         &mut self,
         scope: &SessionScope,
         options: &DesktopTunnelOptions,
-    ) -> io::Result<()> {
+    ) -> Result<(), RouteRefreshError> {
         if scope != &self.scope || !self.ready || self.fenced || self.stopped {
-            return Err(failed());
+            return Err(failed().into());
         }
         options.validate().map_err(|_| failed())?;
         self.check_integrity()?;
@@ -2374,7 +2374,7 @@ impl PairControl for Control {
             let journal = self.journal.borrow();
             let network = journal.current.network.read_view()?;
             if network.pending().is_some() || network.stopping() {
-                return Err(failed());
+                return Err(failed().into());
             }
             network.recorded_active().ok_or_else(failed)?
         };
@@ -2392,14 +2392,14 @@ impl PairControl for Control {
                     old.proof.identity.index == path.proof.identity.index
                         && old.proof.identity != path.proof.identity
                 }) {
-                    return Err(failed());
+                    return Err(failed().into());
                 }
                 if !retained.contains(&path) {
                     retained.push(path);
                 }
             }
             if retained.len() > crate::member_plan::MAX_ROUTES {
-                return Err(failed());
+                return Err(failed().into());
             }
         }
         self.fenced = true;

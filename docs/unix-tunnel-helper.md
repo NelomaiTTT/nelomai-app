@@ -18,14 +18,29 @@ WireGuard backend.
 
 ## Linux
 
-Linux uses the kernel WireGuard implementation and netlink for ordinary
-connections. AWG3 uses the pinned bundled `amneziawg-go` userspace runtime.
-The runtime path does not invoke the `wg` command. The helper owns `nlm-wg0`
-for WireGuard or `nlm-awg0` for AWG3, plus routing, fwmark rules, and resolver
-changes. AWG3 uses a dedicated policy-routing table and fixed rule priorities;
-their root-only recovery state is stored in
-`/var/run/nelomai/awg-routes-state.json`. The helper removes only rules that
-still match that state and cleans stale rules after an interrupted lifecycle.
+An ordinary connection uses kernel WireGuard on `nlm-wg0` or the bundled
+`amneziawg-go` runtime on `nlm-awg0`. The helper reads the physical route
+tables and checks the route to each peer endpoint. It installs IPv4 and IPv6
+routes for the tunnel's share of the peer's allowed addresses in the main
+table, using exclusive netlink adds on the owned interface. Peer endpoints,
+address exclusions, and more-specific OS routes keep their existing paths.
+Both transports check that the standard policy rules select the main table
+for each tunnel address family. Start fails if an unsupported rule could
+redirect the traffic.
+
+The root-only journal at `/var/run/nelomai/ordinary-routing/ordinary-link.json`
+records the boot and interface identity for recovery. On Stop, the helper
+verifies ownership and tears down the interface. Linux then removes its routes.
+A reserved interface name alone cannot authorize teardown. A surviving
+physical route or policy rule matching an old cleanup journal requires
+operator review because another process could have replaced it.
+
+In an isolated Linux network namespace, both transports retained their
+IPv4 and IPv6 peer, exclusion, and static routes across a same-boot helper
+process exit, reopen, and Stop. The physical routing tables and policy rules
+matched their initial snapshots after Stop, including a static route replaced
+with an identical row while connected. Recovery also preserved a foreign
+WireGuard interface created under the former tunnel's name.
 
 The AppImage contains the matching helper. On the first connection after an
 install or update, the application opens the system authorization dialog and
@@ -65,12 +80,13 @@ sudo crates/unix-service/install/install-macos.sh \
   "$(command -v amneziawg-go)"
 ```
 
-Before starting `wireguard-go`, the helper stores the current DNS servers and
-search domains for every network service in
-`/var/run/nelomai/dns-state.json` with mode `0600`. It restores that state when
-the tunnel stops and after helper recovery, including configurations that do
-not override DNS. Routes are attached to the generated `utun` interface and
-the endpoint route is removed explicitly.
+For an ordinary macOS tunnel that overrides DNS, the helper records the
+explicit server lists and a write intent in `/var/run/nelomai/dns-state.json`
+with mode `0600`. It writes the servers and a receipt in one
+SystemConfiguration transaction. Stop and recovery restore only services
+that still have the servers written by that transaction. Search domains
+remain unchanged. Data routes attach to the owned `utun` interfaces; peer
+endpoints keep using the system's existing physical routes.
 
 The app may remain unsigned or ad-hoc signed. macOS will still request the
 administrator password during this one-time helper installation.

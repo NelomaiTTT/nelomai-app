@@ -16,8 +16,8 @@ pub struct MemberView {
 }
 
 /// Serialized owner of two already independently configured native backends.
-/// The enclosing session owns routes/DNS and must install physical endpoint
-/// bypasses before calling start. Neither backend may be a single-mode backend.
+/// The enclosing session owns routes/DNS and verifies physical transport
+/// reachability before calling start. Neither backend may be a single-mode backend.
 pub struct SessionMembers<B> {
     scope: SessionScope,
     backends: [B; 2],
@@ -279,7 +279,7 @@ impl<B: ServiceTunnelBackend> SessionMembers<B> {
     }
 
     /// The existing Unix provider hashes physical default egress and addresses
-    /// on that physical NIC, not the pair's /1, probe or endpoint bypass routes.
+    /// on that physical NIC, not the pair's VPN data or probe routes.
     /// Linux member defaults are in private tables; macOS excludes utun defaults.
     /// Keep the frontend's existing IPv4 fingerprint semantics. Never use the
     /// unrelated single backend or manufacture an empty fingerprint on failure.

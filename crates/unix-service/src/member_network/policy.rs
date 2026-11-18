@@ -41,10 +41,7 @@ impl<C: super::linux::LinuxNetworkCommands> PhysicalPolicyProvider
         endpoints: &[IpAddr],
         owned: &[RouteValue],
     ) -> io::Result<NetworkPolicy> {
-        let mut destinations = owned.iter().map(|r| r.destination).collect::<Vec<_>>();
-        destinations.sort();
-        destinations.dedup();
-        super::linux::LinuxNetwork::resolve_policy(self, options, endpoints, &destinations)
+        super::linux::LinuxNetwork::resolve_policy(self, options, endpoints, owned)
     }
 }
 
@@ -152,7 +149,8 @@ mod tests {
                 return Err(io::Error::other("private resolver path/details"));
             }
             Ok(NetworkPolicy {
-                bypasses: endpoints.iter().map(|endpoint| bypass(*endpoint)).collect(),
+                exclusions: endpoints.iter().copied().map(IpNet::from).collect(),
+                existing: vec![],
                 retained_routes: vec![],
                 dns_services: vec![],
                 metric: 10,
@@ -187,13 +185,13 @@ mod tests {
     fn endpoint_b() -> IpAddr {
         "198.51.100.1".parse().unwrap()
     }
-    fn bypass(endpoint: IpAddr) -> RouteValue {
-        RouteValue {
-            destination: IpNet::from(endpoint),
-            scope: RouteScope::Global,
-            interface: 5,
-            gateway: Some("192.0.2.254".parse().unwrap()),
-            metric: 0,
+    fn standby_policy(endpoint: IpAddr) -> NetworkPolicy {
+        NetworkPolicy {
+            exclusions: vec![IpNet::from(endpoint_a()), IpNet::from(endpoint)],
+            existing: vec![],
+            retained_routes: vec![],
+            dns_services: vec![],
+            metric: 10,
         }
     }
     fn config(endpoint: IpAddr) -> ParsedConfiguration {
@@ -224,20 +222,16 @@ mod tests {
             .unwrap();
     }
     fn expected_owned(two_endpoints: bool) -> Vec<IpNet> {
-        let mut values: Vec<IpNet> = [
-            "0.0.0.0/1",
-            "128.0.0.0/1",
-            "::/1",
-            "8000::/1",
-            "9.9.9.9/32",
-            "192.0.2.1/32",
-        ]
-        .into_iter()
-        .map(|s| s.parse().unwrap())
-        .collect();
+        let mut exclusions = vec![IpNet::from(endpoint_a())];
         if two_endpoints {
-            values.push("198.51.100.1/32".parse().unwrap());
+            exclusions.push(IpNet::from(endpoint_b()));
         }
+        let mut values = nelomai_client_tunnel::redundancy::route_plan::tunnel_destinations(
+            &["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()],
+            &exclusions,
+        )
+        .unwrap();
+        values.push("9.9.9.9/32".parse().unwrap());
         values.sort();
         values
     }
@@ -259,7 +253,7 @@ mod tests {
         assert_eq!(state.borrow().native_calls, 0);
         assert!(pair.active().is_none());
         assert!(pair.members().view(Slot::A).is_none());
-        assert_eq!(policy.bypasses, [bypass(endpoint_a())]);
+        assert_eq!(policy.exclusions, [IpNet::from(endpoint_a())]);
     }
 
     #[test]
@@ -281,12 +275,7 @@ mod tests {
         );
         assert_eq!(state.borrow().native_calls, before);
         assert!(pair.members().view(Slot::B).is_none());
-        let bypass = policy
-            .bypasses
-            .into_iter()
-            .find(|r| r.destination == IpNet::from(endpoint_b()))
-            .unwrap();
-        pair.add_standby(&scope(), Slot::B, &config(endpoint_b()), probe(), bypass)
+        pair.add_standby(&scope(), Slot::B, &config(endpoint_b()), probe(), policy)
             .unwrap();
         state.borrow_mut().queries.clear();
         let before = state.borrow().native_calls;
@@ -316,7 +305,7 @@ mod tests {
             Slot::B,
             &config(endpoint_a()),
             probe(),
-            bypass(endpoint_a()),
+            standby_policy(endpoint_a()),
         )
         .unwrap();
         state.borrow_mut().queries.clear();
@@ -329,7 +318,7 @@ mod tests {
             Slot::B,
             &config(endpoint_b()),
             probe(),
-            bypass(endpoint_b()),
+            standby_policy(endpoint_b()),
         )
         .unwrap();
         pair.remove_standby(&scope(), Slot::B).unwrap();
@@ -388,7 +377,7 @@ mod tests {
             Slot::B,
             &config(endpoint_b()),
             probe(),
-            bypass(endpoint_b()),
+            standby_policy(endpoint_b()),
         )
         .unwrap();
         state.borrow_mut().queries.clear();

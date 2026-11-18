@@ -23,6 +23,42 @@ pub trait SessionStore {
     fn save(&mut self, snapshot: &SessionSnapshot) -> io::Result<()>;
 }
 
+#[derive(Debug)]
+pub enum RouteRefreshError {
+    /// The operation left the native state it was responsible for unchanged.
+    Unchanged(io::Error),
+    /// For a native replacement whose delete succeeded and whose route add
+    /// was rejected because another route had already occupied the slot.
+    RouteAddConflict(io::Error),
+    Uncertain(io::Error),
+}
+
+impl RouteRefreshError {
+    pub fn map_io_error(self, map: impl FnOnce(io::Error) -> io::Error) -> Self {
+        match self {
+            Self::Unchanged(error) => Self::Unchanged(map(error)),
+            Self::RouteAddConflict(error) => Self::RouteAddConflict(map(error)),
+            Self::Uncertain(error) => Self::Uncertain(map(error)),
+        }
+    }
+}
+
+impl From<io::Error> for RouteRefreshError {
+    fn from(error: io::Error) -> Self {
+        Self::Uncertain(error)
+    }
+}
+
+impl From<RouteRefreshError> for io::Error {
+    fn from(error: RouteRefreshError) -> Self {
+        match error {
+            RouteRefreshError::Unchanged(error)
+            | RouteRefreshError::RouteAddConflict(error)
+            | RouteRefreshError::Uncertain(error) => error,
+        }
+    }
+}
+
 #[derive(Default, Debug)]
 pub struct TickResult {
     pub primary_ready: bool,
@@ -309,7 +345,7 @@ impl<N: NativePair, S: SessionStore> SessionDriver<N, S> {
     pub(super) fn refresh_routes(
         &mut self,
         scope: &SessionScope,
-        apply: impl FnOnce(&mut N) -> io::Result<()>,
+        apply: impl FnOnce(&mut N) -> Result<(), RouteRefreshError>,
     ) -> io::Result<()> {
         self.require_preparation()?;
         if !self.network_validated() {
@@ -319,8 +355,22 @@ impl<N: NativePair, S: SessionStore> SessionDriver<N, S> {
         next.routes_refreshed(scope).map_err(|_| fenced())?;
         // An ambiguous native/CAS acknowledgement retains these originals for
         // exact cleanup. Never restart, adopt or report the old revision as ACK.
+        let cleanup_acknowledged = self.cleanup_acknowledged;
         self.fence_preparation();
-        apply(&mut self.native)?;
+        match apply(&mut self.native) {
+            Ok(()) => (),
+            Err(RouteRefreshError::Unchanged(error)) => {
+                self.preparation_acknowledged = true;
+                self.validated = true;
+                self.cleanup_acknowledged = cleanup_acknowledged;
+                return Err(error);
+            }
+            Err(
+                RouteRefreshError::RouteAddConflict(error) | RouteRefreshError::Uncertain(error),
+            ) => {
+                return Err(error);
+            }
+        }
         self.store.save(&next.snapshot())?;
         self.state = next;
         self.preparation_acknowledged = true;

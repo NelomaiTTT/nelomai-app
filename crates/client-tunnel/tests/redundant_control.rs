@@ -67,6 +67,7 @@ struct World {
     retirement_linger: bool,
     fail_close: bool,
     fail_select: bool,
+    reject_split_refresh: bool,
     fail_save: bool,
     fail_save_epoch: Option<u64>,
     lose_save_ack: bool,
@@ -173,8 +174,14 @@ impl PairControl for Pair {
         &mut self,
         _: &SessionScope,
         _: &DesktopTunnelOptions,
-    ) -> io::Result<()> {
-        self.0.borrow_mut().events.push("refresh split".into());
+    ) -> Result<(), RouteRefreshError> {
+        let mut world = self.0.borrow_mut();
+        world.events.push("refresh split".into());
+        if world.reject_split_refresh {
+            return Err(RouteRefreshError::Unchanged(io::Error::other(
+                "split route discovery failed",
+            )));
+        }
         Ok(())
     }
     fn complete_start(&mut self, scope: &SessionScope) -> io::Result<()> {
@@ -2946,6 +2953,22 @@ fn stale_live_split_refresh_has_no_native_or_session_effect() {
     assert!(owner.execute(stale, 1).is_err());
     assert_eq!(owner.snapshot(), before);
     assert!(world.borrow().events.is_empty());
+}
+
+#[test]
+fn rejected_split_route_discovery_keeps_the_existing_pair_available() {
+    let (mut owner, world) = running();
+    let before = owner.snapshot();
+    world.borrow_mut().reject_split_refresh = true;
+    assert!(owner.execute(refresh_command(&before), 1).is_err());
+    assert_eq!(owner.snapshot(), before);
+
+    world.borrow_mut().reject_split_refresh = false;
+    let after = owner.execute(refresh_command(&before), 2).unwrap();
+    assert_eq!(
+        after.session.local_revision,
+        before.session.local_revision + 1
+    );
 }
 
 #[test]

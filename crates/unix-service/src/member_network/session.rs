@@ -5,7 +5,10 @@ use super::members::SessionMembers;
 use super::policy::PhysicalPolicyProvider;
 use crate::{ParsedConfiguration, ServiceError, ServiceTunnelBackend};
 use nelomai_client_tunnel::redundancy::{
-    network::*, route_plan::member_route_plan, SessionScope, Slot,
+    driver::RouteRefreshError,
+    network::*,
+    route_plan::{tunnel_destinations_preserving, unix_member_route_plan},
+    SessionScope, Slot,
 };
 use nelomai_contracts::RedundantHealthProbe;
 use std::{collections::HashSet, net::IpAddr};
@@ -14,8 +17,11 @@ use std::{collections::HashSet, net::IpAddr};
 /// Never accept interface indexes, gateways or DNS service names from app IPC.
 #[derive(Clone, Debug)]
 pub struct NetworkPolicy {
-    pub bypasses: Vec<RouteValue>,
-    /// Existing physical LAN routes: verify but never adopt/mutate/clean them.
+    /// Destinations left to the OS routing table, including the pinned peer endpoints.
+    pub exclusions: Vec<ipnet::IpNet>,
+    /// Existing OS route prefixes whose original priority must survive CIDR subtraction.
+    pub existing: Vec<ipnet::IpNet>,
+    /// Physical egress dependencies read from the kernel; never owned or written.
     pub retained_routes: Vec<RouteValue>,
     pub dns_services: Vec<String>,
     pub metric: u32,
@@ -89,7 +95,7 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
             network: NetworkOwner::recover(
                 DiagnosticNetwork(system),
                 DiagnosticJournal(store),
-                journal,
+                journal.unix_recovery().map_err(network_error)?,
             )
             .map_err(network_error)?,
             failure: FailureSlot::default(),
@@ -137,17 +143,17 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         self.members.validate_start(scope, slot, config, &probe)?;
         validate_policy(&policy)?;
         self.verify_retained(&policy)?;
-        let endpoint = validate_endpoint(config, &policy.bypasses, &policy.retained_routes)?;
+        let endpoint = validate_endpoint(config, &policy.exclusions)?;
         validate_dns(&config.dns)?;
+        tunnel_destinations_preserving(
+            &config.peers[0].allowed_ips,
+            &policy.exclusions,
+            &policy.existing,
+        )
+        .map_err(|e| self.failure.network(Stage::Network, e))?;
         self.network
-            .prepare(
-                policy
-                    .bypasses
-                    .iter()
-                    .cloned()
-                    .map(NetworkValue::Route)
-                    .collect(),
-            )
+            .system_mut()
+            .verify_physical_endpoint(endpoint, &policy.retained_routes)
             .map_err(|e| self.failure.network(Stage::Network, e))?;
         // Retain the policy even on partial native start. Only scoped Stop can
         // dispose of those resources; a new Start must not adopt their remnants.
@@ -168,7 +174,7 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         slot: Slot,
         config: &ParsedConfiguration,
         probe: RedundantHealthProbe,
-        endpoint_bypass: RouteValue,
+        policy: NetworkPolicy,
     ) -> Result<(), ServiceError> {
         self.check(scope)?;
         let active = self.active().ok_or_else(fenced)?;
@@ -176,47 +182,32 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
             return Err(fenced());
         }
         self.members.validate_start(scope, slot, config, &probe)?;
-        let endpoint = validate_endpoint(config, std::slice::from_ref(&endpoint_bypass), &[])?;
+        let endpoint = validate_endpoint(config, &policy.exclusions)?;
         validate_dns(&config.dns)?;
-        let mut next = self.policy.clone().ok_or_else(fenced)?;
-        if let Some(old) = next
-            .bypasses
-            .iter()
-            .chain(&next.retained_routes)
-            .find(|r| r.destination == endpoint_bypass.destination)
-        {
-            if old != &endpoint_bypass {
-                return Err(ServiceError::InvalidRequest);
-            }
-        } else {
-            let value = NetworkValue::Route(endpoint_bypass.clone());
-            if self
-                .network
-                .system_mut()
-                .verify_retained_route(&endpoint_bypass)
-                .map_err(|e| self.failure.network(Stage::Network, e))?
-            {
-                next.retained_routes.push(endpoint_bypass);
-            } else if self
-                .network
-                .system_mut()
-                .read(&value.key())
-                .map_err(|e| self.failure.network(Stage::Network, e))?
-                .is_none()
-            {
-                next.bypasses.push(endpoint_bypass);
-            } else {
-                return Err(ServiceError::Backend("physical_route_changed".into()));
-            }
-        }
-        validate_policy(&next)?;
-        let values = self.values(active, &next)?;
+        // Carve the candidate endpoint out of the current active routes before
+        // its transport socket starts. Preserve every already attached endpoint.
+        let (_, values) = self.plan_policy_routes(scope, &policy)?;
+        tunnel_destinations_preserving(
+            &config.peers[0].allowed_ips,
+            &policy.exclusions,
+            &policy.existing,
+        )
+        .map_err(|e| self.failure.network(Stage::Network, e))?;
         self.network
             .select(active, values)
             .map_err(|e| self.failure.network(Stage::Network, e))?;
-        self.policy = Some(next);
-        self.dns[index(slot)] = config.dns.clone();
+        self.verify_committed_endpoints(&policy)
+            .map_err(|e| self.failure.network(Stage::Network, e))?;
+        let candidate_egress = self
+            .network
+            .system_mut()
+            .verify_physical_endpoint(endpoint, &policy.retained_routes);
+        self.policy = Some(policy);
+        // The primary's committed routes were verified. A candidate with a
+        // foreign transport path can be rejected before it acquires a backend.
+        candidate_egress.map_err(|e| self.failure.network(Stage::Network, e))?;
         self.endpoints[index(slot)] = Some(endpoint);
+        self.dns[index(slot)] = config.dns.clone();
         let view = self.members.start(scope, slot, config, probe)?;
         self.network
             .system_mut()
@@ -234,13 +225,15 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         let values = self.values(slot, &policy)?;
         self.network
             .select(slot, values)
+            .map_err(|e| self.failure.network(Stage::Network, e))?;
+        self.verify_committed_endpoints(&policy)
             .map_err(|e| self.failure.network(Stage::Network, e))
     }
 
     /// A failed reserve does not tear down a working primary. Remove only the
     /// inactive native member, then its probe routes, then its table binding.
     /// A journal/rollback conflict is returned to the owner, never hidden as a
-    /// successful detach. Endpoint bypasses stay owned until session Stop.
+    /// successful detach. Endpoint exclusions stay in the plan until the next physical policy discovery.
     pub fn remove_standby(&mut self, scope: &SessionScope, slot: Slot) -> Result<(), ServiceError> {
         self.check(scope)?;
         let active = self.active().ok_or_else(fenced)?;
@@ -252,6 +245,11 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
             self.retired_interfaces[i] = Some(view.routes.interface);
         }
         self.members.stop(scope, slot)?;
+        if let Some(interface) = self.retired_interfaces[i] {
+            self.network
+                .confirm_link_closed(interface)
+                .map_err(|e| self.failure.network(Stage::Network, e))?;
+        }
         self.dns[i].clear();
         self.endpoints[i] = None;
         let policy = self.policy.clone().ok_or_else(fenced)?;
@@ -270,27 +268,51 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
     }
 
     /// The coordinator invalidates all in-flight probes and health samples
-    /// before invoking this operation. Rebind must never precede bypass repair.
+    /// before invoking this operation. Verify the new physical path before rebinding.
     pub fn network_changed(
         &mut self,
         scope: &SessionScope,
         policy: NetworkPolicy,
     ) -> Result<(), ServiceError> {
-        self.check(scope)?;
-        validate_policy(&policy)?;
-        if self.endpoints.iter().flatten().any(|endpoint| {
-            !has_endpoint(*endpoint, &policy.bypasses)
-                && !has_endpoint(*endpoint, &policy.retained_routes)
-        }) {
-            return Err(ServiceError::InvalidRequest);
-        }
-        let active = self.active().ok_or_else(fenced)?;
-        let values = self.values(active, &policy)?;
+        let (active, values) = self.plan_policy_routes(scope, &policy)?;
         self.network
             .select(active, values)
             .map_err(|e| self.failure.network(Stage::Network, e))?;
+        self.verify_committed_endpoints(&policy)
+            .map_err(|e| self.failure.network(Stage::Network, e))?;
         self.policy = Some(policy);
         self.members.rebind(scope)
+    }
+
+    pub(super) fn plan_policy_routes(
+        &mut self,
+        scope: &SessionScope,
+        policy: &NetworkPolicy,
+    ) -> Result<(Slot, Vec<NetworkValue>), ServiceError> {
+        self.check(scope)?;
+        validate_policy(policy)?;
+        if self
+            .endpoints
+            .iter()
+            .flatten()
+            .any(|e| !policy.exclusions.contains(&ipnet::IpNet::from(*e)))
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let active = self.active().ok_or_else(fenced)?;
+        Ok((active, self.values(active, policy)?))
+    }
+
+    pub(super) fn replace_policy_routes(
+        &mut self,
+        active: Slot,
+        values: Vec<NetworkValue>,
+        policy: NetworkPolicy,
+    ) -> Result<(), RouteRefreshError> {
+        self.network.select_with_outcome(active, values)?;
+        self.verify_committed_endpoints(&policy)?;
+        self.policy = Some(policy);
+        Ok(())
     }
 
     pub fn close(&mut self, scope: &SessionScope) -> Result<(), ServiceError> {
@@ -302,9 +324,15 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         // Cut native traffic before potentially slow DNS/route cleanup. Still
         // attempt both paths on failure and retain their independent journals.
         let members = self.members.close(scope);
+        let retired_routes = if members.is_ok() {
+            self.network.confirm_links_closed()
+        } else {
+            Ok(())
+        };
         let network = self
             .network
             .cleanup()
+            .and(retired_routes)
             .map_err(|e| self.failure.network(Stage::Network, e));
         members.and(network)?;
         self.network
@@ -333,30 +361,21 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
             })
             .collect::<Vec<_>>();
         if policy
-            .bypasses
+            .retained_routes
             .iter()
-            .chain(&policy.retained_routes)
             .any(|r| members.iter().any(|m| m.interface == r.interface))
         {
             return Err(ServiceError::InvalidRequest);
         }
-        let exclusions = policy
-            .bypasses
-            .iter()
-            .chain(&policy.retained_routes)
-            // Physical scoped defaults serve explicitly bound control sockets,
-            // not a global exclusion of all user traffic from the VPN.
-            .filter(|r| r.scope == RouteScope::Global)
-            .map(|r| r.destination)
-            .collect::<Vec<_>>();
-        let routes = member_route_plan(active, &members, &exclusions, policy.metric)
-            .map_err(|e| self.failure.network(Stage::Network, e))?;
-        let mut values = policy
-            .bypasses
-            .iter()
-            .cloned()
-            .map(NetworkValue::Route)
-            .collect::<Vec<_>>();
+        let routes = unix_member_route_plan(
+            active,
+            &members,
+            &policy.exclusions,
+            &policy.existing,
+            policy.metric,
+        )
+        .map_err(|e| self.failure.network(Stage::Network, e))?;
+        let mut values = Vec::new();
         for route in routes {
             values.extend(
                 self.network
@@ -381,6 +400,23 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         }
         Ok(values)
     }
+    fn verify_committed_endpoints(&mut self, policy: &NetworkPolicy) -> std::io::Result<()> {
+        for endpoint in self.endpoints.into_iter().flatten() {
+            if let Err(error) = self
+                .network
+                .system_mut()
+                .verify_physical_endpoint(endpoint, &policy.retained_routes)
+            {
+                // Data routes have already changed. Never publish an active
+                // tunnel or permit another mutation over unverified transport.
+                self.closing = true;
+                self.closing_incomplete = true;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     fn verify_retained(&mut self, policy: &NetworkPolicy) -> Result<(), ServiceError> {
         for route in &policy.retained_routes {
             if !self
@@ -465,6 +501,17 @@ impl<B: ServiceTunnelBackend, N: super::policy::PhysicalPolicyProvider, S: Netwo
     }
 }
 
+pub(super) fn expected_egress(
+    endpoint: IpAddr,
+    retained: &[RouteValue],
+) -> std::io::Result<&RouteValue> {
+    retained
+        .iter()
+        .filter(|r| r.scope == RouteScope::Global && r.destination.contains(&endpoint))
+        .max_by_key(|r| (r.destination.prefix_len(), std::cmp::Reverse(r.metric)))
+        .ok_or_else(|| std::io::Error::other("physical_egress_unavailable"))
+}
+
 fn index(slot: Slot) -> usize {
     match slot {
         Slot::A => 0,
@@ -479,8 +526,7 @@ fn network_error(_: std::io::Error) -> ServiceError {
 }
 fn validate_endpoint(
     config: &ParsedConfiguration,
-    bypasses: &[RouteValue],
-    retained: &[RouteValue],
+    exclusions: &[ipnet::IpNet],
 ) -> Result<IpAddr, ServiceError> {
     let endpoint = config
         .peers
@@ -492,33 +538,22 @@ fn validate_endpoint(
         .map_err(|_| ServiceError::InvalidConfiguration)?;
     // Native adapter must pin a resolved address in the member configuration;
     // otherwise DNS rotation could send encrypted packets through the other VPN.
-    if !has_endpoint(endpoint, bypasses) && !has_endpoint(endpoint, retained) {
+    if !exclusions.contains(&ipnet::IpNet::from(endpoint)) {
         return Err(ServiceError::InvalidRequest);
     }
     Ok(endpoint)
 }
-fn has_endpoint(endpoint: IpAddr, bypasses: &[RouteValue]) -> bool {
-    bypasses
-        .iter()
-        .any(|r| r.destination == ipnet::IpNet::from(endpoint) && r.scope == RouteScope::Global)
-}
 fn validate_policy(policy: &NetworkPolicy) -> Result<(), ServiceError> {
     let mut seen = HashSet::new();
-    if policy
-        .bypasses
-        .len()
-        .saturating_add(policy.retained_routes.len())
-        > 16384
+    if policy.exclusions.len() > 16_384 || policy.retained_routes.len() > 16_384
+        || policy.exclusions.iter().any(|n| *n != n.trunc())
         || policy.dns_services.len() > 64
-        || policy
-            .bypasses
-            .iter()
-            .chain(&policy.retained_routes)
+        || policy.retained_routes.iter()
             .any(|r| {
                 r.interface == 0
                     || !(r.scope == RouteScope::Global
                         || matches!(r.scope, RouteScope::Member(i)
-                            if i == r.interface && r.destination.prefix_len() == 0 && r.gateway.is_some() && r.metric == 0))
+                            if i == r.interface && r.destination.prefix_len() == 0 && r.metric == 0))
                     || r.destination != r.destination.trunc()
                     || r.gateway
                         .is_some_and(|g| g.is_ipv4() != r.destination.addr().is_ipv4())

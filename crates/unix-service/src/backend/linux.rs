@@ -7,7 +7,7 @@ use super::{
     userspace_log_streams, userspace_socket_path, DiagnosticJournal, RebindPeer,
 };
 use crate::process::{status_with_timeout, COMMAND_TIMEOUT};
-use crate::routes::{LinuxUserspaceRouteManager, RouteManager, SystemRouteBackend, AWG_FWMARK};
+use crate::routes::{LinuxOrdinaryRoutes, RouteManager, SystemRouteBackend};
 use crate::{ParsedConfiguration, ServiceError, ServiceTunnelBackend, ServiceTunnelState};
 use defguard_wireguard_rs::{host::Host, Kernel, Userspace, WGApi, WireguardInterfaceApi};
 use nelomai_client_tunnel::redundancy::SessionScope;
@@ -20,6 +20,9 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
+
+mod ordinary_link;
+use ordinary_link::OrdinaryLinkStore;
 
 const START_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -39,7 +42,8 @@ pub struct LinuxBackend {
     runtime_directory: PathBuf,
     active_transport: Option<TunnelTransport>,
     rebind_peers: Vec<RebindPeer>,
-    amneziawg_routes: LinuxUserspaceRouteManager,
+    ordinary_routes: LinuxOrdinaryRoutes,
+    ordinary_link: Option<OrdinaryLinkStore>,
     routes: RouteManager<SystemRouteBackend>,
     state: ServiceTunnelState,
     diagnostics: DiagnosticJournal,
@@ -92,7 +96,7 @@ impl LinuxBackend {
         let amneziawg_api =
             WGApi::<Userspace>::new(mode.linux_interface(TunnelTransport::AmneziaWg3))
                 .map_err(backend_error)?;
-        let mut amneziawg_routes = LinuxUserspaceRouteManager::new(&runtime_directory)?;
+        let mut ordinary_routes = LinuxOrdinaryRoutes::new(&runtime_directory)?;
         let mut routes = RouteManager::new(&runtime_directory, SystemRouteBackend::new()?)?;
         let forward_nat = crate::forward_nat::Owner::open(
             &runtime_directory,
@@ -101,40 +105,26 @@ impl LinuxBackend {
             crate::forward_nat::linux::Adapter::new(crate::forward_nat::NativeCommands::default()),
         )
         .map_err(backend_error)?;
-        // Reopened members expose cleanup only. Never adopt or configure a
-        // resource by name, and never reconstruct a running session from disk.
-        let wireguard_host = if mode.owns_network() {
-            wireguard_api.read_interface_data().ok()
+        // A reserved name alone cannot establish ownership after a restart.
+        let ordinary_link = if mode.owns_network() {
+            Some(OrdinaryLinkStore::open(&runtime_directory)?)
         } else {
             None
         };
-        let amneziawg_host = if mode.owns_network() {
-            amneziawg_api.read_interface_data().ok()
-        } else {
-            None
-        };
-        let wireguard_running = wireguard_host.is_some();
-        let amneziawg_running = amneziawg_host.is_some();
-        if wireguard_running && amneziawg_running {
-            return Err(ServiceError::Backend(
-                "multiple_tunnel_interfaces_detected".to_string(),
-            ));
+        let saved = ordinary_link.as_ref().and_then(OrdinaryLinkStore::owned);
+        let ordinary_pending = ordinary_link
+            .as_ref()
+            .is_some_and(OrdinaryLinkStore::cleanup_pending);
+        let active_transport = saved.map(|link| link.transport());
+        if mode.owns_network() && active_transport.is_none() && !ordinary_pending {
+            ordinary_routes.cleanup()?;
+            routes.cleanup()?;
         }
-        let active_transport = if wireguard_running {
-            Some(TunnelTransport::WireGuard)
-        } else if amneziawg_running {
-            Some(TunnelTransport::AmneziaWg3)
-        } else {
-            if mode.owns_network() {
-                amneziawg_routes.cleanup()?;
-                routes.cleanup()?;
-            }
-            None
-        };
         let state = if forward_nat.is_recovering()
             || member_owner
                 .as_ref()
                 .is_some_and(LinuxOwner::cleanup_pending)
+            || ordinary_pending
         {
             ServiceTunnelState::Stopping
         } else if active_transport.is_some() {
@@ -142,10 +132,16 @@ impl LinuxBackend {
         } else {
             ServiceTunnelState::Stopped
         };
-        let rebind_peers = amneziawg_host
-            .as_ref()
-            .map(rebind_peers_from_host)
-            .unwrap_or_default();
+        let rebind_peers = if active_transport == Some(TunnelTransport::AmneziaWg3) {
+            amneziawg_api
+                .read_interface_data()
+                .ok()
+                .as_ref()
+                .map(rebind_peers_from_host)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let mut diagnostics = DiagnosticJournal::persistent(&runtime_directory);
         diagnostics.record(
             "helper_initialized",
@@ -169,7 +165,8 @@ impl LinuxBackend {
             runtime_directory,
             active_transport,
             rebind_peers,
-            amneziawg_routes,
+            ordinary_routes,
+            ordinary_link,
             routes,
             state,
             diagnostics,
@@ -183,7 +180,11 @@ impl LinuxBackend {
     ) -> Result<(), ServiceError> {
         if self.forward_nat.has_resources()
             || self.active_transport.is_some()
-            || self.amneziawg_routes.has_routes()
+            || self
+                .ordinary_link
+                .as_ref()
+                .is_some_and(OrdinaryLinkStore::cleanup_pending)
+            || self.ordinary_routes.has_routes()
             || self.routes.has_routes()
         {
             self.stop_inner()?;
@@ -192,50 +193,39 @@ impl LinuxBackend {
         let mut native = build_backend_configuration(configuration)?;
         let interface_name = self.mode.linux_interface(configuration.transport);
         native.interface.name = interface_name.to_string();
-        if self.mode.owns_network() && configuration.transport == TunnelTransport::AmneziaWg3 {
-            native.interface.fwmark = Some(AWG_FWMARK);
-        }
-        if self.mode.owns_network() {
-            self.routes.apply(options)?;
-        }
         if !self.mode.owns_network() {
             native.interface.port = 0;
         }
 
+        let boot = boot_identity()?;
+        let transport = match configuration.transport {
+            TunnelTransport::WireGuard => MemberTransport::WireGuard,
+            TunnelTransport::AmneziaWg3 => MemberTransport::AmneziaWg3,
+        };
+        let launch = |group| {
+            launch_member_native(
+                &self.amneziawg_go,
+                &self.runtime_directory,
+                interface_name,
+                transport,
+                &boot,
+                group,
+            )
+        };
         if let Some(owner) = &mut self.member_owner {
-            let boot = boot_identity()?;
-            let transport = match configuration.transport {
-                TunnelTransport::WireGuard => MemberTransport::WireGuard,
-                TunnelTransport::AmneziaWg3 => MemberTransport::AmneziaWg3,
-            };
             owner
-                .launch(transport, &boot, |group| {
-                    launch_member_native(
-                        &self.amneziawg_go,
-                        &self.runtime_directory,
-                        interface_name,
-                        transport,
-                        &boot,
-                        group,
-                    )
-                })
+                .launch(transport, &boot, launch)
                 .map_err(backend_error)?;
         } else {
-            match configuration.transport {
-                TunnelTransport::WireGuard => {
-                    self.wireguard_api
-                        .create_interface()
-                        .map_err(backend_error)?;
-                }
-                TunnelTransport::AmneziaWg3 => {
-                    validate_root_owned_binary(&self.amneziawg_go)?;
-                    launch_amneziawg_go(
-                        &self.amneziawg_go,
-                        interface_name,
-                        &self.runtime_directory,
-                    )?;
-                }
-            }
+            self.ordinary_link
+                .as_mut()
+                .ok_or(ServiceError::InvalidRequest)?
+                .launch(
+                    &self.amneziawg_go,
+                    &self.runtime_directory,
+                    transport,
+                    &boot,
+                )?;
         }
         self.active_transport = Some(configuration.transport);
         let configured_interface_index = kernel_interface_index(interface_name)?;
@@ -244,6 +234,9 @@ impl LinuxBackend {
                 && self.member_interface_index()? != configured_interface_index)
         {
             return Err(backend_error("owned_vpn_interface_changed"));
+        }
+        if let Some(store) = &self.ordinary_link {
+            store.verify(configured_interface_index)?;
         }
         self.nat_interface = Some((interface_name.into(), configured_interface_index));
 
@@ -268,47 +261,61 @@ impl LinuxBackend {
             return Err(error);
         }
 
+        if configuration.transport == TunnelTransport::AmneziaWg3 {
+            // The TUN starts down. Set addrgenmode before UP so the kernel
+            // cannot create a second link-local prefix used by physical LANs.
+            for args in [&["addrgenmode", "none"][..], &["up"][..]] {
+                let status = status_with_timeout(
+                    Command::new(ip_command().map_err(backend_error)?)
+                        .args(["link", "set", "dev", interface_name])
+                        .args(args)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null()),
+                    COMMAND_TIMEOUT,
+                )
+                .map_err(backend_error)?;
+                if !status.success()
+                    || kernel_interface_index(interface_name)? != configured_interface_index
+                {
+                    return Err(backend_error("interface_up_failed"));
+                }
+            }
+        }
         let configured_routes: Result<(), ServiceError> = if !self.mode.owns_network() {
             self.member_interface_index().and_then(|index| {
-                if configuration.transport == TunnelTransport::AmneziaWg3 {
-                    // Userspace creates a DOWN TUN; members skip ordinary routing.
-                    // Set addrgenmode separately: kernel UP processing precedes
-                    // addrgenmode in a combined request and can add a link-local route.
-                    for args in [&["addrgenmode", "none"][..], &["up"][..]] {
-                        let status = status_with_timeout(
-                            Command::new(ip_command().map_err(backend_error)?)
-                                .args(["link", "set", "dev", interface_name])
-                                .args(args)
-                                .stdin(Stdio::null())
-                                .stdout(Stdio::null())
-                                .stderr(Stdio::null()),
-                            COMMAND_TIMEOUT,
-                        )
-                        .map_err(backend_error)?;
-                        if self.member_interface_index()? != index || !status.success() {
-                            return Err(backend_error("member_interface_up_unconfirmed"));
-                        }
-                    }
-                }
                 super::member_rpf::enable_member_reply_path(interface_name, index)
                     .map_err(backend_error)
             })
         } else {
-            match configuration.transport {
-                TunnelTransport::WireGuard => self
-                    .wireguard_api
-                    .configure_peer_routing(&native.interface.peers)
-                    .and_then(|_| self.wireguard_api.configure_dns(&configuration.dns, &[]))
-                    .map_err(backend_error),
-                TunnelTransport::AmneziaWg3 => self
-                    .amneziawg_routes
-                    .apply(interface_name, &native.interface.peers)
-                    .and_then(|_| {
-                        self.amneziawg_api
-                            .configure_dns(&configuration.dns, &[])
-                            .map_err(backend_error)
-                    }),
+            let store = self
+                .ordinary_link
+                .as_mut()
+                .ok_or(ServiceError::InvalidRequest)?;
+            store.verify(configured_interface_index)?;
+            self.ordinary_routes.apply(
+                configured_interface_index,
+                interface_name,
+                &native.interface.peers,
+                options,
+            )?;
+            if !configuration.dns.is_empty() {
+                store.verify(configured_interface_index)?;
+                store
+                    .owned_mut()
+                    .ok_or(ServiceError::InvalidRequest)?
+                    .dns_entry = Some(resolvconf_entry(interface_name));
+                store.persist()?;
             }
+            match configuration.transport {
+                TunnelTransport::WireGuard => {
+                    self.wireguard_api.configure_dns(&configuration.dns, &[])
+                }
+                TunnelTransport::AmneziaWg3 => {
+                    self.amneziawg_api.configure_dns(&configuration.dns, &[])
+                }
+            }
+            .map_err(backend_error)
         };
         if let Err(error) = configured_routes {
             let _ = self.stop_inner();
@@ -326,6 +333,10 @@ impl LinuxBackend {
         )
         .map_err(backend_error)?;
         self.refresh_forward_nat()?;
+        if let Some(store) = self.ordinary_link.as_mut() {
+            store.owned_mut().ok_or(ServiceError::InvalidRequest)?.ready = true;
+            store.persist()?;
+        }
         self.rebind_peers = rebind_peers_for_start(configuration, self.mode);
         Ok(())
     }
@@ -391,45 +402,19 @@ impl LinuxBackend {
             self.rebind_peers.clear();
             return Ok(());
         }
-        let transport = if self.mode.owns_network() {
-            self.active_transport.take()
-        } else {
-            self.active_transport
-        };
-        let mut first_error = None;
-        if let Err(error) = if self.mode.owns_network() {
-            self.amneziawg_routes.cleanup()
-        } else {
-            Ok(())
-        } {
-            first_error.get_or_insert(error);
+        if let Some(store) = self.ordinary_link.as_mut() {
+            store.stop()?;
         }
-        let interface_result = match transport {
-            Some(TunnelTransport::WireGuard) => {
-                self.wireguard_api.remove_interface().map_err(backend_error)
-            }
-            Some(TunnelTransport::AmneziaWg3) => {
-                self.amneziawg_api.remove_interface().map_err(backend_error)
-            }
-            None => Ok(()),
-        };
-        if let Err(error) = interface_result {
-            first_error.get_or_insert(error);
-        } else {
-            self.active_transport = None;
-            self.rebind_peers.clear();
-        }
-        if let Err(error) = if self.mode.owns_network() {
-            self.routes.cleanup()
-        } else {
-            Ok(())
-        } {
-            first_error.get_or_insert(error);
-        }
-        first_error.map_or(Ok(()), Err)
+        self.active_transport = None;
+        self.rebind_peers.clear();
+        self.ordinary_routes.cleanup()?;
+        self.routes.cleanup()
     }
 
     fn read_active_interface(&self) -> Result<Host, ServiceError> {
+        if let Some(store) = &self.ordinary_link {
+            store.verify_active()?;
+        }
         if self.member_owner.is_some() {
             self.member_interface_index()?;
         }
@@ -451,8 +436,13 @@ impl LinuxBackend {
             "state={}\ntransport={}\nroutes_active={}\nawg_routes_active={}",
             state_name(self.state),
             transport_name(self.active_transport),
-            self.routes.has_routes(),
-            self.amneziawg_routes.has_routes(),
+            self.ordinary_link
+                .as_ref()
+                .and_then(OrdinaryLinkStore::owned)
+                .is_some_and(|r| r.ready)
+                || self.routes.has_routes(),
+            self.active_transport == Some(TunnelTransport::AmneziaWg3) && self.mode.owns_network()
+                || self.ordinary_routes.has_routes(),
         );
         match self.read_active_interface() {
             Ok(host) => {
@@ -466,6 +456,32 @@ impl LinuxBackend {
         }
         snapshot
     }
+}
+
+// Match the resolver entry used by defguard on systems with Debian resolvconf.
+fn resolvconf_entry(interface: &str) -> String {
+    let executable = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|p| p.join("resolvconf"))
+            .find(|p| p.is_file())
+    });
+    if executable
+        .and_then(|p| std::fs::symlink_metadata(p).ok())
+        .is_some_and(|m| m.is_file())
+    {
+        if let Ok(order) = std::fs::read_to_string("/etc/resolvconf/interface-order") {
+            if let Some(prefix) = order
+                .lines()
+                .filter_map(|l| l.trim().strip_suffix('*'))
+                .find(|s| {
+                    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                })
+            {
+                return format!("{prefix}.{interface}");
+            }
+        }
+    }
+    interface.into()
 }
 
 fn kernel_interface_index(interface: &str) -> Result<u32, ServiceError> {
@@ -561,14 +577,7 @@ fn capture_member(
     }
     let proof = match transport {
         MemberTransport::WireGuard => NativeProof::Kernel {
-            group: std::fs::read_to_string(
-                Path::new("/sys/class/net")
-                    .join(interface)
-                    .join("netdev_group"),
-            )?
-            .trim_end_matches('\n')
-            .parse()
-            .map_err(|_| Error::other("slot_interface_group_invalid"))?,
+            group: kernel_interface_group(interface)?,
         },
         MemberTransport::AmneziaWg3 => NativeProof::Userspace(
             super::redundancy::capture_userspace_member(interface).map_err(Error::other)?,
@@ -585,6 +594,17 @@ fn capture_member(
         index,
         proof,
     })
+}
+
+fn kernel_interface_group(interface: &str) -> std::io::Result<u32> {
+    std::fs::read_to_string(
+        Path::new("/sys/class/net")
+            .join(interface)
+            .join("netdev_group"),
+    )?
+    .trim_end_matches('\n')
+    .parse()
+    .map_err(|_| std::io::Error::other("slot_interface_group_invalid"))
 }
 
 fn inspect_member(saved: &LinuxIdentity) -> std::io::Result<Option<LinuxIdentity>> {
@@ -792,6 +812,13 @@ impl ServiceTunnelBackend for LinuxBackend {
         if self.forward_nat.is_recovering() {
             return Ok(ServiceTunnelState::Stopping);
         }
+        if self
+            .ordinary_link
+            .as_ref()
+            .is_some_and(OrdinaryLinkStore::cleanup_pending)
+        {
+            return Ok(ServiceTunnelState::Stopping);
+        }
         if self.member_cleanup_pending() && self.active_transport.is_none() {
             return Ok(ServiceTunnelState::Stopping);
         }
@@ -799,7 +826,7 @@ impl ServiceTunnelBackend for LinuxBackend {
             Ok(ServiceTunnelState::Running)
         } else if self.active_transport.is_none()
             && self.state == ServiceTunnelState::Stopped
-            && !self.amneziawg_routes.has_routes()
+            && !self.ordinary_routes.has_routes()
             && !self.routes.has_routes()
         {
             Ok(ServiceTunnelState::Stopped)
@@ -918,16 +945,7 @@ fn launch_amneziawg_go(
             "amneziawg_interface_already_exists".to_string(),
         ));
     }
-    let mut command = Command::new(executable);
-    command.arg(interface_name).stdin(Stdio::null());
-    if let Some((stdout, stderr)) = userspace_log_streams(runtime_directory) {
-        command
-            .env("LOG_LEVEL", "error")
-            .stdout(stdout)
-            .stderr(stderr);
-    } else {
-        command.stdout(Stdio::null()).stderr(Stdio::null());
-    }
+    let mut command = amneziawg_command(executable, interface_name, runtime_directory);
     let status = status_with_timeout(&mut command, COMMAND_TIMEOUT).map_err(backend_error)?;
     if !status.success() {
         return Err(ServiceError::Backend(
@@ -944,6 +962,20 @@ fn launch_amneziawg_go(
     Err(ServiceError::Backend(
         "amneziawg_go_start_timeout".to_string(),
     ))
+}
+
+fn amneziawg_command(executable: &Path, interface_name: &str, runtime_directory: &Path) -> Command {
+    let mut command = Command::new(executable);
+    command.arg(interface_name).stdin(Stdio::null());
+    if let Some((stdout, stderr)) = userspace_log_streams(runtime_directory) {
+        command
+            .env("LOG_LEVEL", "error")
+            .stdout(stdout)
+            .stderr(stderr);
+    } else {
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+    command
 }
 
 fn validate_root_owned_binary(path: &Path) -> Result<(), ServiceError> {

@@ -7,8 +7,9 @@ use nelomai_client_api::{
 use nelomai_client_core::{
     AllowRuntimeStart, ClientCore, ConnectOptions, ConnectionMetricsContext, CoreApi, CoreApiError,
     CoreError, CoreLocalStop, CoreLogger, CoreState, Phase, PhysicalNetworkPollOutcome,
-    RuntimeAuthProvider, RuntimeStartPreflight, SplitTunnelSyncOutcome, StalledDataPlaneRecovery,
-    StalledDataPlaneRecoveryOutcome, StartCancellationEpoch,
+    RuntimeAuthProvider, RuntimeStartPreflight, SavedSplitTunnelAddressRules,
+    SplitTunnelSyncOutcome, StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome,
+    StartCancellationEpoch,
 };
 use nelomai_client_storage::{MemorySplitTunnelStore, RuntimeStateStore, SplitTunnelStore};
 use nelomai_client_tunnel::TunnelController;
@@ -604,7 +605,7 @@ where
         &self,
         request: &SplitTunnelAddressRuleUpdate,
         now_unix: i64,
-    ) -> Result<SplitTunnelPolicy, ApplicationError> {
+    ) -> Result<SavedSplitTunnelAddressRules, ApplicationError> {
         Box::pin(self.core.add_split_tunnel_address_rule(request, now_unix))
             .await
             .map_err(Into::into)
@@ -615,7 +616,7 @@ where
         rule_id: i64,
         scope: SplitTunnelAddressRuleScope,
         now_unix: i64,
-    ) -> Result<SplitTunnelPolicy, ApplicationError> {
+    ) -> Result<SavedSplitTunnelAddressRules, ApplicationError> {
         Box::pin(
             self.core
                 .remove_split_tunnel_address_rule(rule_id, scope, now_unix),
@@ -653,6 +654,15 @@ where
         &self,
     ) -> Result<Option<SplitTunnelPolicy>, ApplicationError> {
         self.core.cached_split_tunnel_policy().map_err(Into::into)
+    }
+
+    pub async fn saved_split_tunnel_policy(
+        &self,
+    ) -> Result<Option<SplitTunnelPolicy>, ApplicationError> {
+        self.core
+            .saved_split_tunnel_policy()
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn split_tunnel_capabilities(

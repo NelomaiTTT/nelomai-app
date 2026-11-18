@@ -408,96 +408,57 @@ fn malformed_saved_boot_is_not_reboot_evidence() {
     assert_eq!(store(dir.path()).receipt(), Some(&receipt));
 }
 
+#[cfg(target_os = "macos")]
 #[test]
-fn live_attempt_no_child_closes_exact_receipt_and_allows_retry() {
-    use super::macos_launch::tests::{fake_command, LaunchCase};
-    for case in [LaunchCase::PrepareError, LaunchCase::SpawnError] {
-        let dir = directory();
-        let mut owner = store(dir.path());
-        let receipt = reboot_receipt();
-        assert!(owner
-            .launch_attempt(receipt.clone(), |r| {
-                assert_eq!(store(dir.path()).receipt(), Some(r)); // journal BEFORE effects
-                fake_command(case)
-            })
-            .unwrap()
-            .is_err());
-        assert!(!owner.cleanup_pending());
-        assert!(!store(dir.path()).cleanup_pending());
-        assert!(owner.stopping());
-        owner
-            .launch_attempt(receipt, |_| fake_command(LaunchCase::Success))
-            .unwrap()
-            .unwrap();
-        assert!(owner.interrupted_launch()); // success is NOT a capture
-    }
-}
-
-#[test]
-fn live_attempt_spawned_failures_and_recovery_never_grant_no_child_retirement() {
-    use super::macos_launch::tests::{fake_command, LaunchCase};
-    for case in [
-        LaunchCase::Nonzero,
-        LaunchCase::Timeout,
-        LaunchCase::WaitError,
-        LaunchCase::GuardianError,
-    ] {
-        let dir = directory();
-        let mut owner = store(dir.path());
-        let receipt = reboot_receipt();
-        assert!(owner
-            .launch_attempt(receipt.clone(), |_| fake_command(case))
-            .unwrap()
-            .is_err());
-        assert_eq!(owner.receipt(), Some(&receipt));
-        assert_eq!(store(dir.path()).receipt(), Some(&receipt));
-        assert!(owner
-            .launch_attempt::<(), std::io::Error>(receipt.clone(), |_| panic!("duplicate launch"))
-            .is_err());
-        assert!(store(dir.path())
-            .launch_attempt::<(), std::io::Error>(receipt, |_| panic!(
-                "crash recovery is not a fresh attempt"
-            ))
-            .is_err());
-    }
-}
-
-#[test]
-fn live_attempt_no_child_journal_failure_retains_authority() {
-    use super::macos_launch::tests::{fake_command, LaunchCase};
+fn managed_start_persists_each_phase_and_retires_only_a_managed_receipt() {
+    use super::macos_launch::ManagedUtun;
     let dir = directory();
     let mut owner = store(dir.path());
-    let receipt = reboot_receipt();
+    let mut receipt = reboot_receipt();
+    owner.begin(receipt.clone()).unwrap();
+    assert!(owner.retire_managed_launch().is_err());
+    assert_eq!(store(dir.path()).receipt(), Some(&receipt));
+    owner.retire_starting_after_boot(NEW_BOOT).unwrap();
+
+    let live = identity();
+    receipt.managed = Some(ManagedUtun {
+        name: live.interface,
+        index: live.index,
+        socket: None,
+    });
+    owner.begin(receipt.clone()).unwrap();
+    assert_eq!(store(dir.path()).receipt(), Some(&receipt));
+    owner.record_managed_listener(live.socket).unwrap();
+    receipt.managed.as_mut().unwrap().socket = Some(live.socket);
+    assert_eq!(store(dir.path()).receipt(), Some(&receipt));
+    assert!(owner.record_managed_listener(live.socket).is_err());
+
+    let mut recovered = store(dir.path());
+    assert!(recovered.ensure_fresh().is_err());
+    recovered.retire_managed_launch().unwrap();
+    assert!(!store(dir.path()).cleanup_pending());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn managed_retirement_write_failure_keeps_the_pending_record() {
+    use super::macos_launch::ManagedUtun;
+    let dir = directory();
+    let mut owner = store(dir.path());
+    let mut receipt = reboot_receipt();
+    let live = identity();
+    receipt.managed = Some(ManagedUtun {
+        name: live.interface,
+        index: live.index,
+        socket: Some(live.socket),
+    });
+    owner.begin(receipt.clone()).unwrap();
     let path = dir.path().join("redundant-member.json");
-    assert!(owner
-        .launch_attempt(receipt.clone(), |_| {
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-            fake_command(LaunchCase::SpawnError)
-        })
-        .is_err());
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(owner.retire_managed_launch().is_err());
     assert_eq!(owner.receipt(), Some(&receipt));
     assert!(owner.ensure_fresh().is_err());
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(store(dir.path()).receipt(), Some(&receipt));
-}
-
-#[test]
-fn live_attempt_no_child_rejects_replaced_durable_receipt() {
-    use super::macos_launch::tests::{fake_command, LaunchCase};
-    let dir = directory();
-    let mut owner = store(dir.path());
-    let receipt = reboot_receipt();
-    let mut replacement = receipt.clone();
-    replacement.boot = NEW_BOOT.into();
-    replacement.launch_nonce.replace_range(35..36, "2");
-    assert!(owner
-        .launch_attempt(receipt.clone(), |_| {
-            let mut other = store(dir.path());
-            other.retire_starting_after_boot(NEW_BOOT).unwrap();
-            other.begin(replacement.clone()).unwrap();
-            fake_command(LaunchCase::SpawnError)
-        })
-        .is_err());
-    assert_eq!(owner.receipt(), Some(&receipt));
-    assert_eq!(store(dir.path()).receipt(), Some(&replacement));
+    store(dir.path()).retire_managed_launch().unwrap();
+    assert!(!store(dir.path()).cleanup_pending());
 }

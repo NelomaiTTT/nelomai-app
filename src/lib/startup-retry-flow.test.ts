@@ -62,7 +62,7 @@ function fixture(bootstrap: () => Promise<unknown>) {
     localStopPendingCleanup: false, diagnosticsStatus: null, error: null, view: "unavailable",
     phase: "server_unavailable", pinnedStray: null, selectedLayer: "tic", ticConnectionMode: "personal",
     routeMode: "via_tak", connection: null, connectionIntentStatus: "none", nextRetryAtUnix: null,
-    connectionMetrics: null, reserveState: null, runtimeWarning: null, splitTunnelOpen: false,
+    connectionMetrics: null, reserveState: null, runtimeWarning: null, splitTunnelOpen: false, splitTunnelRequestId: 0, splitTunnelBusy: false,
     ownedConnectionIntentNotice: null, runtimeStatus: null, desktopActiveSlot: null,
     readDesktopActiveSlot: () => null, logoutRecoveryRequired: false,
     phaseLabels: { server_unavailable: "Сервер недоступен", error: "Ошибка" },

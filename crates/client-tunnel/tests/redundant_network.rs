@@ -1,5 +1,5 @@
-use nelomai_client_tunnel::redundancy::network::*;
 use nelomai_client_tunnel::redundancy::Slot;
+use nelomai_client_tunnel::redundancy::{driver::RouteRefreshError, network::*};
 use std::{collections::BTreeMap, io};
 
 #[derive(Default)]
@@ -10,10 +10,23 @@ struct System {
     fail_at: Vec<usize>,
     ignore_at: Vec<usize>,
     reject_interfaces: Vec<u32>,
+    foreign_on_failure: Option<NetworkValue>,
+    halt_after_write: Option<(usize, NetworkValue)>,
+    covered_address: Option<std::net::IpAddr>,
+    stage_global_routes: bool,
+    fail_delete_readback: bool,
+    reject_next_read: bool,
 }
 impl NetworkSystem for System {
+    fn observe_routes_on_close(&self) -> bool {
+        self.stage_global_routes
+    }
+
     fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
         self.reads.push(key.clone());
+        if std::mem::take(&mut self.reject_next_read) {
+            return Err(io::Error::other("native readback failed"));
+        }
         Ok(self.values.get(&format!("{key:?}")).cloned())
     }
     fn compare_exchange(
@@ -28,6 +41,9 @@ impl NetworkSystem for System {
             return Err(io::Error::other("interface vanished"));
         }
         if self.fail_at.contains(&self.writes) {
+            if let Some(foreign) = self.foreign_on_failure.take() {
+                self.values.insert(format!("{:?}", foreign.key()), foreign);
+            }
             return Err(io::Error::other("injected"));
         }
         if self.ignore_at.contains(&self.writes) {
@@ -41,6 +57,21 @@ impl NetworkSystem for System {
             self.values.insert(key, value.clone());
         } else {
             self.values.remove(&key);
+            self.reject_next_read = std::mem::take(&mut self.fail_delete_readback);
+        }
+        if let Some(address) = self.covered_address {
+            assert!(self.values.values().any(|value| {
+                matches!(value, NetworkValue::Route(route) if route.destination.contains(&address))
+            }), "native write lost VPN coverage for {address}");
+        }
+        if self
+            .halt_after_write
+            .as_ref()
+            .is_some_and(|(write, _)| *write == self.writes)
+        {
+            let (_, foreign) = self.halt_after_write.take().unwrap();
+            self.values.insert(format!("{:?}", foreign.key()), foreign);
+            panic!("injected interruption immediately after native write");
         }
         Ok(())
     }
@@ -51,11 +82,12 @@ struct Journal {
     fail: bool,
     saves: usize,
     lose_ack_at: Option<usize>,
+    reject_at: Option<usize>,
 }
 impl NetworkJournalStore for Journal {
     fn save(&mut self, value: &NetworkJournal) -> io::Result<()> {
         self.saves += 1;
-        if self.fail {
+        if self.fail || self.reject_at == Some(self.saves) {
             return Err(io::Error::other("disk"));
         }
         self.saved = Some(value.clone());
@@ -73,6 +105,184 @@ fn route(destination: &str, interface: u32) -> NetworkValue {
         gateway: None,
         metric: 1,
     })
+}
+
+#[test]
+fn mac_global_prefix_splits_and_merges_keep_coverage_through_every_write() {
+    let parent = route("203.0.113.0/24", 10);
+    let child = route("203.0.113.16/28", 10);
+    let mut owner = NetworkOwner::fresh(
+        System {
+            stage_global_routes: true,
+            ..Default::default()
+        },
+        Journal::default(),
+    );
+    owner.select(Slot::A, vec![parent.clone()]).unwrap();
+    owner.system_mut().covered_address = Some("203.0.113.17".parse().unwrap());
+
+    // Attach uses select; explicit refresh uses journaled native writes.
+    owner.select(Slot::A, vec![child.clone()]).unwrap();
+    owner
+        .select_with_outcome(Slot::A, vec![parent.clone()])
+        .unwrap();
+
+    // Refuse a later DNS/route update after staging the broader replacement,
+    // then check coverage after each compensating native mutation as well.
+    let fail_at = owner.system_mut().writes + 3;
+    owner.system_mut().fail_at.push(fail_at);
+    let dns = NetworkValue::Dns(DnsValue {
+        service: "Ethernet".into(),
+        servers: vec!["192.0.2.53".parse().unwrap()],
+    });
+    assert!(owner
+        .select_with_outcome(Slot::A, vec![child, dns])
+        .is_err());
+    assert_eq!(
+        owner.system_mut().read(&parent.key()).unwrap(),
+        Some(parent)
+    );
+    assert_eq!(owner.active(), Some(Slot::A));
+}
+
+#[test]
+fn staged_coverage_survives_unconfirmed_retirement_or_failed_restore() {
+    for fail_readback in [true, false] {
+        let parent = route("203.0.113.0/24", 10);
+        let child = route("203.0.113.16/28", 10);
+        let mut owner = NetworkOwner::fresh(
+            System {
+                stage_global_routes: true,
+                ..Default::default()
+            },
+            Journal::default(),
+        );
+        owner.select(Slot::A, vec![parent.clone()]).unwrap();
+        let native = owner.system_mut();
+        native.covered_address = Some("203.0.113.17".parse().unwrap());
+        native.fail_delete_readback = fail_readback;
+        if !fail_readback {
+            // The forward DNS update and the attempted route restore fail.
+            native.fail_at = vec![native.writes + 3, native.writes + 4];
+        }
+        let dns = NetworkValue::Dns(DnsValue {
+            service: "Ethernet".into(),
+            servers: vec!["192.0.2.53".parse().unwrap()],
+        });
+        assert!(owner
+            .select_with_outcome(Slot::A, vec![child.clone(), dns])
+            .is_err());
+        assert!(owner.cleanup_pending());
+        assert_eq!(
+            owner.system_mut().read(&child.key()).unwrap(),
+            Some(child.clone())
+        );
+
+        let (mut system, journal) = owner.into_parts();
+        system.covered_address = None; // Stop is now intentional.
+        let persisted = journal.saved.clone().unwrap();
+        let mut recovered = NetworkOwner::recover(system, journal, persisted).unwrap();
+        // macOS Stop first closes the owned interface and the kernel retires
+        // its routes. The network owner must never delete by a retired index.
+        recovered
+            .system_mut()
+            .values
+            .remove(&format!("{:?}", child.key()));
+        recovered.confirm_links_closed().unwrap();
+        recovered.cleanup().unwrap();
+        assert!(!recovered.cleanup_pending());
+        assert_eq!(recovered.system_mut().read(&child.key()).unwrap(), None);
+    }
+}
+
+#[test]
+fn linux_priority_transition_keeps_coverage_through_every_write() {
+    let main_route = |destination, interface| {
+        let NetworkValue::Route(mut value) = route(destination, interface) else {
+            unreachable!()
+        };
+        value.metric = 42 + interface;
+        value.scope = RouteScope::LinuxMainPriority(value.metric);
+        NetworkValue::Route(value)
+    };
+    let mut owner = NetworkOwner::fresh(System::default(), Journal::default());
+    owner
+        .select(Slot::A, vec![main_route("203.0.113.0/24", 10)])
+        .unwrap();
+    owner.system_mut().covered_address = Some("203.0.113.17".parse().unwrap());
+    owner
+        .select_with_outcome(Slot::A, vec![main_route("203.0.113.16/28", 10)])
+        .unwrap();
+    owner
+        .select_with_outcome(Slot::B, vec![main_route("203.0.113.16/28", 20)])
+        .unwrap();
+    owner
+        .select_with_outcome(Slot::B, vec![main_route("203.0.113.0/24", 20)])
+        .unwrap();
+}
+
+#[test]
+fn recovery_removes_confirmed_gateway_route_when_final_save_is_rejected() {
+    #[derive(Default)]
+    struct RejectCommit(Journal);
+    impl NetworkJournalStore for RejectCommit {
+        fn save(&mut self, value: &NetworkJournal) -> io::Result<()> {
+            let view = value.read_view()?;
+            if view.pending().is_none() && view.recorded_active().is_some() {
+                return Err(io::Error::other("rejected final save"));
+            }
+            self.0.save(value)
+        }
+    }
+
+    let mut bypass = route("192.0.2.1/32", 5);
+    if let NetworkValue::Route(route) = &mut bypass {
+        route.gateway = Some("198.51.100.1".parse().unwrap());
+    }
+    let mut owner = NetworkOwner::fresh(System::default(), RejectCommit::default());
+    assert!(owner
+        .select_with_outcome(Slot::A, vec![bypass.clone()])
+        .is_err());
+    let (system, store) = owner.into_parts();
+    let persisted = store.0.saved.clone().unwrap();
+    let mut recovered = NetworkOwner::recover(system, store, persisted).unwrap();
+    recovered.cleanup().unwrap();
+    assert_eq!(recovered.system_mut().read(&bypass.key()).unwrap(), None);
+}
+
+#[test]
+fn recover_rejects_an_intent_without_a_route() {
+    let mut journal = serde_json::to_value(NetworkJournal::default()).unwrap();
+    journal["route_intents"] = serde_json::json!([{"before": null, "after": null}]);
+    let journal = serde_json::from_value(journal).unwrap();
+    let result = NetworkOwner::recover(System::default(), Journal::default(), journal);
+    assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::InvalidData));
+}
+
+#[test]
+fn legacy_commit_save_failure_restores_original_routes() {
+    for acknowledgement_is_lost in [false, true] {
+        let old = route("192.0.2.1/32", 10);
+        let new = route("192.0.2.1/32", 20);
+        let mut owner = NetworkOwner::fresh(
+            System::default(),
+            Journal {
+                reject_at: (!acknowledgement_is_lost).then_some(4),
+                lose_ack_at: acknowledgement_is_lost.then_some(4),
+                ..Default::default()
+            },
+        );
+        owner.select(Slot::A, vec![old.clone()]).unwrap();
+        assert!(owner.select(Slot::B, vec![new]).is_err());
+        assert_eq!(owner.system_mut().read(&old.key()).unwrap(), Some(old));
+        assert_eq!(owner.active(), Some(Slot::A));
+        assert!(!owner.cleanup_pending());
+        let (_, store) = owner.into_parts();
+        assert_eq!(
+            store.saved.unwrap().read_view().unwrap().recorded_active(),
+            Some(Slot::A)
+        );
+    }
 }
 
 #[test]
@@ -662,7 +872,12 @@ impl NetworkSystem for GroupedSystem {
         if self.truncate {
             values.pop();
         }
-        if let Some(value) = self.replace_after_batch.take() {
+        if self
+            .replace_after_batch
+            .as_ref()
+            .is_some_and(|v| keys.contains(&v.key()))
+        {
+            let value = self.replace_after_batch.take().unwrap();
             self.inner
                 .values
                 .insert(format!("{:?}", value.key()), value);
@@ -694,6 +909,31 @@ fn grouped_owner_reads_only_preflight_and_reconciliation_together() {
     assert_eq!(owner.system_mut().batches[1].len(), 2);
     assert_eq!(owner.system_mut().inner.reads.len(), 2);
     assert_eq!(owner.system_mut().inner.writes, 2);
+}
+
+#[test]
+fn unix_recovery_checks_missing_tunnel_routes_in_one_snapshot_and_preserves_a_matching_row() {
+    let mut owner = NetworkOwner::fresh(GroupedSystem::default(), Journal::default());
+    let a = route("192.0.2.1/32", 10);
+    let b = route("192.0.2.2/32", 10);
+    owner.prepare(vec![a.clone(), b.clone()]).unwrap();
+    let (mut sys, store) = owner.into_parts();
+    let journal = store.saved.clone().unwrap().unix_recovery().unwrap();
+    sys.batches.clear();
+    sys.inner.reads.clear();
+    sys.inner.values.remove(&format!("{:?}", b.key()));
+    let mut recovered = NetworkOwner::recover(sys, store, journal).unwrap();
+    assert_eq!(
+        recovered.cleanup().unwrap_err().to_string(),
+        "network_route_ownership_unconfirmed"
+    );
+    let sys = recovered.system_mut();
+    assert!(sys.batches.iter().any(|keys| keys == &[a.key(), b.key()]));
+    assert!(sys.inner.reads.is_empty());
+    assert_eq!(sys.inner.writes, 2);
+    sys.inner.values.clear();
+    recovered.cleanup().unwrap();
+    assert!(!recovered.has_resources());
 }
 
 #[test]
@@ -740,4 +980,601 @@ fn grouped_read_default_preserves_order_and_missing_values() {
         vec![Some(b), None, Some(a)]
     );
     assert_eq!(system.reads, keys);
+}
+
+#[test]
+fn partial_live_refresh_does_not_roll_back_an_unattempted_foreign_route() {
+    let old = route("192.0.2.1/32", 10);
+    let next = route("198.51.100.1/32", 5);
+    let foreign = route("203.0.113.1/32", 5);
+    let mut owner = NetworkOwner::fresh(System::default(), Journal::default());
+    owner.select(Slot::A, vec![old.clone()]).unwrap();
+    owner.system_mut().fail_at.push(2);
+    owner.system_mut().foreign_on_failure = Some(foreign.clone());
+    assert!(owner
+        .select_with_outcome(Slot::A, vec![old.clone(), next.clone(), foreign.clone()])
+        .is_err());
+    assert_eq!(owner.system_mut().read(&old.key()).unwrap(), Some(old));
+    assert_eq!(owner.system_mut().read(&next.key()).unwrap(), None);
+    assert_eq!(
+        owner.system_mut().read(&foreign.key()).unwrap(),
+        Some(foreign.clone()),
+        "rollback removed a native route whose write was never attempted"
+    );
+    owner.cleanup().unwrap();
+    assert_eq!(
+        owner.system_mut().read(&foreign.key()).unwrap(),
+        Some(foreign)
+    );
+}
+
+#[test]
+fn interrupted_rollback_only_leaves_attempted_routes_for_recovery() {
+    let old = route("192.0.2.1/32", 10);
+    let applied = route("198.51.100.1/32", 5);
+    let failed = route("198.51.100.2/32", 5);
+    let foreign = route("203.0.113.1/32", 5);
+    let mut owner = NetworkOwner::fresh(System::default(), Journal::default());
+    owner.select(Slot::A, vec![old.clone()]).unwrap();
+    owner.system_mut().fail_at = vec![3, 4];
+    owner.system_mut().foreign_on_failure = Some(foreign.clone());
+    assert!(owner
+        .select_with_outcome(
+            Slot::A,
+            vec![old.clone(), applied.clone(), failed, foreign.clone()]
+        )
+        .is_err());
+    assert!(owner.cleanup_pending());
+    let (system, store) = owner.into_parts();
+    let persisted = store.saved.clone().unwrap();
+    let mut recovered = NetworkOwner::recover(system, store, persisted).unwrap();
+    assert_eq!(
+        recovered.cleanup().unwrap_err().to_string(),
+        "network_route_ownership_unconfirmed"
+    );
+    assert_eq!(recovered.system_mut().read(&old.key()).unwrap(), None);
+    assert_eq!(
+        recovered.system_mut().read(&applied.key()).unwrap(),
+        Some(applied.clone())
+    );
+    recovered
+        .system_mut()
+        .values
+        .remove(&format!("{:?}", applied.key()));
+    recovered.cleanup().unwrap();
+    assert_eq!(
+        recovered.system_mut().read(&foreign.key()).unwrap(),
+        Some(foreign)
+    );
+}
+
+#[test]
+fn live_rollback_reclaims_a_route_only_after_the_restore_returns() {
+    for interrupted in [false, true] {
+        let previous = route("192.0.2.1/32", 10);
+        let replacement = route("192.0.2.1/32", 20);
+        let failed = route("203.0.113.1/32", 5);
+        let mut owner = NetworkOwner::fresh(System::default(), Journal::default());
+        owner.select(Slot::A, vec![previous.clone()]).unwrap();
+        owner.system_mut().fail_at.push(3);
+        if interrupted {
+            owner.system_mut().halt_after_write = Some((4, previous.clone()));
+        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            owner.select_with_outcome(Slot::A, vec![replacement, failed])
+        }));
+        if interrupted {
+            assert!(outcome.is_err());
+        } else {
+            assert!(outcome.unwrap().is_err());
+            assert_eq!(owner.active(), Some(Slot::A));
+        }
+        let (system, journal) = owner.into_parts();
+        let persisted = journal.saved.clone().unwrap();
+        let mut recovered = NetworkOwner::recover(system, journal, persisted).unwrap();
+        if interrupted {
+            assert_eq!(
+                recovered.cleanup().unwrap_err().to_string(),
+                "network_route_ownership_unconfirmed"
+            );
+            assert_eq!(
+                recovered.system_mut().read(&previous.key()).unwrap(),
+                Some(previous)
+            );
+        } else {
+            recovered.cleanup().unwrap();
+            assert_eq!(recovered.system_mut().read(&previous.key()).unwrap(), None);
+        }
+    }
+}
+
+#[test]
+fn recovery_cleans_acknowledged_routes_and_fences_an_interrupted_add() {
+    let previous = route("192.0.2.1/32", 10);
+    let confirmed = route("198.51.100.1/32", 5);
+    let unconfirmed = route("198.51.100.2/32", 5);
+    let foreign = route("203.0.113.1/32", 5);
+    let mut owner = NetworkOwner::fresh(System::default(), Journal::default());
+    owner.select(Slot::A, vec![previous.clone()]).unwrap();
+    owner.system_mut().halt_after_write = Some((3, foreign.clone()));
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        owner.select_with_outcome(
+            Slot::A,
+            vec![
+                previous.clone(),
+                confirmed.clone(),
+                unconfirmed.clone(),
+                foreign.clone(),
+            ],
+        )
+    }))
+    .is_err());
+    let (system, journal) = owner.into_parts();
+    let persisted: NetworkJournal =
+        serde_json::from_slice(&serde_json::to_vec(journal.saved.as_ref().unwrap()).unwrap())
+            .unwrap();
+    let mut recovered = NetworkOwner::recover(system, journal, persisted).unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            recovered.cleanup().unwrap_err().to_string(),
+            "network_route_ownership_unconfirmed"
+        );
+        assert!(recovered.cleanup_pending());
+        assert_eq!(recovered.system_mut().read(&previous.key()).unwrap(), None);
+        assert_eq!(recovered.system_mut().read(&confirmed.key()).unwrap(), None);
+        assert_eq!(
+            recovered.system_mut().read(&unconfirmed.key()).unwrap(),
+            Some(unconfirmed.clone())
+        );
+        assert_eq!(
+            recovered.system_mut().read(&foreign.key()).unwrap(),
+            Some(foreign.clone())
+        );
+    }
+    let (mut system, journal) = recovered.into_parts();
+    system.values.remove(&format!("{:?}", unconfirmed.key()));
+    let persisted = journal.saved.clone().unwrap();
+    let mut recovered = NetworkOwner::recover(system, journal, persisted).unwrap();
+    recovered.cleanup().unwrap();
+    assert!(!recovered.cleanup_pending());
+    assert_eq!(
+        recovered.system_mut().read(&foreign.key()).unwrap(),
+        Some(foreign)
+    );
+}
+
+#[test]
+fn cas_preflight_collision_keeps_foreign_route_equal_to_target() {
+    let old = route("192.0.2.1/32", 10);
+    let foreign = route("203.0.113.1/32", 5);
+    let mut owner = NetworkOwner::fresh(GroupedSystem::default(), Journal::default());
+    owner.select(Slot::A, vec![old.clone()]).unwrap();
+
+    // Install after the new value is read in grouped preflight. The
+    // preflight re-read that compares before the CAS must reject this
+    // exact value without mutating native state.
+    owner.system_mut().replace_after_batch = Some(foreign.clone());
+    assert!(matches!(
+        owner.select_with_outcome(Slot::A, vec![old.clone(), foreign.clone()]),
+        Err(RouteRefreshError::Unchanged(_))
+    ));
+    assert_eq!(owner.active(), Some(Slot::A));
+    assert_eq!(
+        owner.system_mut().read(&foreign.key()).unwrap(),
+        Some(foreign),
+        "rollback deleted the native entry that made compare_exchange reject the write"
+    );
+}
+
+#[test]
+fn live_refresh_preserves_foreign_route_inserted_during_journal_save() {
+    assert_foreign_route_survives_live_journal_save(false);
+}
+
+#[test]
+fn recovery_preserves_foreign_route_inserted_before_native_write() {
+    assert_foreign_route_survives_live_journal_save(true);
+}
+
+fn assert_foreign_route_survives_live_journal_save(interrupt: bool) {
+    use std::{cell::RefCell, rc::Rc};
+
+    struct SharedSystem(Rc<RefCell<System>>);
+    impl NetworkSystem for SharedSystem {
+        fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
+            self.0.borrow_mut().read(key)
+        }
+        fn compare_exchange(
+            &mut self,
+            key: &ResourceKey,
+            before: Option<&NetworkValue>,
+            after: Option<&NetworkValue>,
+        ) -> io::Result<()> {
+            self.0.borrow_mut().compare_exchange(key, before, after)
+        }
+    }
+    struct InsertOnSave {
+        system: Rc<RefCell<System>>,
+        journal: Journal,
+        foreign: Option<NetworkValue>,
+        interrupt: bool,
+    }
+    impl NetworkJournalStore for InsertOnSave {
+        fn save(&mut self, journal: &NetworkJournal) -> io::Result<()> {
+            self.journal.save(journal)?;
+            if self.journal.saves == 4 {
+                let value = self.foreign.take().expect("foreign route fixture");
+                self.system
+                    .borrow_mut()
+                    .values
+                    .insert(format!("{:?}", value.key()), value);
+                if self.interrupt {
+                    panic!("interruption during the live route intent save");
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let system = Rc::new(RefCell::new(System::default()));
+    let original = route("192.0.2.1/32", 10);
+    let foreign = route("203.0.113.1/32", 5);
+    let store = InsertOnSave {
+        system: system.clone(),
+        journal: Journal::default(),
+        foreign: Some(foreign.clone()),
+        interrupt,
+    };
+    let mut owner = NetworkOwner::fresh(SharedSystem(system), store);
+    owner.select(Slot::A, vec![original.clone()]).unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        owner.select_with_outcome(Slot::A, vec![original, foreign.clone()])
+    }));
+    assert_eq!(
+        owner.system_mut().0.borrow().writes,
+        1,
+        "only setup may write"
+    );
+    if interrupt {
+        assert!(outcome.is_err());
+        let (system, store) = owner.into_parts();
+        let persisted = store.journal.saved.clone().unwrap();
+        owner = NetworkOwner::recover(system, store, persisted).unwrap();
+        assert_eq!(
+            owner.cleanup().unwrap_err().to_string(),
+            "network_route_ownership_unconfirmed"
+        );
+        assert!(owner.cleanup_pending());
+    } else {
+        assert!(outcome.unwrap().is_err());
+        owner.cleanup().unwrap();
+    }
+    assert_eq!(
+        owner.system_mut().read(&foreign.key()).unwrap(),
+        Some(foreign),
+        "cleanup must preserve the route installed by another process"
+    );
+}
+
+#[test]
+fn live_refresh_can_clean_up_after_final_journal_ack_loss() {
+    let old = route("192.0.2.1/32", 10);
+    let new = route("192.0.2.1/32", 20);
+    let mut owner = NetworkOwner::fresh(
+        System::default(),
+        Journal {
+            lose_ack_at: Some(5),
+            ..Default::default()
+        },
+    );
+    owner.select(Slot::A, vec![old.clone()]).unwrap();
+    owner.system_mut().halt_after_write = Some((3, old.clone()));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        owner.select_with_outcome(Slot::A, vec![new])
+    }));
+    assert!(outcome
+        .expect("ambiguous save must not start a rollback")
+        .is_err());
+    assert!(owner.cleanup_pending());
+    let (mut system, journal) = owner.into_parts();
+    system.halt_after_write = None;
+    let persisted = journal.saved.clone().unwrap();
+    let mut recovered = NetworkOwner::recover(system, journal, persisted).unwrap();
+    recovered
+        .cleanup()
+        .expect("recovery should recognize the owned route");
+    assert_eq!(recovered.system_mut().read(&old.key()).unwrap(), None);
+}
+
+struct ReinsertAfterNativeDelete {
+    inner: System,
+    foreign: Option<NetworkValue>,
+    interrupt: bool,
+    interrupt_at_readback: bool,
+}
+impl NetworkSystem for ReinsertAfterNativeDelete {
+    fn journal_each_write(&self) -> bool {
+        true
+    }
+
+    fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
+        if std::mem::take(&mut self.interrupt_at_readback) {
+            panic!("helper interrupted after successful delete, before persisting its result");
+        }
+        self.inner.read(key)
+    }
+
+    fn compare_exchange(
+        &mut self,
+        key: &ResourceKey,
+        before: Option<&NetworkValue>,
+        after: Option<&NetworkValue>,
+    ) -> io::Result<()> {
+        self.inner.compare_exchange(key, before, after)?;
+        if after.is_none()
+            && self
+                .foreign
+                .as_ref()
+                .is_some_and(|route| Some(route) == before)
+        {
+            let foreign = self.foreign.take().unwrap();
+            self.inner.values.insert(format!("{key:?}"), foreign);
+            self.interrupt_at_readback = self.interrupt;
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn forward_delete_ack_survives_interruption_before_readback() {
+    let old = route("192.0.2.1/32", 10);
+    let mut owner = NetworkOwner::fresh(
+        ReinsertAfterNativeDelete {
+            inner: System::default(),
+            foreign: Some(old.clone()),
+            interrupt: true,
+            interrupt_at_readback: false,
+        },
+        Journal::default(),
+    );
+    owner.select(Slot::A, vec![old.clone()]).unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        owner.select_with_outcome(Slot::A, Vec::new())
+    }));
+    assert!(result.is_err());
+    assert_eq!(owner.system_mut().inner.writes, 2);
+    assert!(owner.system_mut().foreign.is_none());
+
+    let (system, store) = owner.into_parts();
+    let persisted =
+        serde_json::from_slice(&serde_json::to_vec(store.saved.as_ref().unwrap()).unwrap())
+            .unwrap();
+    let mut recovered = NetworkOwner::recover(system, store, persisted).unwrap();
+    assert!(recovered.cleanup_pending());
+    assert_eq!(
+        recovered.cleanup().unwrap_err().to_string(),
+        "network_route_ownership_unconfirmed"
+    );
+    assert_eq!(
+        recovered.system_mut().read(&old.key()).unwrap(),
+        Some(old),
+        "recovery deleted the foreign route using pre-delete durable ownership"
+    );
+}
+
+#[test]
+fn stop_preserves_reinserted_route_after_compensating_delete() {
+    let old = route("192.0.2.1/32", 10);
+    let replacement = route("198.51.100.1/32", 5);
+    let failed = route("203.0.113.1/32", 5);
+    let mut owner = NetworkOwner::fresh(
+        ReinsertAfterNativeDelete {
+            inner: System {
+                fail_at: vec![3],
+                ..Default::default()
+            },
+            foreign: Some(replacement.clone()),
+            interrupt: false,
+            interrupt_at_readback: false,
+        },
+        Journal::default(),
+    );
+    owner.select(Slot::A, vec![old.clone()]).unwrap();
+    assert!(owner
+        .select_with_outcome(Slot::A, vec![old, replacement.clone(), failed])
+        .is_err());
+    assert_eq!(owner.system_mut().inner.writes, 4);
+    assert!(owner.system_mut().foreign.is_none());
+    assert_eq!(
+        owner.cleanup().unwrap_err().to_string(),
+        "network_route_ownership_unconfirmed"
+    );
+    assert_eq!(
+        owner.system_mut().read(&replacement.key()).unwrap(),
+        Some(replacement),
+        "Stop deleted the foreign replacement after the acknowledged compensating delete"
+    );
+}
+
+#[test]
+fn repeated_guarded_stop_preserves_a_reinserted_route_and_cleans_the_rest() {
+    let first = route("192.0.2.1/32", 10);
+    let foreign = route("192.0.2.2/32", 10);
+    let last = route("192.0.2.3/32", 10);
+    let mut owner = NetworkOwner::fresh(
+        ReinsertAfterNativeDelete {
+            inner: System::default(),
+            foreign: Some(foreign.clone()),
+            interrupt: false,
+            interrupt_at_readback: false,
+        },
+        Journal::default(),
+    );
+    owner
+        .select(Slot::A, vec![first.clone(), foreign.clone(), last.clone()])
+        .unwrap();
+    assert_eq!(
+        owner.cleanup().unwrap_err().to_string(),
+        "network_change_not_applied"
+    );
+    let (system, store) = owner.into_parts();
+    let persisted = store.saved.clone().unwrap();
+    let mut recovered = NetworkOwner::recover(system, store, persisted).unwrap();
+    assert_eq!(
+        recovered.cleanup().unwrap_err().to_string(),
+        "network_route_ownership_unconfirmed"
+    );
+    assert_eq!(recovered.system_mut().read(&first.key()).unwrap(), None);
+    assert_eq!(recovered.system_mut().read(&last.key()).unwrap(), None);
+    assert_eq!(
+        recovered.system_mut().read(&foreign.key()).unwrap(),
+        Some(foreign.clone())
+    );
+    assert_eq!(
+        recovered.system_mut().inner.writes,
+        6,
+        "Stop must not reinstall previously deleted routes"
+    );
+    recovered
+        .system_mut()
+        .inner
+        .values
+        .remove(&format!("{:?}", foreign.key()));
+    recovered.cleanup().unwrap();
+    assert!(!recovered.has_resources());
+}
+
+#[test]
+fn interrupted_replacement_protects_either_exact_row_and_cleans_independent_routes() {
+    let before = route("192.0.2.1/32", 10);
+    let after = route("192.0.2.1/32", 20);
+    let independent = route("198.51.100.1/32", 5);
+    for possible in [before.clone(), after.clone()] {
+        let mut owner = NetworkOwner::fresh(System::default(), Journal::default());
+        owner
+            .select(Slot::A, vec![before.clone(), independent.clone()])
+            .unwrap();
+        owner.system_mut().halt_after_write = Some((3, possible.clone()));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            owner.select_with_outcome(Slot::A, vec![after.clone(), independent.clone()])
+        }))
+        .is_err());
+        let (system, store) = owner.into_parts();
+        let persisted =
+            serde_json::from_slice(&serde_json::to_vec(store.saved.as_ref().unwrap()).unwrap())
+                .unwrap();
+        let mut recovered = NetworkOwner::recover(system, store, persisted).unwrap();
+        assert_eq!(
+            recovered.cleanup().unwrap_err().to_string(),
+            "network_route_ownership_unconfirmed"
+        );
+        assert_eq!(
+            recovered.system_mut().read(&independent.key()).unwrap(),
+            None
+        );
+        assert_eq!(
+            recovered.system_mut().read(&possible.key()).unwrap(),
+            Some(possible)
+        );
+    }
+}
+
+fn gateway_routes(count: usize) -> Vec<NetworkValue> {
+    (0..count)
+        .map(|i| {
+            NetworkValue::Route(RouteValue {
+                destination: format!("10.56.{}.{}/32", i / 256, i % 256).parse().unwrap(),
+                scope: RouteScope::Global,
+                gateway: Some("192.0.2.254".parse().unwrap()),
+                interface: 5,
+                metric: 1,
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn large_route_apply_and_stop_use_bounded_journal_batches() {
+    let routes = gateway_routes(512);
+    let mut owner = NetworkOwner::fresh(
+        ReinsertAfterNativeDelete {
+            inner: System::default(),
+            foreign: None,
+            interrupt: false,
+            interrupt_at_readback: false,
+        },
+        Journal::default(),
+    );
+    owner.select(Slot::A, routes.clone()).unwrap();
+    assert_eq!(owner.system_mut().inner.writes, 512);
+    assert_eq!(owner.system_mut().inner.values.len(), 512);
+    owner.cleanup().unwrap();
+    assert_eq!(owner.system_mut().inner.writes, 1024);
+    assert!(owner.system_mut().inner.values.is_empty());
+    let (_, journal) = owner.into_parts();
+    assert!(
+        journal.saves < 100,
+        "{} saves for a 512-route add and remove",
+        journal.saves
+    );
+}
+
+#[test]
+fn large_failed_refresh_leaves_an_unattempted_foreign_gateway_route_untouched() {
+    let routes = gateway_routes(512);
+    let foreign = routes[272].clone();
+    let system = System {
+        fail_at: vec![260],
+        foreign_on_failure: Some(foreign.clone()),
+        ..Default::default()
+    };
+    let mut owner = NetworkOwner::fresh(system, Journal::default());
+    assert!(owner.select_with_outcome(Slot::A, routes).is_err());
+    owner.cleanup().unwrap();
+    assert_eq!(owner.system_mut().values.len(), 1);
+    assert_eq!(
+        owner.system_mut().read(&foreign.key()).unwrap(),
+        Some(foreign)
+    );
+    let (_, journal) = owner.into_parts();
+    assert!(
+        journal.saves < 100,
+        "{} writes for an interrupted 512-route transaction",
+        journal.saves
+    );
+}
+
+#[test]
+fn interrupted_route_batch_never_claims_an_unattempted_foreign_gateway_route() {
+    let routes = gateway_routes(512);
+    let foreign = routes[265].clone();
+    let system = System {
+        halt_after_write: Some((260, foreign.clone())),
+        ..Default::default()
+    };
+    let mut owner = NetworkOwner::fresh(system, Journal::default());
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        owner.select_with_outcome(Slot::A, routes.clone())
+    }))
+    .is_err());
+    let (system, store) = owner.into_parts();
+    let saved = store.saved.clone().unwrap();
+    let mut owner = NetworkOwner::recover(system, store, saved).unwrap();
+    assert_eq!(
+        owner.cleanup().unwrap_err().to_string(),
+        "network_route_ownership_unconfirmed"
+    );
+    assert_eq!(owner.system_mut().read(&routes[0].key()).unwrap(), None);
+    assert_eq!(
+        owner.system_mut().read(&foreign.key()).unwrap(),
+        Some(foreign.clone())
+    );
+    assert_eq!(
+        owner.cleanup().unwrap_err().to_string(),
+        "network_route_ownership_unconfirmed"
+    );
+    assert_eq!(
+        owner.system_mut().read(&foreign.key()).unwrap(),
+        Some(foreign)
+    );
 }

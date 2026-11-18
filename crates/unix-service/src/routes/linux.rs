@@ -1,25 +1,27 @@
 use super::{OwnedRoute, RouteBackend, RouteScope};
 use crate::process::{output_with_timeout, COMMAND_TIMEOUT};
 use crate::ServiceError;
+#[cfg(target_os = "linux")]
 use defguard_wireguard_rs::peer::Peer;
 use ipnet::{IpNet, Ipv4Net};
+use nelomai_client_tunnel::redundancy::route_plan::tunnel_destinations_preserving;
+#[cfg(target_os = "linux")]
+use nelomai_client_tunnel::{DesktopTunnelOptions, Ipv4RoutePlan};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::fs;
+use std::net::IpAddr;
+
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const ROUTE_METRIC: u32 = 42_760;
 const AWG_ROUTE_STATE_FILE: &str = "awg-routes-state.json";
 const AWG_ROUTE_STATE_FORMAT: u16 = 1;
 const AWG_ROUTE_STATE_MAX_SIZE: u64 = 64 * 1024;
 const AWG_FWMARK_TABLE: u32 = 42_761;
 const AWG_MAIN_RULE_PRIORITY: u32 = 31_120;
 const AWG_TUNNEL_RULE_PRIORITY: u32 = 31_121;
-
-pub(crate) const AWG_FWMARK: u32 = AWG_FWMARK_TABLE;
 
 #[derive(Clone)]
 pub(crate) struct LinuxEgress {
@@ -76,28 +78,13 @@ struct UserspaceRouteState {
     routes: Vec<UserspaceRoute>,
 }
 
-impl UserspaceRouteState {
-    fn empty(interface_name: &str) -> Self {
-        Self {
-            format_version: AWG_ROUTE_STATE_FORMAT,
-            interface_name: interface_name.to_string(),
-            default_families: Vec::new(),
-            routes: Vec::new(),
-        }
-    }
-
-    fn active(&self) -> bool {
-        !self.default_families.is_empty() || !self.routes.is_empty()
-    }
-}
-
-pub(crate) struct LinuxUserspaceRouteManager {
+pub(crate) struct LinuxOrdinaryRoutes {
     ip: PathBuf,
     state_path: PathBuf,
     state: Option<UserspaceRouteState>,
 }
 
-impl LinuxUserspaceRouteManager {
+impl LinuxOrdinaryRoutes {
     pub(crate) fn new(runtime_directory: impl AsRef<Path>) -> Result<Self, ServiceError> {
         let state_path = runtime_directory.as_ref().join(AWG_ROUTE_STATE_FILE);
         let state = load_userspace_route_state(&state_path)?;
@@ -108,41 +95,14 @@ impl LinuxUserspaceRouteManager {
         })
     }
 
-    pub(crate) fn apply(
-        &mut self,
-        interface_name: &str,
-        peers: &[Peer],
-    ) -> Result<(), ServiceError> {
-        self.cleanup()?;
-        let state = userspace_route_plan(interface_name, peers);
-        if !state.active() {
-            return Ok(());
-        }
-        self.ensure_targets_available(&state)?;
-        persist_userspace_route_state(&self.state_path, &state)?;
-        self.state = Some(state.clone());
-
-        if state.default_families.contains(&RouteFamily::Ipv4)
-            && fs::write("/proc/sys/net/ipv4/conf/all/src_valid_mark", b"1").is_err()
-        {
-            let _ = self.cleanup();
-            return Err(ServiceError::Backend("route_command_failed".to_string()));
-        }
-        let result = self.apply_state(&state);
-        if let Err(error) = result {
-            let _ = self.cleanup();
-            return Err(error);
-        }
-        Ok(())
-    }
-
+    /// Old AWG journals were written before route/rule creation. Even an
+    /// exact live value could have been installed independently after a crash.
     pub(crate) fn cleanup(&mut self) -> Result<(), ServiceError> {
-        let Some(state) = self.state.clone() else {
+        let Some(state) = &self.state else {
             return Ok(());
         };
-        let mut first_error = None;
-        for route in state.routes.iter().rev() {
-            let query = query_ip(
+        for route in &state.routes {
+            let text = query_ip(
                 &self.ip,
                 &[
                     route.family.ip_argument(),
@@ -151,125 +111,20 @@ impl LinuxUserspaceRouteManager {
                     "exact",
                     &route.destination,
                 ],
-            );
-            let owned = match query {
-                Ok(output) => output.lines().any(|line| {
-                    let tokens = line.split_whitespace().collect::<Vec<_>>();
-                    value_after(&tokens, "dev") == Some(state.interface_name.as_str())
-                        && value_after(&tokens, "proto") == Some("static")
-                }),
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                    continue;
-                }
-            };
-            if !owned {
-                continue;
-            }
-            let arguments = vec![
-                route.family.ip_argument().to_string(),
-                "route".to_string(),
-                "del".to_string(),
-                route.destination.clone(),
-                "dev".to_string(),
-                state.interface_name.clone(),
-                "proto".to_string(),
-                "static".to_string(),
-            ];
-            if let Err(error) = mutate_ip(&self.ip, &arguments, true, "route_del_failed") {
-                first_error.get_or_insert(error);
-            }
-        }
-        for family in state.default_families.iter().rev() {
-            for priority in [AWG_TUNNEL_RULE_PRIORITY, AWG_MAIN_RULE_PRIORITY] {
-                let query = query_ip(
-                    &self.ip,
-                    &[
-                        family.ip_argument(),
-                        "rule",
-                        "show",
-                        "priority",
-                        &priority.to_string(),
-                    ],
-                );
-                let owned = match query {
-                    Ok(output) => userspace_rule_is_owned(&output, priority),
-                    Err(error) => {
-                        first_error.get_or_insert(error);
-                        continue;
-                    }
-                };
-                if !owned {
-                    continue;
-                }
-                let arguments = userspace_rule_arguments(*family, "del", priority);
-                if let Err(error) = mutate_ip(&self.ip, &arguments, true, "route_del_failed") {
-                    first_error.get_or_insert(error);
-                }
-            }
-            let query = query_ip(
-                &self.ip,
-                &[
-                    family.ip_argument(),
-                    "route",
-                    "show",
-                    "table",
-                    &AWG_FWMARK_TABLE.to_string(),
-                ],
-            );
-            let owned = match query {
-                Ok(output) => output.lines().any(|line| {
-                    let tokens = line.split_whitespace().collect::<Vec<_>>();
-                    tokens.first() == Some(&"default")
-                        && value_after(&tokens, "dev") == Some(state.interface_name.as_str())
-                }),
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                    continue;
-                }
-            };
-            if !owned {
-                continue;
-            }
-            let arguments = vec![
-                family.ip_argument().to_string(),
-                "route".to_string(),
-                "del".to_string(),
-                "default".to_string(),
-                "dev".to_string(),
-                state.interface_name.clone(),
-                "table".to_string(),
-                AWG_FWMARK_TABLE.to_string(),
-            ];
-            if let Err(error) = mutate_ip(&self.ip, &arguments, true, "route_del_failed") {
-                first_error.get_or_insert(error);
-            }
-        }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        remove_userspace_route_state(&self.state_path)?;
-        self.state = None;
-        Ok(())
-    }
-
-    pub(crate) fn has_routes(&self) -> bool {
-        self.state.as_ref().is_some_and(UserspaceRouteState::active)
-    }
-
-    fn ensure_targets_available(&self, state: &UserspaceRouteState) -> Result<(), ServiceError> {
-        for family in &state.default_families {
-            let rules = query_ip(&self.ip, &[family.ip_argument(), "rule", "show"])?;
-            let expected_table = AWG_FWMARK_TABLE.to_string();
-            if rules.lines().any(|line| {
-                let tokens = line.split_whitespace().collect::<Vec<_>>();
-                value_after(&tokens, "lookup") == Some(expected_table.as_str())
-                    || value_after(&tokens, "table") == Some(expected_table.as_str())
+            )?;
+            if text.lines().any(|line| {
+                let tokens: Vec<_> = line.split_whitespace().collect();
+                value_after(&tokens, "dev") == Some(&state.interface_name)
+                    && value_after(&tokens, "proto") == Some("static")
             }) {
-                return Err(ServiceError::Backend("route_conflict".to_string()));
+                return Err(ServiceError::Backend(
+                    "legacy_route_ownership_unconfirmed".into(),
+                ));
             }
+        }
+        for family in &state.default_families {
             for priority in [AWG_MAIN_RULE_PRIORITY, AWG_TUNNEL_RULE_PRIORITY] {
-                ensure_ip_query_empty(
+                let output = query_ip(
                     &self.ip,
                     &[
                         family.ip_argument(),
@@ -279,8 +134,13 @@ impl LinuxUserspaceRouteManager {
                         &priority.to_string(),
                     ],
                 )?;
+                if userspace_rule_is_owned(&output, priority) {
+                    return Err(ServiceError::Backend(
+                        "legacy_route_ownership_unconfirmed".into(),
+                    ));
+                }
             }
-            ensure_ip_query_empty(
+            let output = query_ip(
                 &self.ip,
                 &[
                     family.ip_argument(),
@@ -290,153 +150,418 @@ impl LinuxUserspaceRouteManager {
                     &AWG_FWMARK_TABLE.to_string(),
                 ],
             )?;
+            if output.lines().any(|line| {
+                let tokens: Vec<_> = line.split_whitespace().collect();
+                tokens.first() == Some(&"default")
+                    && value_after(&tokens, "dev") == Some(&state.interface_name)
+            }) {
+                return Err(ServiceError::Backend(
+                    "legacy_route_ownership_unconfirmed".into(),
+                ));
+            }
         }
-        for route in &state.routes {
-            ensure_ip_query_empty(
-                &self.ip,
-                &[
-                    route.family.ip_argument(),
-                    "route",
-                    "show",
-                    "exact",
-                    &route.destination,
-                ],
-            )?;
-        }
+        remove_userspace_route_state(&self.state_path)?;
+        self.state = None;
         Ok(())
     }
 
-    fn apply_state(&self, state: &UserspaceRouteState) -> Result<(), ServiceError> {
-        // The userspace AWG launcher creates a DOWN TUN device; configuring
-        // addresses/MTU through defguard does not activate it for routing.
-        mutate_ip(
-            &self.ip,
-            &[
-                "link".to_string(),
-                "set".to_string(),
-                "dev".to_string(),
-                state.interface_name.clone(),
-                "up".to_string(),
-            ],
-            false,
-            "interface_up_failed",
-        )?;
-        for route in &state.routes {
-            mutate_ip(
-                &self.ip,
-                &[
-                    route.family.ip_argument().to_string(),
-                    "route".to_string(),
-                    "add".to_string(),
-                    route.destination.clone(),
-                    "dev".to_string(),
-                    state.interface_name.clone(),
-                    "proto".to_string(),
-                    "static".to_string(),
-                ],
-                false,
-                "route_add_failed",
-            )?;
-        }
-        for family in &state.default_families {
-            mutate_ip(
-                &self.ip,
-                &[
-                    family.ip_argument().to_string(),
-                    "route".to_string(),
-                    "add".to_string(),
-                    "default".to_string(),
-                    "dev".to_string(),
-                    state.interface_name.clone(),
-                    "table".to_string(),
-                    AWG_FWMARK_TABLE.to_string(),
-                ],
-                false,
-                "route_add_failed",
-            )?;
-            mutate_ip(
-                &self.ip,
-                &userspace_rule_arguments(*family, "add", AWG_MAIN_RULE_PRIORITY),
-                false,
-                "route_add_failed",
-            )?;
-            mutate_ip(
-                &self.ip,
-                &userspace_rule_arguments(*family, "add", AWG_TUNNEL_RULE_PRIORITY),
-                false,
-                "route_add_failed",
-            )?;
-        }
-        Ok(())
+    pub(crate) fn has_routes(&self) -> bool {
+        self.state.is_some()
     }
-}
 
-fn userspace_rule_arguments(family: RouteFamily, action: &str, priority: u32) -> Vec<String> {
-    let mut arguments = vec![
-        family.ip_argument().to_string(),
-        "rule".to_string(),
-        action.to_string(),
-    ];
-    match priority {
-        AWG_MAIN_RULE_PRIORITY => arguments.extend([
-            "table".to_string(),
-            "main".to_string(),
-            "suppress_prefixlength".to_string(),
-            "0".to_string(),
-        ]),
-        AWG_TUNNEL_RULE_PRIORITY => arguments.extend([
-            "not".to_string(),
-            "fwmark".to_string(),
-            AWG_FWMARK_TABLE.to_string(),
-            "table".to_string(),
-            AWG_FWMARK_TABLE.to_string(),
-        ]),
-        _ => unreachable!("only owned AWG policy rule priorities are used"),
-    }
-    arguments.extend(["priority".to_string(), priority.to_string()]);
-    arguments
-}
-
-fn userspace_route_plan(interface_name: &str, peers: &[Peer]) -> UserspaceRouteState {
-    let mut state = UserspaceRouteState::empty(interface_name);
-    let mut defaults = HashSet::new();
-    let mut routes = HashSet::new();
-    for allowed_ip in peers.iter().flat_map(|peer| &peer.allowed_ips) {
-        let family = if allowed_ip.address.is_ipv4() {
-            RouteFamily::Ipv4
-        } else {
-            RouteFamily::Ipv6
+    #[cfg(target_os = "linux")]
+    pub(crate) fn apply(
+        &self,
+        index: u32,
+        interface: &str,
+        peers: &[Peer],
+        options: &DesktopTunnelOptions,
+    ) -> Result<(), ServiceError> {
+        let policy = Ipv4RoutePlan::from_options(options)
+            .map_err(|error| ServiceError::Backend(error.stable_code().into()))?;
+        let endpoints: HashSet<_> = peers
+            .iter()
+            .map(|peer| {
+                peer.endpoint
+                    .map(|a| a.ip())
+                    .ok_or(ServiceError::InvalidConfiguration)
+            })
+            .collect::<Result<_, _>>()?;
+        let mut holes: Vec<_> = policy
+            .excluded_networks
+            .into_iter()
+            .map(IpNet::V4)
+            .collect();
+        holes.extend(endpoints.iter().copied().map(IpNet::from));
+        let allowed = peers
+            .iter()
+            .flat_map(|peer| &peer.allowed_ips)
+            .map(|net| {
+                IpNet::new(net.address, net.cidr)
+                    .map(|net| net.trunc())
+                    .map_err(|_| ServiceError::InvalidConfiguration)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut network = crate::member_network::linux::LinuxNetwork::new(
+            crate::member_network::linux::NativeLinuxCommands::new()
+                .map_err(|_| invalid_table())?,
+            [],
+        )
+        .map_err(|_| invalid_table())?;
+        let mut read_routes = || -> Result<(Vec<MainRoute>, HashSet<String>), ServiceError> {
+            let local_interfaces = if policy.exclude_local_networks {
+                network
+                    .physical_links()
+                    .map_err(|_| invalid_table())?
+                    .into_keys()
+                    .collect()
+            } else {
+                HashSet::new()
+            };
+            let mut routes = Vec::new();
+            for family in [RouteFamily::Ipv4, RouteFamily::Ipv6] {
+                if !allowed
+                    .iter()
+                    .any(|net| net.addr().is_ipv4() == (family == RouteFamily::Ipv4))
+                {
+                    continue;
+                }
+                // A higher-priority policy table could defeat all of our data
+                // routes while the main-table readback still looks correct.
+                network
+                    .verify_main_rules(family == RouteFamily::Ipv6)
+                    .map_err(|_| invalid_table())?;
+                let rows = query_ip(
+                    &self.ip,
+                    &["-j", family.ip_argument(), "route", "show", "table", "main"],
+                )?;
+                routes.extend(parse_main_routes(&rows, family)?);
+            }
+            Ok((routes, local_interfaces))
         };
-        if allowed_ip.address.is_unspecified() && allowed_ip.cidr == 0 {
-            defaults.insert(family);
-        } else {
-            routes.insert((family, allowed_ip.to_string()));
+        let (main, local_interfaces) = read_routes()?;
+        let destinations =
+            ordinary_destinations(&allowed, &holes, &main, interface, &local_interfaces)?;
+        let egress = |endpoint: &IpAddr| -> Result<(String, Option<IpAddr>), ServiceError> {
+            let family = if endpoint.is_ipv4() { "-4" } else { "-6" };
+            let text = query_ip(
+                &self.ip,
+                &["-j", family, "route", "get", &endpoint.to_string()],
+            )?;
+            let rows: Vec<serde_json::Value> =
+                serde_json::from_str(&text).map_err(|_| invalid_table())?;
+            let [row] = rows.as_slice() else {
+                return Err(invalid_table());
+            };
+            let name = row["dev"]
+                .as_str()
+                .filter(|s| !s.is_empty() && *s != interface)
+                .ok_or_else(invalid_table)?;
+            let gateway = row
+                .get("gateway")
+                .map(|v| {
+                    v.as_str()
+                        .and_then(|ip| ip.parse().ok())
+                        .ok_or_else(invalid_table)
+                })
+                .transpose()?;
+            Ok((name.into(), gateway))
+        };
+        let paths: Vec<_> = endpoints
+            .iter()
+            .map(|ip| egress(ip).map(|path| (ip, path)))
+            .collect::<Result<_, _>>()?;
+        let mut socket = native::RoutingSocket::new()?;
+        for &destination in &destinations {
+            socket.add(index, destination)?;
         }
+        // A foreign route with another metric can coexist even after an
+        // exclusive netlink add. Verify the whole plan in two family dumps.
+        let expected: HashSet<_> = destinations.iter().copied().collect();
+        let mut confirmed = HashSet::new();
+        let mut others = Vec::new();
+        let (current_main, local_interfaces) = read_routes()?;
+        for row in current_main {
+            if expected.contains(&row.net) {
+                if row.device.as_deref() != Some(interface)
+                    || !row.static_direct
+                    || !confirmed.insert(row.net)
+                {
+                    return Err(route_conflict());
+                }
+            } else {
+                others.push(row);
+            }
+        }
+        if confirmed != expected
+            || ordinary_destinations(&allowed, &holes, &others, interface, &local_interfaces)?
+                != destinations
+        {
+            return Err(route_conflict());
+        }
+        for (ip, path) in paths {
+            if egress(ip)? != path {
+                return Err(ServiceError::Backend(
+                    "ordinary_endpoint_route_changed".into(),
+                ));
+            }
+        }
+        Ok(())
     }
-    state.default_families = defaults.into_iter().collect();
-    state.default_families.sort_by_key(|family| match family {
-        RouteFamily::Ipv4 => 4,
-        RouteFamily::Ipv6 => 6,
-    });
-    state.routes = routes
-        .into_iter()
-        .filter(|(family, _)| !state.default_families.contains(family))
-        .map(|(family, destination)| UserspaceRoute {
-            family,
-            destination,
-        })
-        .collect();
-    state
-        .routes
-        .sort_by(|left, right| left.destination.cmp(&right.destination));
-    state
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn create_wireguard_link(name: &str, group: u32) -> Result<(), ServiceError> {
+        native::RoutingSocket::new()?.create_wireguard_link(name, group)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_link_group(index: u32, group: u32) -> Result<(), ServiceError> {
+        native::RoutingSocket::new()?.set_link_group(index, group)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn delete_link(index: u32) -> Result<(), ServiceError> {
+        native::RoutingSocket::new()?.delete_link(index)
+    }
 }
 
-fn ensure_ip_query_empty(ip: &Path, arguments: &[&str]) -> Result<(), ServiceError> {
-    if query_ip(ip, arguments)?.trim().is_empty() {
-        Ok(())
-    } else {
-        Err(ServiceError::Backend("route_conflict".to_string()))
+fn invalid_table() -> ServiceError {
+    ServiceError::Backend("route_table_unavailable".into())
+}
+
+fn route_conflict() -> ServiceError {
+    ServiceError::Backend("route_conflict".into())
+}
+
+struct MainRoute {
+    net: IpNet,
+    device: Option<String>,
+    connected: bool,
+    static_direct: bool,
+}
+
+fn parse_main_routes(text: &str, family: RouteFamily) -> Result<Vec<MainRoute>, ServiceError> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(text).map_err(|_| invalid_table())?;
+    let mut routes = Vec::new();
+    for row in rows {
+        let dst = row["dst"].as_str().ok_or_else(invalid_table)?;
+        if dst == "default" {
+            continue;
+        }
+        let net = dst
+            .parse::<IpNet>()
+            .or_else(|_| dst.parse::<IpAddr>().map(IpNet::from))
+            .map_err(|_| invalid_table())?;
+        if net.addr().is_ipv4() != (family == RouteFamily::Ipv4) || net.trunc() != net {
+            return Err(invalid_table());
+        }
+        let direct = row.get("gateway").is_none()
+            && row.get("via").is_none()
+            && row.get("nexthops").is_none();
+        routes.push(MainRoute {
+            net,
+            device: row["dev"].as_str().map(str::to_owned),
+            connected: direct && (row["scope"] == "link" || row["protocol"] == "kernel"),
+            static_direct: direct && row["protocol"] == "static",
+        });
+    }
+    Ok(routes)
+}
+
+fn ordinary_destinations(
+    allowed: &[IpNet],
+    excluded: &[IpNet],
+    routes: &[MainRoute],
+    interface: &str,
+    local_interfaces: &HashSet<String>,
+) -> Result<Vec<IpNet>, ServiceError> {
+    let mut holes = excluded.to_vec();
+    let mut tunnel_connected = Vec::new();
+    let full4 = allowed
+        .iter()
+        .any(|n| n.addr().is_ipv4() && n.prefix_len() == 0);
+    let full6 = allowed
+        .iter()
+        .any(|n| n.addr().is_ipv6() && n.prefix_len() == 0);
+    for row in routes {
+        if row.device.as_deref() == Some(interface) {
+            tunnel_connected.push(row.net);
+        } else if (row.net.prefix_len() == 1
+            && if row.net.addr().is_ipv4() {
+                full4
+            } else {
+                full6
+            })
+            || (row.connected
+                && row
+                    .device
+                    .as_ref()
+                    .is_some_and(|name| local_interfaces.contains(name)))
+        {
+            holes.push(row.net);
+        }
+    }
+    // Interface address assignment itself can create a connected tunnel
+    // route. An overlap with a physical exclusion cannot be fixed by omitting
+    // a data route; abort and let teardown remove the new tunnel link.
+    if tunnel_connected.iter().any(|n| {
+        holes
+            .iter()
+            .any(|hole| hole.contains(n) || n.contains(hole))
+    }) {
+        return Err(route_conflict());
+    }
+    holes.extend(tunnel_connected);
+    let existing: Vec<_> = routes.iter().map(|r| r.net).collect();
+    let planned = tunnel_destinations_preserving(allowed, &holes, &existing)
+        .map_err(|e| ServiceError::Backend(e.to_string()))?;
+    let present: HashSet<_> = existing.into_iter().collect();
+    if planned.iter().any(|n| present.contains(n)) {
+        return Err(route_conflict());
+    }
+    Ok(planned)
+}
+
+#[cfg(target_os = "linux")]
+mod native {
+    use super::*;
+    use netlink_packet_core::{
+        NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REQUEST,
+    };
+    use netlink_packet_route::{
+        link::{InfoKind, LinkAttribute, LinkFlags, LinkInfo, LinkMessage},
+        route::{RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope, RouteType},
+        AddressFamily, RouteNetlinkMessage,
+    };
+    use netlink_sys::{constants::NETLINK_ROUTE, Socket, SocketAddr};
+    use std::os::fd::AsRawFd;
+
+    pub(super) struct RoutingSocket {
+        socket: Socket,
+        sequence: u32,
+    }
+    impl RoutingSocket {
+        pub(super) fn new() -> Result<Self, ServiceError> {
+            let socket = Socket::new(NETLINK_ROUTE).map_err(|_| invalid_table())?;
+            socket
+                .connect(&SocketAddr::new(0, 0))
+                .map_err(|_| invalid_table())?;
+            let timeout = libc::timeval {
+                tv_sec: 3,
+                tv_usec: 0,
+            };
+            if unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVTIMEO,
+                    (&timeout as *const libc::timeval).cast(),
+                    std::mem::size_of_val(&timeout) as _,
+                )
+            } != 0
+            {
+                return Err(invalid_table());
+            }
+            Ok(Self {
+                socket,
+                sequence: 0,
+            })
+        }
+        pub(super) fn add(&mut self, index: u32, net: IpNet) -> Result<(), ServiceError> {
+            if index == 0 || net.prefix_len() == 0 {
+                return Err(invalid_table());
+            }
+            let mut route = RouteMessage::default();
+            route.header.address_family = if net.addr().is_ipv4() {
+                AddressFamily::Inet
+            } else {
+                AddressFamily::Inet6
+            };
+            route.header.destination_prefix_length = net.prefix_len();
+            route.header.table = 254;
+            route.header.scope = RouteScope::Link;
+            route.header.kind = RouteType::Unicast;
+            route.header.protocol = RouteProtocol::Static;
+            let dst = match net.network() {
+                IpAddr::V4(ip) => RouteAddress::Inet(ip),
+                IpAddr::V6(ip) => RouteAddress::Inet6(ip),
+            };
+            route.attributes = vec![RouteAttribute::Oif(index), RouteAttribute::Destination(dst)];
+            self.request(
+                RouteNetlinkMessage::NewRoute(route),
+                NLM_F_CREATE | NLM_F_EXCL,
+            )
+        }
+        pub(super) fn create_wireguard_link(
+            &mut self,
+            name: &str,
+            group: u32,
+        ) -> Result<(), ServiceError> {
+            let mut link = LinkMessage::default();
+            link.header.flags = LinkFlags::Up;
+            link.header.change_mask = LinkFlags::Up;
+            link.attributes = vec![
+                LinkAttribute::IfName(name.into()),
+                LinkAttribute::Group(group),
+                LinkAttribute::LinkInfo(vec![LinkInfo::Kind(InfoKind::Wireguard)]),
+            ];
+            self.request(
+                RouteNetlinkMessage::NewLink(link),
+                NLM_F_CREATE | NLM_F_EXCL,
+            )
+        }
+        pub(super) fn set_link_group(
+            &mut self,
+            index: u32,
+            group: u32,
+        ) -> Result<(), ServiceError> {
+            if index == 0 {
+                return Err(invalid_table());
+            }
+            let mut link = LinkMessage::default();
+            link.header.index = index;
+            link.attributes = vec![LinkAttribute::Group(group)];
+            self.request(RouteNetlinkMessage::NewLink(link), 0)
+        }
+        pub(super) fn delete_link(&mut self, index: u32) -> Result<(), ServiceError> {
+            if index == 0 {
+                return Err(invalid_table());
+            }
+            let mut link = LinkMessage::default();
+            link.header.index = index;
+            self.request(RouteNetlinkMessage::DelLink(link), 0)
+        }
+        fn request(&mut self, msg: RouteNetlinkMessage, flags: u16) -> Result<(), ServiceError> {
+            self.sequence += 1;
+            let mut req = NetlinkMessage::from(msg);
+            req.header.sequence_number = self.sequence;
+            req.header.flags = flags | NLM_F_REQUEST | NLM_F_ACK;
+            req.finalize();
+            let mut bytes = vec![0; req.buffer_len()];
+            req.serialize(&mut bytes);
+            if self.socket.send(&bytes, 0).map_err(|_| invalid_table())? != bytes.len() {
+                return Err(invalid_table());
+            }
+            let mut buf = [0u8; 8192];
+            let (n, sender) = self
+                .socket
+                .recv_from(&mut &mut buf[..], 0)
+                .map_err(|_| invalid_table())?;
+            if n >= buf.len() || sender.port_number() != 0 || sender.multicast_groups() != 0 {
+                return Err(invalid_table());
+            }
+            let ack = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&buf[..n])
+                .map_err(|_| invalid_table())?;
+            if ack.header.sequence_number != self.sequence {
+                return Err(invalid_table());
+            }
+            match ack.payload {
+                NetlinkPayload::Error(e) if e.code.is_none() => Ok(()),
+                _ => Err(ServiceError::Backend(
+                    "ordinary_route_change_rejected".into(),
+                )),
+            }
+        }
     }
 }
 
@@ -510,30 +635,6 @@ fn parse_fwmark(value: &str) -> Option<u32> {
         .unwrap_or_else(|| value.parse().ok())
 }
 
-fn mutate_ip(
-    ip: &Path,
-    arguments: &[String],
-    missing_ok: bool,
-    error_code: &str,
-) -> Result<(), ServiceError> {
-    let output = output_with_timeout(
-        Command::new(ip)
-            .args(arguments)
-            .env("LANG", "C")
-            .env("LC_ALL", "C"),
-        COMMAND_TIMEOUT,
-    )
-    .map_err(|_| ServiceError::Backend("route_command_failed".to_string()))?;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if output.status.success()
-        || (missing_ok && (stderr.contains("No such process") || stderr.contains("No such file")))
-    {
-        Ok(())
-    } else {
-        Err(ServiceError::Backend(error_code.to_string()))
-    }
-}
-
 fn load_userspace_route_state(path: &Path) -> Result<Option<UserspaceRouteState>, ServiceError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -584,30 +685,6 @@ fn validate_userspace_route_state(state: &UserspaceRouteState) -> Result<(), Ser
         }
     }
     Ok(())
-}
-
-fn persist_userspace_route_state(
-    path: &Path,
-    state: &UserspaceRouteState,
-) -> Result<(), ServiceError> {
-    let bytes = serde_json::to_vec(state)
-        .map_err(|_| ServiceError::Backend("route_state_serialize_failed".to_string()))?;
-    if bytes.len() as u64 > AWG_ROUTE_STATE_MAX_SIZE {
-        return Err(ServiceError::Backend("route_state_too_large".to_string()));
-    }
-    let temporary = path.with_extension("json.new");
-    remove_userspace_route_state(&temporary)?;
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&temporary)
-        .map_err(|_| ServiceError::Backend("route_state_write_failed".to_string()))?;
-    file.write_all(&bytes)
-        .and_then(|_| file.sync_all())
-        .map_err(|_| ServiceError::Backend("route_state_write_failed".to_string()))?;
-    fs::rename(&temporary, path)
-        .map_err(|_| ServiceError::Backend("route_state_activate_failed".to_string()))
 }
 
 fn remove_userspace_route_state(path: &Path) -> Result<(), ServiceError> {
@@ -662,28 +739,6 @@ impl RouteBackend for SystemRouteBackend {
         )
     }
 
-    fn owned_route(&self, egress: &Self::Egress, network: Ipv4Net) -> OwnedRoute {
-        OwnedRoute {
-            destination: network.to_string(),
-            interface_identifier: egress.interface.clone(),
-            gateway: egress.gateway.clone(),
-            metric: Some(ROUTE_METRIC),
-        }
-    }
-
-    fn add_route(&self, route: &OwnedRoute) -> Result<(), ServiceError> {
-        mutate_route(&self.ip, "add", route)
-    }
-
-    fn route_exists(&self, route: &OwnedRoute) -> Result<bool, ServiceError> {
-        Ok(self
-            .route_presence(std::slice::from_ref(route))?
-            .into_iter()
-            .next()
-            .flatten()
-            .is_some())
-    }
-
     fn route_presence(
         &self,
         routes: &[OwnedRoute],
@@ -704,13 +759,6 @@ impl RouteBackend for SystemRouteBackend {
                     .then_some(RouteScope::Unscoped))
             })
             .collect()
-    }
-
-    fn remove_route(&self, route: &OwnedRoute, scope: RouteScope) -> Result<(), ServiceError> {
-        if scope != RouteScope::Unscoped {
-            return Err(ServiceError::Backend("route_state_invalid".to_string()));
-        }
-        mutate_route(&self.ip, "del", route)
     }
 }
 
@@ -757,45 +805,6 @@ fn route_matches_tokens(tokens: &[&str], route: &OwnedRoute) -> bool {
         && value_after(tokens, "metric").and_then(|value| value.parse::<u32>().ok())
             == Some(expected_metric)
         && value_after(tokens, "proto") == Some("static")
-}
-
-fn mutate_route(ip: &Path, action: &str, route: &OwnedRoute) -> Result<(), ServiceError> {
-    let metric = route
-        .metric
-        .ok_or_else(|| ServiceError::Backend("route_state_invalid".to_string()))?
-        .to_string();
-    let mut arguments = vec![
-        "-4".to_string(),
-        "route".to_string(),
-        action.to_string(),
-        route.destination.clone(),
-    ];
-    if let Some(gateway) = &route.gateway {
-        arguments.extend(["via".to_string(), gateway.clone()]);
-    }
-    arguments.extend([
-        "dev".to_string(),
-        route.interface_identifier.clone(),
-        "metric".to_string(),
-        metric,
-        "proto".to_string(),
-        "static".to_string(),
-    ]);
-    let output = output_with_timeout(
-        Command::new(ip)
-            .args(arguments)
-            .env("LANG", "C")
-            .env("LC_ALL", "C"),
-        COMMAND_TIMEOUT,
-    )
-    .map_err(|_| ServiceError::Backend("route_command_failed".to_string()))?;
-    if output.status.success()
-        || (action == "del" && String::from_utf8_lossy(&output.stderr).contains("No such process"))
-    {
-        Ok(())
-    } else {
-        Err(ServiceError::Backend(format!("route_{action}_failed")))
-    }
 }
 
 fn run(path: &Path, arguments: &[&str]) -> Result<Output, ServiceError> {
@@ -880,130 +889,123 @@ fn virtual_interface(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use defguard_wireguard_rs::{key::Key, net::IpAddrMask};
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn userspace_link_is_up_before_ipv4_and_ipv6_routes() {
-        let directory = tempfile::tempdir().unwrap();
-        let ip = directory.path().join("ip");
-        let calls = directory.path().join("calls");
-        fs::write(
-            &ip,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
-                calls.display()
-            ),
+    fn ordinary_dual_stack_routes_keep_existing_static_and_connected_paths() {
+        let mut main=parse_main_routes(r#"[{"dst":"default","dev":"eth0"},{"dst":"10.42.0.0/16","dev":"eth0","scope":"link","protocol":"kernel"},{"dst":"203.0.113.0/24","dev":"eth0","gateway":"192.0.2.2","protocol":"static"}]"#,RouteFamily::Ipv4).unwrap();
+        main.extend(
+            parse_main_routes(
+                r#"[{"dst":"2001:db8::/48","dev":"eth0","gateway":"fd00::1","protocol":"static"}]"#,
+                RouteFamily::Ipv6,
+            )
+            .unwrap(),
+        );
+        let allowed = ["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()];
+        let holes = [
+            "203.0.113.7/32".parse().unwrap(),
+            "198.51.100.10/32".parse().unwrap(),
+            "2001:db8::a/128".parse().unwrap(),
+        ];
+        let data = ordinary_destinations(
+            &allowed,
+            &holes,
+            &main,
+            "nlm-wg0",
+            &HashSet::from(["eth0".into()]),
         )
         .unwrap();
-        fs::set_permissions(&ip, fs::Permissions::from_mode(0o700)).unwrap();
-        let manager = LinuxUserspaceRouteManager {
-            ip,
-            state_path: directory.path().join("state.json"),
-            state: None,
+        let tunneled = |s: &str| {
+            data.iter()
+                .any(|n| n.contains(&s.parse::<IpAddr>().unwrap()))
         };
+        for bypass in ["10.42.1.1", "203.0.113.6", "198.51.100.10", "2001:db8::b"] {
+            assert!(!tunneled(bypass), "{bypass}");
+        }
+        assert!(tunneled("198.51.100.11"));
+        assert!(tunneled("2001:db8:1::b"));
+    }
+
+    #[test]
+    fn ordinary_specific_route_refuses_a_foreign_equal_prefix_at_any_metric() {
+        let main = parse_main_routes(
+            r#"[{"dst":"203.0.113.0/24","dev":"eth0","gateway":"192.0.2.1","metric":900}]"#,
+            RouteFamily::Ipv4,
+        )
+        .unwrap();
+        assert!(ordinary_destinations(
+            &["203.0.113.0/24".parse().unwrap()],
+            &[],
+            &main,
+            "nlm-awg0",
+            &HashSet::new()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn ordinary_exclusion_inside_tunnel_connected_prefix_is_unavailable() {
+        let main = parse_main_routes(
+            r#"[{"dst":"10.2.0.0/24","dev":"nlm-wg0","protocol":"kernel"}]"#,
+            RouteFamily::Ipv4,
+        )
+        .unwrap();
+        assert!(ordinary_destinations(
+            &["0.0.0.0/0".parse().unwrap()],
+            &["10.2.0.19/32".parse().unwrap()],
+            &main,
+            "nlm-wg0",
+            &HashSet::new()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn ordinary_does_not_treat_another_vpn_as_a_physical_lan() {
+        let main = parse_main_routes(
+            r#"[{"dst":"10.0.0.0/8","dev":"wg-other","scope":"link","protocol":"kernel"}]"#,
+            RouteFamily::Ipv4,
+        )
+        .unwrap();
+        let allowed = ["10.20.0.0/16".parse().unwrap()];
+        assert_eq!(
+            ordinary_destinations(
+                &allowed,
+                &[],
+                &main,
+                "nlm-wg0",
+                &HashSet::from(["eth0".into()])
+            )
+            .unwrap(),
+            allowed
+        );
+    }
+
+    #[test]
+    fn legacy_exact_replacement_never_grants_route_delete_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let ip = dir.path().join("ip");
+        let calls = dir.path().join("calls");
+        fs::write(&ip, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in *show*) echo '192.0.2.0/24 dev nlm-awg0 proto static';; esac\n", calls.display())).unwrap();
+        fs::set_permissions(&ip, fs::Permissions::from_mode(0o700)).unwrap();
         let state = UserspaceRouteState {
-            format_version: AWG_ROUTE_STATE_FORMAT,
+            format_version: 1,
             interface_name: "nlm-awg0".into(),
-            default_families: vec![RouteFamily::Ipv4, RouteFamily::Ipv6],
+            default_families: vec![],
             routes: vec![UserspaceRoute {
                 family: RouteFamily::Ipv4,
                 destination: "192.0.2.0/24".into(),
             }],
         };
-        manager.apply_state(&state).unwrap();
-        let output = fs::read_to_string(calls).unwrap();
-        let lines = output.lines().collect::<Vec<_>>();
-        assert_eq!(lines[0], "link set dev nlm-awg0 up");
-        assert!(lines.contains(&"-4 route add 192.0.2.0/24 dev nlm-awg0 proto static"));
-        assert!(lines.contains(&"-4 route add default dev nlm-awg0 table 42761"));
-        assert!(lines.contains(&"-6 route add default dev nlm-awg0 table 42761"));
-    }
-
-    #[test]
-    fn userspace_link_up_failure_aborts_routes_and_clears_saved_state() {
-        let directory = tempfile::tempdir().unwrap();
-        let ip = directory.path().join("ip");
-        let calls = directory.path().join("calls");
-        fs::write(&ip, format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n'link set dev nlm-awg0 up') exit 2;;\nesac\nexit 0\n", calls.display()
-        )).unwrap();
-        fs::set_permissions(&ip, fs::Permissions::from_mode(0o700)).unwrap();
-        let state_path = directory.path().join("state.json");
-        let mut manager = LinuxUserspaceRouteManager {
+        let mut manager = LinuxOrdinaryRoutes {
             ip,
-            state_path: state_path.clone(),
-            state: None,
+            state_path: dir.path().join("state"),
+            state: Some(state),
         };
-        let error = manager
-            .apply(
-                "nlm-awg0",
-                &[peer_with_allowed_ips(vec!["192.0.2.0/24".parse().unwrap()])],
-            )
-            .unwrap_err();
-        assert!(
-            matches!(&error, ServiceError::Backend(code) if code == "interface_up_failed"),
-            "unexpected apply error: {error:?}; owned fixture calls: {:?}",
-            fs::read_to_string(&calls)
-        );
-        let output = fs::read_to_string(calls).unwrap();
-        assert!(!output.contains("route add"));
-        assert!(!output.contains("rule add"));
-        assert!(!state_path.exists());
-        assert!(!manager.has_routes());
+        assert!(manager.cleanup().is_err());
+        assert!(!fs::read_to_string(calls).unwrap().contains("route del"));
     }
-
-    #[test]
-    fn userspace_preflight_accepts_missing_fib_table_but_not_other_query_failures() {
-        // Match iproute2 on SteamOS before the first AWG connection. The real
-        // query/preflight must treat only a missing route table as empty.
-        let directory = tempfile::tempdir().unwrap();
-        let ip = directory.path().join("ip");
-        for (stderr, stdout, exit, accepted) in [
-            (
-                "Error: ipv4: FIB table does not exist.\nDump terminated\n",
-                "",
-                2,
-                true,
-            ),
-            ("RTNETLINK answers: Operation not permitted\n", "", 2, false),
-            (
-                "Error: ipv4: FIB table does not exist.\nDump terminated\n",
-                "default dev foreign0\n",
-                2,
-                false,
-            ),
-            (
-                "Error: ipv4: FIB table does not exist.\nDump terminated\n",
-                "",
-                1,
-                false,
-            ),
-            ("", "default dev foreign0\n", 0, false),
-        ] {
-            fs::write(
-                &ip,
-                format!(
-                    "#!/bin/sh\nprintf '%s' '{stdout}'\nprintf '%s' '{stderr}' >&2\nexit {exit}\n"
-                ),
-            )
-            .unwrap();
-            fs::set_permissions(&ip, fs::Permissions::from_mode(0o700)).unwrap();
-            let result = ensure_ip_query_empty(&ip, &["-4", "route", "show", "table", "42761"]);
-            assert_eq!(
-                result.is_ok(),
-                accepted,
-                "stderr={stderr:?} stdout={stdout:?} exit={exit}"
-            );
-            if exit != 0 {
-                assert!(query_ip(&ip, &["-4", "rule", "show"]).is_err());
-            }
-        }
-        fs::write(&ip, "#!/bin/sh\nprintf 'Error: ipv6: FIB table does not exist.\\nDump terminated\\n' >&2\nexit 2\n").unwrap();
-        assert!(ensure_ip_query_empty(&ip, &["-6", "route", "show", "table", "42761"]).is_ok());
-    }
-
     #[test]
     fn host_route_without_printed_prefix_is_recognized_for_cleanup() {
         let route = OwnedRoute {
@@ -1034,12 +1036,6 @@ mod tests {
         }
     }
 
-    fn peer_with_allowed_ips(allowed_ips: Vec<IpAddrMask>) -> Peer {
-        let mut peer = Peer::new(Key::new([7; 32]));
-        peer.allowed_ips = allowed_ips;
-        peer
-    }
-
     #[test]
     fn parses_lowest_metric_physical_default_route() {
         let output = b"default via 10.0.0.1 dev wg0 metric 1\n\
@@ -1065,42 +1061,6 @@ default via 192.168.1.1 dev enp3s0 proto dhcp src 192.168.1.20 metric 100\n";
             b"2: enp3s0    inet 192.168.1.20/24 brd 192.168.1.255 scope global enp3s0\n",
         );
         assert_eq!(routes, vec!["192.168.1.0/24".parse().unwrap()]);
-    }
-
-    #[test]
-    fn userspace_plan_uses_policy_routing_for_default_routes() {
-        let peer = peer_with_allowed_ips(vec![
-            IpAddrMask::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            IpAddrMask::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8),
-            IpAddrMask::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 128),
-        ]);
-
-        let state = userspace_route_plan("nlm-awg0", &[peer]);
-
-        assert_eq!(state.default_families, vec![RouteFamily::Ipv4]);
-        assert_eq!(
-            state.routes,
-            vec![UserspaceRoute {
-                family: RouteFamily::Ipv6,
-                destination: "::1/128".to_string(),
-            }]
-        );
-    }
-
-    #[test]
-    fn userspace_plan_deduplicates_specific_routes() {
-        let route = IpAddrMask::new(IpAddr::V4(Ipv4Addr::new(10, 8, 0, 0)), 16);
-        let state = userspace_route_plan(
-            "nlm-awg0",
-            &[
-                peer_with_allowed_ips(vec![route.clone()]),
-                peer_with_allowed_ips(vec![route]),
-            ],
-        );
-
-        assert!(state.default_families.is_empty());
-        assert_eq!(state.routes.len(), 1);
-        assert_eq!(state.routes[0].destination, "10.8.0.0/16");
     }
 
     #[test]
@@ -1132,32 +1092,5 @@ default via 192.168.1.1 dev enp3s0 proto dhcp src 192.168.1.20 metric 100\n";
             "31121: from all not fwmark 0xa708 lookup 42761\n",
             AWG_TUNNEL_RULE_PRIORITY,
         ));
-        assert_eq!(
-            userspace_rule_arguments(RouteFamily::Ipv4, "add", AWG_TUNNEL_RULE_PRIORITY,),
-            [
-                "-4", "rule", "add", "not", "fwmark", "42761", "table", "42761", "priority",
-                "31121",
-            ]
-            .map(str::to_string)
-        );
-    }
-
-    #[test]
-    fn userspace_route_state_is_private_and_round_trips() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join(AWG_ROUTE_STATE_FILE);
-        let state = UserspaceRouteState {
-            format_version: AWG_ROUTE_STATE_FORMAT,
-            interface_name: "nlm-awg0".to_string(),
-            default_families: vec![RouteFamily::Ipv4],
-            routes: Vec::new(),
-        };
-
-        persist_userspace_route_state(&path, &state).unwrap();
-
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
-        assert_eq!(load_userspace_route_state(&path).unwrap(), Some(state));
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(load_userspace_route_state(&path).is_err());
     }
 }

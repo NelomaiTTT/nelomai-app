@@ -2,10 +2,12 @@
 //! adapter as paired mode, but a separate journal and no DNS resources.
 use crate::member_network::{
     journal::ScopedJournal,
-    macos::{MacNetwork, MacNetworkCommands},
+    macos::{
+        physical_endpoint, physical_interface, table_destination, MacNetwork, MacNetworkCommands,
+    },
 };
 use ipnet::IpNet;
-use nelomai_client_tunnel::redundancy::{network::*, SessionScope};
+use nelomai_client_tunnel::redundancy::{driver::RouteRefreshError, network::*, SessionScope};
 use nelomai_contracts::RuntimeSlot;
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -33,6 +35,14 @@ impl NetworkJournalStore for Store {
 // Even a malformed journal must never confer resolver ownership on this path.
 struct RoutesOnly<C>(MacNetwork<C>);
 impl<C: MacNetworkCommands> NetworkSystem for RoutesOnly<C> {
+    fn journal_each_write(&self) -> bool {
+        true
+    }
+
+    fn observe_routes_on_close(&self) -> bool {
+        true
+    }
+
     fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
         if !matches!(key, ResourceKey::Route(_, RouteScope::Global)) {
             return Err(invalid());
@@ -59,6 +69,53 @@ impl<C: MacNetworkCommands> NetworkSystem for RoutesOnly<C> {
         }
         self.0.compare_exchange(key, before, after)
     }
+
+    fn compare_exchange_prepared(
+        &mut self,
+        key: &ResourceKey,
+        before: Option<&NetworkValue>,
+        after: Option<&NetworkValue>,
+        prepare: Option<&mut dyn FnMut() -> io::Result<()>>,
+    ) -> Result<(), RouteRefreshError> {
+        if !matches!(key, ResourceKey::Route(_, RouteScope::Global)) {
+            return Err(RouteRefreshError::Unchanged(invalid()));
+        }
+        self.0
+            .compare_exchange_prepared(key, before, after, prepare)
+    }
+}
+
+pub(super) fn ordinary_journal_location(
+    root: &Path,
+    uid: u32,
+) -> io::Result<(std::path::PathBuf, SessionScope)> {
+    // The existing socket/runtime directory is intentionally searchable
+    // (0755). Keep the journal in its own private child, without changing
+    // socket access or weakening ScopedJournal's ownership checks.
+    let metadata = fs::symlink_metadata(root)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(invalid());
+    }
+    let private = root.join("ordinary-routing");
+    match fs::DirBuilder::new().mode(0o700).create(&private) {
+        Ok(()) => fs::File::open(root)?.sync_all()?,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
+        Err(error) => return Err(error),
+    }
+    // Stable namespace for the existing private-file implementation. The
+    // runtime root and distinct filename isolate ordinary mode; no pair's
+    // session scope, journal, or DNS baseline is shared or adopted.
+    let scope = SessionScope {
+        runtime: RuntimeSlot::Latest,
+        runtime_generation: 1,
+        session_id: "00000000-0000-4000-8000-000000000001".into(),
+        connection_generation: 1,
+    };
+    Ok((private, scope))
 }
 
 pub(super) struct OrdinaryRoutes<C> {
@@ -69,32 +126,7 @@ impl<C: MacNetworkCommands> OrdinaryRoutes<C> {
         if !valid_boot(boot) {
             return Err(invalid());
         }
-        // The existing socket/runtime directory is intentionally searchable
-        // (0755). Keep the journal in its own private child, without changing
-        // socket access or weakening ScopedJournal's ownership checks.
-        let metadata = fs::symlink_metadata(root)?;
-        if !metadata.is_dir()
-            || metadata.file_type().is_symlink()
-            || metadata.uid() != uid
-            || metadata.mode() & 0o022 != 0
-        {
-            return Err(invalid());
-        }
-        let private = root.join("ordinary-routing");
-        match fs::DirBuilder::new().mode(0o700).create(&private) {
-            Ok(()) => fs::File::open(root)?.sync_all()?,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
-            Err(error) => return Err(error),
-        }
-        // Stable namespace for the existing private-file implementation. The
-        // runtime root and distinct filename isolate ordinary mode; no pair's
-        // session scope, journal, or DNS baseline is shared or adopted.
-        let scope = SessionScope {
-            runtime: RuntimeSlot::Latest,
-            runtime_generation: 1,
-            session_id: "00000000-0000-4000-8000-000000000001".into(),
-            connection_generation: 1,
-        };
+        let (private, scope) = ordinary_journal_location(root, uid)?;
         let file = ScopedJournal::open_named(&private, scope, uid, "ordinary-routes.json")?;
         let saved: Option<Record> = file.load()?;
         let mut store = Store {
@@ -107,7 +139,7 @@ impl<C: MacNetworkCommands> OrdinaryRoutes<C> {
                     return Err(invalid());
                 }
                 if saved.boot.eq_ignore_ascii_case(boot) {
-                    saved.network
+                    saved.network.unix_recovery()?
                 } else {
                     // Routes are ephemeral across boots. Never query/delete
                     // rows through a reused native index from the old boot.
@@ -126,6 +158,7 @@ impl<C: MacNetworkCommands> OrdinaryRoutes<C> {
         interface: &str,
         allowed: &[IpNet],
         endpoints: &[IpAddr],
+        split: &nelomai_client_tunnel::Ipv4RoutePlan,
     ) -> io::Result<()> {
         if self.has_resources() {
             return Err(io::Error::other("ordinary_route_cleanup_pending"));
@@ -147,73 +180,89 @@ impl<C: MacNetworkCommands> OrdinaryRoutes<C> {
             return Err(invalid());
         }
         let index = native.commands.interface_index(interface)?;
-        let mut values = Vec::new();
-        let mut retained = Vec::new();
         let mut endpoints = endpoints.to_vec();
         endpoints.sort();
         endpoints.dedup();
-        for endpoint in &endpoints {
-            let route = physical_endpoint(&mut native.commands, *endpoint)?;
-            let value = NetworkValue::Route(route);
-            match native.read(&value.key())? {
-                None => values.push(value),
-                Some(existing) if existing == value => retained.push(value),
-                Some(_) => return Err(io::Error::other("ordinary_endpoint_route_conflict")),
-            }
-        }
-        let mut destinations = Vec::new();
-        for network in allowed {
-            if network.prefix_len() == 0 {
-                let halves = if network.addr().is_ipv4() {
-                    ["0.0.0.0/1", "128.0.0.0/1"]
-                } else {
-                    ["::/1", "8000::/1"]
-                };
-                destinations.extend(halves.map(|s| s.parse::<IpNet>().expect("constant CIDR")));
-            } else {
-                destinations.push(network.trunc());
-            }
-        }
-        destinations.sort();
-        destinations.dedup();
-        for destination in destinations {
-            // Endpoint bypass wins over an exact AllowedIPs host route too.
-            if endpoints.iter().any(|e| IpNet::from(*e) == destination) {
+        let physical = endpoints
+            .iter()
+            .map(|ip| physical_endpoint(&mut native.commands, *ip))
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut holes: Vec<_> = split
+            .excluded_networks
+            .iter()
+            .copied()
+            .map(IpNet::V4)
+            .collect();
+        holes.extend(endpoints.iter().copied().map(IpNet::from));
+        crate::member_network::macos::preserve_scoped_defaults(&mut holes);
+        let mut existing = Vec::new();
+        for (ipv4, family) in [(true, "inet"), (false, "inet6")] {
+            if !allowed.iter().any(|net| net.addr().is_ipv4() == ipv4) {
                 continue;
             }
-            values.push(NetworkValue::Route(RouteValue {
-                destination,
-                scope: RouteScope::Global,
-                interface: index,
-                gateway: None,
-                metric: 0,
-            }));
+            let table = native.commands.run(
+                "/usr/sbin/netstat",
+                &["-rn".into(), "-f".into(), family.into()],
+            )?;
+            for row in table.lines() {
+                let mut fields = row.split_whitespace();
+                if let (Some(dst), Some(gateway), Some(flags), Some(interface)) =
+                    (fields.next(), fields.next(), fields.next(), fields.next())
+                {
+                    if !flags.contains('I') {
+                        if let Some(net) = table_destination(dst, ipv4) {
+                            existing.push(net);
+                            if split.exclude_local_networks
+                                && physical_interface(interface)
+                                && gateway.starts_with("link#")
+                                && net.prefix_len() > 0
+                                && net.prefix_len() < if ipv4 { 32 } else { 128 }
+                            {
+                                holes.push(net);
+                            }
+                        }
+                    }
+                }
+            }
         }
+        let destinations =
+            nelomai_client_tunnel::redundancy::route_plan::tunnel_destinations_preserving(
+                allowed, &holes, &existing,
+            )?;
+        let values: Vec<_> = destinations
+            .into_iter()
+            .map(|destination| {
+                NetworkValue::Route(RouteValue {
+                    destination,
+                    scope: RouteScope::Global,
+                    interface: index,
+                    gateway: None,
+                    metric: 0,
+                })
+            })
+            .collect();
         // NetworkOwner rejects every preexisting data-route key (even an
         // identical utun row), before writing intent or changing any route.
         owner.prepare(values.clone())?;
-        let verified = (|| {
+        (|| {
             let native = &mut owner.system_mut().0;
-            // Recheck retained dependencies and the entire installed set,
-            // including rows changed while later additions were in progress.
-            for value in retained.iter().chain(&values) {
-                if native.read(&value.key())?.as_ref() != Some(value) {
-                    return Err(io::Error::other("ordinary_route_readback_failed"));
-                }
+            let keys: Vec<_> = values.iter().map(NetworkValue::key).collect();
+            let current = native.read_many(&keys)?;
+            if current.len() != keys.len()
+                || current
+                    .iter()
+                    .map(Option::as_ref)
+                    .ne(values.iter().map(Some))
+            {
+                return Err(io::Error::other("ordinary_route_readback_failed"));
             }
-            for endpoint in endpoints {
-                let actual =
-                    NetworkValue::Route(physical_endpoint(&mut native.commands, endpoint)?);
-                if !retained.iter().chain(&values).any(|value| *value == actual) {
+            for (ip, expected) in endpoints.into_iter().zip(physical) {
+                if physical_endpoint(&mut native.commands, ip)? != expected {
                     return Err(io::Error::other("ordinary_endpoint_route_changed"));
                 }
             }
             Ok(())
-        })();
-        if verified.is_err() {
-            let _ = owner.cleanup();
-        }
-        verified
+        })()
     }
 
     pub(super) fn cleanup(&mut self) -> io::Result<()> {
@@ -222,87 +271,17 @@ impl<C: MacNetworkCommands> OrdinaryRoutes<C> {
         }
         Ok(())
     }
+    pub(super) fn confirm_link_closed(&mut self) -> io::Result<()> {
+        self.owner
+            .as_mut()
+            .expect("route owner")
+            .confirm_links_closed()
+    }
     pub(super) fn has_resources(&self) -> bool {
         self.owner.as_ref().expect("route owner").has_resources()
     }
 }
 
-fn physical_endpoint<C: MacNetworkCommands>(
-    commands: &mut C,
-    endpoint: IpAddr,
-) -> io::Result<RouteValue> {
-    if endpoint.is_unspecified() || endpoint.is_loopback() || endpoint.is_multicast() {
-        return Err(invalid());
-    }
-    let text = commands.run(
-        "/sbin/route",
-        &[
-            "-n".into(),
-            "get".into(),
-            if endpoint.is_ipv4() {
-                "-inet"
-            } else {
-                "-inet6"
-            }
-            .into(),
-            endpoint.to_string(),
-        ],
-    )?;
-    let field = |name: &str| -> io::Result<&str> {
-        let mut matches = text.lines().filter_map(|line| {
-            let (key, value) = line.split_once(':')?;
-            (key.trim() == name).then_some(value.trim())
-        });
-        let value = matches.next().ok_or_else(invalid)?;
-        if matches.next().is_some() || value.is_empty() {
-            return Err(invalid());
-        }
-        Ok(value)
-    };
-    let name = field("interface")?;
-    if ["lo", "utun", "tun", "tap", "wg", "awg", "nlm-"]
-        .iter()
-        .any(|p| name.starts_with(p))
-    {
-        return Err(invalid());
-    }
-    let flags = field("flags")?
-        .trim_matches(['<', '>'])
-        .split(',')
-        .collect::<Vec<_>>();
-    if !flags.contains(&"UP") || flags.iter().any(|f| matches!(*f, "REJECT" | "BLACKHOLE")) {
-        return Err(invalid());
-    }
-    let gateway = field("gateway")?;
-    let gateway = if gateway.starts_with("link#") {
-        None
-    } else {
-        let address = if let Some((address, scope)) = gateway.split_once('%') {
-            if scope != name {
-                return Err(invalid());
-            }
-            address
-        } else {
-            gateway
-        };
-        let address: IpAddr = address.parse().map_err(|_| invalid())?;
-        if address.is_ipv4() != endpoint.is_ipv4()
-            || address.is_loopback()
-            || address.is_unspecified()
-            || address.is_multicast()
-        {
-            return Err(invalid());
-        }
-        Some(address)
-    };
-    Ok(RouteValue {
-        destination: endpoint.into(),
-        scope: RouteScope::Global,
-        interface: commands.interface_index(name)?,
-        gateway,
-        metric: 0,
-    })
-}
 fn valid_boot(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(i, b)| {

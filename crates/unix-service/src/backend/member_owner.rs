@@ -1,5 +1,5 @@
 //! Durable userspace identity. A name alone never authorizes adoption/cleanup.
-use super::macos_launch::{LaunchFailure, LaunchReceipt, VerifiedLaunch};
+use super::macos_launch::{LaunchReceipt, ProcessStamp, VerifiedLaunch};
 use super::redundancy::SocketIdentity;
 use crate::member_network::journal::ScopedJournal;
 use nelomai_client_tunnel::redundancy::SessionScope;
@@ -47,6 +47,8 @@ enum Phase {
         transport: MemberTransport,
         identity: UserspaceIdentity,
         stopping: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        managed: Option<ProcessStamp>,
     },
     Closed,
 }
@@ -72,12 +74,22 @@ impl MemberOwner {
         slot: TunnelSlot,
         uid: u32,
     ) -> io::Result<Self> {
-        let store =
-            ScopedJournal::<Record>::open_named(root, scope.clone(), uid, "redundant-member.json")?;
+        Self::open_named(root, scope, slot, uid, "redundant-member.json")
+    }
+
+    pub(super) fn open_named(
+        root: &Path,
+        scope: SessionScope,
+        slot: TunnelSlot,
+        uid: u32,
+        name: &'static str,
+    ) -> io::Result<Self> {
+        let store = ScopedJournal::<Record>::open_named(root, scope.clone(), uid, name)?;
         let record = store.load()?;
         if record.as_ref().is_some_and(|r| {
             r.slot != slot
-                || matches!(&r.phase, Phase::Owned { identity, .. } if !identity.valid())
+                || matches!(&r.phase, Phase::Owned { identity, managed, .. } if
+                    !identity.valid() || managed.is_some_and(|process| !process.valid()))
                 || matches!(&r.phase, Phase::Starting(receipt) if !receipt.valid())
         }) {
             return Err(invalid());
@@ -97,38 +109,33 @@ impl MemberOwner {
         self.state = Some(state);
         Ok(())
     }
+    #[cfg(target_os = "macos")]
+    pub(super) fn has_record(&self) -> bool {
+        self.state.is_some()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn capture_ordinary_legacy(
+        &mut self,
+        proof: super::macos_launch::VerifiedLegacy,
+    ) -> io::Result<()> {
+        if self.has_record() {
+            return Err(invalid());
+        }
+        self.save(Phase::Owned {
+            transport: proof.transport(),
+            identity: proof.into_identity(),
+            stopping: true,
+            managed: None,
+        })
+    }
+
     pub(super) fn begin(&mut self, receipt: LaunchReceipt) -> io::Result<()> {
         self.ensure_fresh()?;
         if !receipt.valid() {
             return Err(invalid());
         }
         self.save(Phase::Starting(receipt))
-    }
-    /// Outer errors are journal/ownership failures; inner errors retain the
-    /// launcher's original error. This closure runs once, only after a fresh
-    /// begin. No retirement capability escapes to recovery or a later attempt.
-    pub(super) fn launch_attempt<T, E>(
-        &mut self,
-        receipt: LaunchReceipt,
-        launch: impl FnOnce(&LaunchReceipt) -> Result<T, LaunchFailure<E>>,
-    ) -> io::Result<Result<T, E>> {
-        self.begin(receipt.clone())?;
-        match launch(&receipt) {
-            Ok(value) => Ok(Ok(value)),
-            Err(LaunchFailure::SpawnedOrUnknown(error)) => Ok(Err(error)),
-            Err(LaunchFailure::NotSpawned(error)) => {
-                // Never use mere absence as evidence. Verify both the live
-                // attempt and its still-current durable receipt before saving.
-                if self.receipt() != Some(&receipt)
-                    || !matches!(self.store.load()?, Some(Record {slot, phase:Phase::Starting(saved)})
-                        if slot == self.slot && saved == receipt)
-                {
-                    return Err(invalid());
-                }
-                self.save(Phase::Closed)?;
-                Ok(Err(error))
-            }
-        }
     }
     pub(super) fn ensure_fresh(&self) -> io::Result<()> {
         if self.cleanup_pending() {
@@ -145,6 +152,48 @@ impl MemberOwner {
             Some(Phase::Starting(receipt)) => Some(receipt),
             _ => None,
         }
+    }
+    #[cfg(target_os = "macos")]
+    pub(super) fn manages_utun(&self) -> bool {
+        self.managed_process().is_some()
+            || self
+                .receipt()
+                .is_some_and(|receipt| receipt.managed.is_some())
+    }
+    #[cfg(target_os = "macos")]
+    pub(super) fn managed_process(&self) -> Option<ProcessStamp> {
+        match &self.state {
+            Some(Phase::Owned { managed, .. }) => *managed,
+            _ => None,
+        }
+    }
+    #[cfg(target_os = "macos")]
+    pub(super) fn record_managed_listener(
+        &mut self,
+        socket: super::redundancy::SocketIdentity,
+    ) -> io::Result<()> {
+        let mut receipt = self.receipt().ok_or_else(invalid)?.clone();
+        let managed = receipt.managed.as_mut().ok_or_else(invalid)?;
+        if managed.socket.is_some() {
+            return Err(invalid());
+        }
+        managed.socket = Some(socket);
+        if !receipt.valid() {
+            return Err(invalid());
+        }
+        self.save(Phase::Starting(receipt))
+    }
+    /// The caller verified that the original kernel attachment and any
+    /// listener published by this managed attempt have been released.
+    #[cfg(target_os = "macos")]
+    pub(super) fn retire_managed_launch(&mut self) -> io::Result<()> {
+        if self
+            .receipt()
+            .is_none_or(|receipt| receipt.managed.is_none())
+        {
+            return Err(invalid());
+        }
+        self.save(Phase::Closed)
     }
     /// The caller supplies a newly read kernel boot UUID, never journal text.
     /// A different boot retires only an uncaptured launch: no old interface or
@@ -173,19 +222,21 @@ impl MemberOwner {
         proof: VerifiedLaunch,
         cleanup_only: bool,
     ) -> io::Result<()> {
+        let managed = proof.managed_process();
         let identity = proof.into_identity(self.receipt().ok_or_else(invalid)?)?;
-        self.capture_identity(identity, cleanup_only)
+        self.capture_identity(identity, managed, cleanup_only)
     }
     #[cfg(test)]
     pub(super) fn capture(&mut self, identity: UserspaceIdentity) -> io::Result<()> {
-        self.capture_identity(identity, false)
+        self.capture_identity(identity, None, false)
     }
     fn capture_identity(
         &mut self,
         identity: UserspaceIdentity,
+        managed: Option<ProcessStamp>,
         cleanup_only: bool,
     ) -> io::Result<()> {
-        if !identity.valid() {
+        if !identity.valid() || managed.is_some_and(|process| !process.valid()) {
             return Err(invalid());
         }
         let Some(receipt) = self.receipt() else {
@@ -199,6 +250,7 @@ impl MemberOwner {
             transport,
             identity: identity.clone(),
             stopping: cleanup_only,
+            managed,
         });
         if saved.is_err() {
             // Durable Starting can be re-proven after a crash. Keep live proof
@@ -207,6 +259,7 @@ impl MemberOwner {
                 transport,
                 identity,
                 stopping: true,
+                managed,
             });
         }
         saved
@@ -237,8 +290,8 @@ impl MemberOwner {
         matches!(self.state, Some(Phase::Starting(_)))
     }
     /// Read-only recovery: no new Start, DNS restoration or interface deletion.
-    /// `inspect` returns None only when BOTH recorded interface and socket are
-    /// absent. An ambiguous resource is an error, never cleanup authority.
+    /// `inspect` establishes either a live tunnel or a remaining owned resource,
+    /// depending on the caller. Ambiguous resources grant no cleanup authority.
     pub(super) fn recover(
         &self,
         boot: &str,
@@ -262,11 +315,13 @@ impl MemberOwner {
             Some(Phase::Owned {
                 transport,
                 identity,
+                managed,
                 ..
             }) => self.save(Phase::Owned {
                 transport: *transport,
                 identity: identity.clone(),
                 stopping: true,
+                managed: *managed,
             }),
             None | Some(Phase::Closed) => self.save(Phase::Closed),
             _ => Err(invalid()),

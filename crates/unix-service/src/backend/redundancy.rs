@@ -191,7 +191,7 @@ pub(super) fn capture_userspace_member(
         .map_err(|_| crate::ServiceError::Backend("slot_socket_ownership_unavailable".into()))
 }
 
-fn socket_identity(path: &Path, owner: u32) -> std::io::Result<SocketIdentity> {
+pub(super) fn socket_identity(path: &Path, owner: u32) -> std::io::Result<SocketIdentity> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.file_type().is_socket() || metadata.uid() != owner {
@@ -206,7 +206,7 @@ fn socket_identity(path: &Path, owner: u32) -> std::io::Result<SocketIdentity> {
     })
 }
 
-fn unlink_socket_identity(
+pub(super) fn unlink_socket_identity(
     path: &Path,
     owner: u32,
     expected: SocketIdentity,

@@ -157,11 +157,13 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
         key: &ResourceKey,
         before: Option<&NetworkValue>,
         after: Option<&NetworkValue>,
-    ) -> io::Result<()> {
-        let interface = link_index(key)?;
+        prepare: Option<&mut dyn FnMut() -> io::Result<()>>,
+    ) -> Result<(), RouteRefreshError> {
+        let unchanged = RouteRefreshError::Unchanged;
+        let interface = link_index(key).map_err(unchanged)?;
         for value in [before, after].into_iter().flatten() {
             if value.key() != *key {
-                return Err(invalid());
+                return Err(unchanged(invalid()));
             }
             if let NetworkValue::LinkDns(d) = value {
                 if d.servers.is_empty()
@@ -175,26 +177,21 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
                         .len()
                         != d.servers.len()
                 {
-                    return Err(invalid());
+                    return Err(unchanged(invalid()));
                 }
             }
         }
-        if self.read_link_dns(key)?.as_ref() != before {
-            return Err(io::Error::other("network_resource_changed"));
-        }
+        self.prepare_exchange(key, before, None)?;
         if before == after {
             return Ok(());
         }
         if after.is_some() {
-            self.verify_resolver()?;
-            // The two manager queries may block. Do not apply a stale CAS
-            // observation after another owner changed this link meanwhile.
-            if self.read_link_dns(key)?.as_ref() != before {
-                return Err(io::Error::other("network_resource_changed"));
-            }
+            self.verify_resolver().map_err(unchanged)?;
+            // The two manager queries may block. Check again before the setter.
+            self.prepare_exchange(key, before, None)?;
         }
-        if !self.dns_link_present(interface)? {
-            return Err(invalid());
+        if !self.dns_link_present(interface).map_err(unchanged)? {
+            return Err(unchanged(invalid()));
         }
         let mut args = vec![
             "call".into(),
@@ -207,7 +204,7 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
                 let servers = match after {
                     Some(NetworkValue::LinkDns(d)) => d.servers.as_slice(),
                     None => &[],
-                    _ => return Err(invalid()),
+                    _ => return Err(unchanged(invalid())),
                 };
                 args.extend([
                     "SetLinkDNS".into(),
@@ -236,14 +233,17 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
                     args.push("0".into());
                 }
             }
-            _ => return Err(invalid()),
+            _ => return Err(unchanged(invalid())),
         }
         // One setter instead of a delete/add pair. NetworkOwner verifies readback
         // and rolls back known results; an unrecognized partial value stays
         // cleanup-pending rather than authorizing a blind resolver reset.
+        if prepare.is_some() {
+            self.prepare_exchange(key, before, prepare)?;
+        }
         self.commands.busctl(&args)?;
         if !self.dns_link_present(interface)? {
-            return Err(invalid());
+            return Err(invalid().into());
         }
         Ok(())
     }

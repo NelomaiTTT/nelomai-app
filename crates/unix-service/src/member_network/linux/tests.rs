@@ -16,10 +16,11 @@ impl LinuxNetworkCommands for Commands {
     fn ip(&mut self, args: &[String]) -> io::Result<String> {
         self.calls.push(args.to_vec());
         let value = self.replies.pop_front().unwrap_or_default();
-        if value == "command_failure" {
-            return Err(io::Error::other("injected native failure"));
+        match value.as_str() {
+            "command_failure" => Err(io::Error::other("injected native failure")),
+            "route_collision" => Err(io::ErrorKind::AlreadyExists.into()),
+            _ => Ok(value),
         }
-        Ok(value)
     }
     fn interface_name(&self, index: u32) -> io::Result<String> {
         if index == 20 && self.reused_b_index {
@@ -81,6 +82,272 @@ fn route(cidr: &str, scope: RouteScope, interface: u32) -> NetworkValue {
         gateway: None,
         metric: 42,
     })
+}
+
+#[test]
+fn rejected_new_route_add_reports_no_native_write() {
+    let value = route("198.18.0.1/32", RouteScope::Member(10), 10);
+    let mut native = adapter(&["[]", "[]", "route_collision"]);
+    let result =
+        native.compare_exchange_prepared(&value.key(), None, Some(&value), Some(&mut || Ok(())));
+    assert!(matches!(
+        result,
+        Err(RouteRefreshError::Unchanged(error)) if error.kind() == io::ErrorKind::AlreadyExists
+    ));
+}
+
+#[test]
+fn effective_endpoint_lookup_requires_physical_device_gateway_and_main_table() {
+    let endpoint = "198.51.100.7".parse().unwrap();
+    let expected = RouteValue {
+        destination: "0.0.0.0/0".parse().unwrap(),
+        scope: RouteScope::Global,
+        interface: 5,
+        gateway: Some("192.168.1.1".parse().unwrap()),
+        metric: 100,
+    };
+    let readback = r#"[{"dst":"198.51.100.7","gateway":"192.168.1.1","dev":"eth0","prefsrc":"192.168.1.7","uid":0,"cache":[]}]"#;
+    let mut linux = adapter(&[readback]);
+    linux
+        .verify_physical_endpoint(endpoint, std::slice::from_ref(&expected))
+        .unwrap();
+    assert_eq!(
+        linux.commands.calls[0],
+        ["-j", "-N", "-4", "route", "get", "198.51.100.7"]
+    );
+    for other in [
+        readback.replace("eth0", "nlm-wga"),
+        readback.replace("192.168.1.1", "192.168.1.2"),
+        readback.replace(r#""uid":0"#, r#""table":52000"#),
+        readback.replace("198.51.100.7", "198.51.100.8"),
+    ] {
+        assert!(adapter(&[&other])
+            .verify_physical_endpoint(endpoint, std::slice::from_ref(&expected))
+            .is_err());
+    }
+}
+
+#[test]
+fn ordinary_boot_protocol_routes_and_interface_scoped_link_local_lans_are_read_only() {
+    let v4 = r#"[{"dst":"default","dev":"eth0","gateway":"192.0.2.1","flags":[]}]"#;
+    let v6 = r#"[{"dst":"fe80::/64","dev":"eth0","protocol":"2","metric":256,"flags":[],"pref":"medium"},{"dst":"fe80::/64","dev":"nlm-wga","protocol":"2","metric":256,"flags":[],"pref":"medium"}]"#;
+    let mut linux = adapter(&[PHYSICAL_LINKS, MAIN_RULES, v4, MAIN_RULES, v6, v4]);
+    let routes = linux
+        .resolve_physical_routes(
+            &nelomai_client_tunnel::DesktopTunnelOptions {
+                exclude_local_networks: true,
+                ..Default::default()
+            },
+            &["198.51.100.1".parse().unwrap()],
+            &[],
+        )
+        .unwrap();
+    assert!(routes.exclusions.contains(&"fe80::/64".parse().unwrap()));
+    assert_eq!(routes.retained_routes.len(), 1);
+    assert!(linux
+        .verify_retained_route(&routes.retained_routes[0])
+        .unwrap());
+    assert!(linux
+        .commands
+        .calls
+        .iter()
+        .all(|c| c.iter().any(|x| x == "show")));
+}
+
+#[test]
+fn physical_interfaces_are_never_written_even_for_gateway_free_static_or_legacy_rows() {
+    let mut network = adapter(&[]);
+    for scope in [RouteScope::Global, RouteScope::Member(5)] {
+        let physical = route("198.18.0.1/32", scope, 5);
+        let vpn = route("198.18.0.1/32", scope, 10);
+        for (old, new) in [
+            (None, Some(&physical)),
+            (Some(&physical), None),
+            (Some(&physical), Some(&vpn)),
+            (Some(&vpn), Some(&physical)),
+        ] {
+            assert!(network.compare_exchange(&physical.key(), old, new).is_err());
+        }
+    }
+    assert!(network.commands.calls.is_empty());
+}
+
+#[test]
+fn foreign_vpn_route_covering_endpoint_is_rejected_even_when_physical_default_exists() {
+    let text = r#"[{"dst":"default","dev":"eth0","gateway":"192.0.2.254","protocol":16},{"dst":"198.51.100.0/24","dev":"nlm-wga","protocol":4,"metric":42,"scope":253}]"#;
+    let endpoint = "198.51.100.7".parse().unwrap();
+    assert!(adapter(&[PHYSICAL_LINKS, MAIN_RULES, text])
+        .resolve_physical_routes(&Default::default(), &[endpoint], &[])
+        .is_err());
+    let NetworkValue::Route(own) = route("198.51.100.0/24", RouteScope::Global, 10) else {
+        unreachable!()
+    };
+    let projection = adapter(&[PHYSICAL_LINKS, MAIN_RULES, text])
+        .resolve_physical_routes(&Default::default(), &[endpoint], &[own])
+        .unwrap();
+    assert_eq!(projection.exclusions, [IpNet::from(endpoint)]);
+    assert!(projection.existing.iter().all(|n| n.prefix_len() == 0));
+    assert!(projection.retained_routes.iter().all(|r| r.interface == 5));
+}
+
+#[test]
+fn live_replacement_collision_preserves_foreign_route() {
+    use nelomai_client_tunnel::redundancy::Slot;
+
+    struct Store;
+    impl NetworkJournalStore for Store {
+        fn save(&mut self, _: &NetworkJournal) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const OLD: &str =
+        r#"[{"dst":"198.18.0.1","dev":"nlm-wgb","protocol":4,"metric":42,"scope":253}]"#;
+    const NEW: &str =
+        r#"[{"dst":"198.18.0.1","dev":"nlm-wga","protocol":4,"metric":42,"scope":253}]"#;
+    let old = route("198.18.0.1/32", RouteScope::Global, 20);
+    let new = route("198.18.0.1/32", RouteScope::Global, 10);
+    let mut owner = NetworkOwner::fresh(
+        adapter(&[
+            "[]",
+            "[]",
+            "",
+            OLD, // Initial installation of our old route.
+            OLD,
+            OLD,
+            OLD,
+            OLD,
+            "",
+            "route_collision", // Delete succeeded, add is rejected.
+            NEW,
+            NEW,
+            "",
+            "",
+            OLD, // Any rollback sees a foreign exact match.
+        ]),
+        Store,
+    );
+    owner.select(Slot::A, vec![old]).unwrap();
+    assert!(owner.select_with_outcome(Slot::A, vec![new]).is_err());
+    owner.cleanup().unwrap();
+    let calls = &owner.system_mut().commands.calls;
+    assert!(calls.iter().any(|args| args.starts_with(&[
+        "-4".into(),
+        "route".into(),
+        "add".into()
+    ]) && args.windows(2).any(|w| w == ["dev", "nlm-wga"])));
+    assert!(
+        !calls.iter().any(
+            |args| args.starts_with(&["-4".into(), "route".into(), "del".into()])
+                && args.windows(2).any(|w| w == ["dev", "nlm-wga"])
+        ),
+        "rollback deletes foreign replacement after rejected add: {calls:?}"
+    );
+}
+#[test]
+fn stop_preserves_foreign_route_after_a_rollback_add_is_rejected() {
+    use nelomai_client_tunnel::redundancy::Slot;
+
+    struct Store;
+    impl NetworkJournalStore for Store {
+        fn save(&mut self, _: &NetworkJournal) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const OLD: &str =
+        r#"[{"dst":"198.18.0.1","dev":"nlm-wgb","protocol":4,"metric":42,"scope":253}]"#;
+    const NEW: &str =
+        r#"[{"dst":"198.18.0.1","dev":"nlm-wga","protocol":4,"metric":42,"scope":253}]"#;
+    let old = route("198.18.0.1/32", RouteScope::Global, 20);
+    let new = route("198.18.0.1/32", RouteScope::Global, 10);
+    let second = route("198.18.0.2/32", RouteScope::Global, 20);
+    let mut owner = NetworkOwner::fresh(
+        adapter(&[
+            "[]",
+            "[]",
+            "",
+            OLD, // Install our original route.
+            OLD,
+            OLD,
+            OLD,
+            OLD,
+            "",
+            "",
+            NEW, // Replace it successfully during refresh.
+            "[]",
+            "[]",
+            "command_failure", // Second rule fails.
+            NEW,
+            NEW,
+            NEW,
+            "",
+            "route_collision",
+            "[]",
+        ]),
+        Store,
+    );
+    owner.select(Slot::A, vec![old]).unwrap();
+    let before_refresh = owner.system_mut().commands.calls.len();
+    assert!(owner
+        .select_with_outcome(Slot::A, vec![new, second])
+        .is_err());
+    assert!(owner.cleanup_pending());
+    let after_rollback = owner.system_mut().commands.calls.len();
+    assert!(owner.system_mut().commands.calls[before_refresh..]
+        .iter()
+        .any(|args| args.starts_with(&[
+            "-4".into(),
+            "route".into(),
+            "add".into(),
+            "198.18.0.1/32".into()
+        ]) && args.windows(2).any(|pair| pair == ["dev", "nlm-wgb"])));
+    owner.cleanup().unwrap();
+    let stop = &owner.system_mut().commands.calls[after_rollback..];
+    assert!(
+        !stop.iter().any(
+            |args| args.starts_with(&["-4".into(), "route".into(), "del".into()])
+                && args.windows(2).any(|w| w == ["dev", "nlm-wgb"])
+        ),
+        "Stop deletes the route that conflicted with the rollback add: {stop:?}"
+    );
+}
+
+#[test]
+fn stop_preserves_route_reinserted_after_our_delete() {
+    use nelomai_client_tunnel::redundancy::Slot;
+
+    struct Store;
+    impl NetworkJournalStore for Store {
+        fn save(&mut self, _: &NetworkJournal) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const OLD: &str =
+        r#"[{"dst":"198.18.0.1","dev":"nlm-wgb","protocol":4,"metric":42,"scope":253}]"#;
+    let route = route("198.18.0.1/32", RouteScope::Global, 20);
+    let mut owner = NetworkOwner::fresh(
+        adapter(&[
+            "[]", "[]", "", OLD, // Nelomai installs the initial route.
+            OLD, OLD, OLD, OLD, "",
+            OLD, // Delete ACK, then a foreign exact match on readback.
+            OLD, OLD, // Rollback and Stop both see the foreign match.
+        ]),
+        Store,
+    );
+    owner.select(Slot::A, vec![route]).unwrap();
+    assert!(owner.select_with_outcome(Slot::A, vec![]).is_err());
+    let stop_from = owner.system_mut().commands.calls.len();
+    assert_eq!(
+        owner.cleanup().unwrap_err().to_string(),
+        "network_route_ownership_unconfirmed"
+    );
+    let stop_calls = &owner.system_mut().commands.calls[stop_from..];
+    assert!(
+        !stop_calls.iter().any(|args| args.starts_with(&["-4".into(), "route".into(), "del".into()])),
+        "Stop deleted the matching row installed by someone else after the original delete ACK: {stop_calls:?}"
+    );
 }
 
 fn dns_value(interface: u32) -> NetworkValue {
@@ -489,7 +756,39 @@ fn resolved_property_failure_flows_through_real_adapter_journal_and_recovery() {
 
 const PHYSICAL_LINKS: &str = r#"[{"ifindex":5,"ifname":"eth0","flags":["UP","LOWER_UP"],"link_type":"ether"},{"ifindex":10,"ifname":"nlm-wga","flags":["UP"],"link_type":"none","linkinfo":{"info_kind":"wireguard"}}]"#;
 const MAIN_RULES: &str = r#"[{"priority":0,"src":"all","table":"255"},{"priority":32766,"src":"all","table":"254"},{"priority":32767,"src":"all","table":"253"}]"#;
-const PHYSICAL_V4: &str = r#"[{"dst":"default","dev":"nlm-wga","gateway":"10.0.0.1","protocol":"4","flags":[]},{"dst":"default","dev":"eth0","gateway":"192.168.1.1","protocol":"16","metric":100,"flags":[]},{"dst":"192.168.1.0/24","dev":"eth0","protocol":"2","scope":"link","prefsrc":"192.168.1.4","metric":100,"flags":[]}]"#;
+const RULES_WITH_LATE_POLICY: &str = r#"[{"priority":0,"src":"all","table":255},{"priority":32766,"src":"all","table":254},{"priority":32767,"src":"all","table":253},{"priority":40000,"src":"all","table":100}]"#;
+const PHYSICAL_V4: &str = r#"[{"dst":"default","dev":"nlm-wga","gateway":"10.0.0.1","protocol":"4","metric":500,"flags":[]},{"dst":"default","dev":"eth0","gateway":"192.168.1.1","protocol":"16","metric":100,"flags":[]},{"dst":"192.168.1.0/24","dev":"eth0","protocol":"2","scope":"link","prefsrc":"192.168.1.4","metric":100,"flags":[]}]"#;
+
+fn verify_ordinary_main_rules(rules: &str) -> io::Result<()> {
+    let commands = Commands {
+        replies: [rules.to_owned()].into(),
+        ..Default::default()
+    };
+    LinuxNetwork::new(commands, [])?.verify_main_rules(false)
+}
+
+#[test]
+fn ordinary_main_rules_allow_policy_after_main() {
+    verify_ordinary_main_rules(RULES_WITH_LATE_POLICY).unwrap();
+}
+
+#[test]
+fn ordinary_main_rules_reject_policy_at_or_before_main() {
+    for priority in [100, 32766] {
+        let rules = RULES_WITH_LATE_POLICY
+            .replace(r#""priority":40000"#, &format!(r#""priority":{priority}"#));
+        assert!(verify_ordinary_main_rules(&rules).is_err());
+    }
+}
+
+#[test]
+fn paired_physical_discovery_still_checks_fallback_rules() {
+    assert!(
+        adapter(&[PHYSICAL_LINKS, RULES_WITH_LATE_POLICY, PHYSICAL_V4])
+            .resolve_physical_routes(&Default::default(), &["198.51.100.1".parse().unwrap()], &[])
+            .is_err()
+    );
+}
 
 #[test]
 fn full_linux_policy_checks_stub_before_start_and_uses_no_physical_dns_override() {
@@ -505,8 +804,8 @@ fn full_linux_policy_checks_stub_before_start_and_uses_no_physical_dns_override(
         .unwrap();
     assert!(p.dns_services.is_empty());
     assert_eq!(p.metric, 42);
-    assert_eq!(p.bypasses.len(), 1);
-    assert_eq!(p.bypasses[0].interface, 5);
+    assert_eq!(p.exclusions.len(), 1);
+    assert_eq!(p.retained_routes[0].interface, 5);
     assert!(network.commands.calls.iter().all(|c| !c
         .iter()
         .any(|s| matches!(s.as_str(), "add" | "del" | "call"))));
@@ -539,7 +838,7 @@ fn physical_discovery_uses_onlink_prefix_and_rejects_equal_cost_gateway_guess() 
     let result = network
         .resolve_physical_routes(&Default::default(), &["192.168.1.9".parse().unwrap()], &[])
         .unwrap();
-    assert_eq!(result.bypasses[0].gateway, None);
+    assert_eq!(result.retained_routes[0].gateway, None);
     let routes = r#"[{"dst":"default","dev":"eth0","gateway":"192.168.1.1","protocol":16,"metric":100},{"dst":"default","dev":"eth0","gateway":"192.168.1.2","protocol":16,"metric":100}]"#;
     assert!(adapter(&[PHYSICAL_LINKS, MAIN_RULES, routes])
         .resolve_physical_routes(&Default::default(), &["198.51.100.1".parse().unwrap()], &[])
@@ -590,21 +889,19 @@ fn physical_discovery_excludes_vpn_gateway_and_retains_kernel_lan_without_mutati
             &[],
         )
         .unwrap();
-    assert_eq!(result.bypasses.len(), 2);
+    assert_eq!(result.exclusions.len(), 3);
+    assert!(result.retained_routes.iter().all(|r| r.interface == 5));
     assert!(result
-        .bypasses
+        .retained_routes
         .iter()
-        .all(|r| r.interface == 5 && r.gateway == Some("192.168.1.1".parse().unwrap())));
-    assert_eq!(
-        result.retained_routes,
-        vec![RouteValue {
-            destination: "192.168.1.0/24".parse().unwrap(),
-            scope: RouteScope::Global,
-            interface: 5,
-            gateway: None,
-            metric: 100,
-        }]
-    );
+        .any(|r| r.destination == "0.0.0.0/0".parse().unwrap()
+            && r.gateway == Some("192.168.1.1".parse().unwrap())));
+    assert!(result
+        .retained_routes
+        .iter()
+        .any(|r| r.destination == "192.168.1.0/24".parse().unwrap()
+            && r.gateway.is_none()
+            && r.metric == 100));
     assert!(network
         .commands
         .calls
@@ -631,7 +928,7 @@ fn retained_kernel_route_can_be_verified_but_never_mutated_as_owned_static_route
     assert!(network
         .compare_exchange(&owned.key(), Some(&owned), None)
         .is_err());
-    assert_eq!(network.commands.calls.len(), 2);
+    assert_eq!(network.commands.calls.len(), 1);
 }
 
 #[test]
@@ -666,12 +963,18 @@ fn physical_discovery_rejects_policy_routing_instead_of_guessing_main_table() {
 }
 
 #[test]
-fn physical_discovery_keeps_existing_endpoint_unowned_unless_journal_owns_it() {
+fn legacy_physical_journal_entry_cannot_make_a_physical_endpoint_owned() {
     let text = r#"[{"dst":"default","dev":"eth0","gateway":"192.168.1.1","protocol":16},{"dst":"198.51.100.1","dev":"eth0","gateway":"192.168.1.1","protocol":4,"metric":42}]"#;
     for owned in [false, true] {
         let mut network = adapter(&[PHYSICAL_LINKS, MAIN_RULES, text]);
         let journal = if owned {
-            vec!["198.51.100.1/32".parse().unwrap()]
+            vec![RouteValue {
+                destination: "198.51.100.1/32".parse().unwrap(),
+                scope: RouteScope::Global,
+                interface: 5,
+                gateway: Some("192.168.1.1".parse().unwrap()),
+                metric: 42,
+            }]
         } else {
             vec![]
         };
@@ -682,11 +985,9 @@ fn physical_discovery_keeps_existing_endpoint_unowned_unless_journal_owns_it() {
                 &journal,
             )
             .unwrap();
-        assert_eq!(result.retained_routes.len(), usize::from(!owned));
-        assert_eq!(result.bypasses.len(), usize::from(owned));
-        if !owned {
-            assert_eq!(result.retained_routes[0].metric, 42);
-        }
+        assert_eq!(result.retained_routes.len(), 1);
+        assert_eq!(result.exclusions.len(), 1);
+        assert_eq!(result.retained_routes[0].metric, 42);
     }
 }
 
@@ -697,12 +998,12 @@ fn physical_ipv6_endpoint_uses_link_local_gateway_on_exact_interface() {
     let result = network
         .resolve_physical_routes(&Default::default(), &["2001:db8::9".parse().unwrap()], &[])
         .unwrap();
-    assert_eq!(result.bypasses[0].interface, 5);
-    assert_eq!(result.bypasses[0].gateway, Some("fe80::1".parse().unwrap()));
+    assert_eq!(result.retained_routes[0].interface, 5);
     assert_eq!(
-        result.bypasses[0].destination,
-        "2001:db8::9/128".parse().unwrap()
+        result.retained_routes[0].gateway,
+        Some("fe80::1".parse().unwrap())
     );
+    assert_eq!(result.exclusions[0], "2001:db8::9/128".parse().unwrap());
     assert!(network.commands.calls[1].contains(&"-6".into()));
 }
 
@@ -786,20 +1087,101 @@ fn registering_ambiguous_table_never_changes_existing_primary_binding() {
 }
 
 #[test]
-fn route_resource_expansion_keeps_global_routes_global_and_ipv6_rules_distinct() {
+fn route_resource_expansion_keys_main_routes_by_priority_and_keeps_ipv6_rules_distinct() {
     let network = adapter(&[]);
     let NetworkValue::Route(global) = route("0.0.0.0/1", RouteScope::Global, 10) else {
         unreachable!()
     };
     assert_eq!(
         network.route_resources(global.clone()).unwrap(),
-        vec![NetworkValue::Route(global)]
+        vec![NetworkValue::Route(RouteValue {
+            scope: RouteScope::LinuxMainPriority(52),
+            metric: 52,
+            ..global
+        })]
     );
     let NetworkValue::Route(probe) = route("2001:db8::1/128", RouteScope::Member(20), 20) else {
         unreachable!()
     };
     let resources = network.route_resources(probe).unwrap();
     assert_eq!(resources[1], network.member_rule(20, true).unwrap());
+}
+
+#[test]
+fn main_route_readback_selects_only_the_exact_priority() {
+    let rows = r#"[{"dst":"198.18.0.1","dev":"eth0","gateway":"192.0.2.1","metric":17,"protocol":16},{"dst":"198.18.0.1","dev":"nlm-wga","metric":52,"protocol":4,"scope":253},{"dst":"198.18.0.1","dev":"nlm-wgb","metric":62,"protocol":4,"scope":253}]"#;
+    let mut network = adapter(&[rows]);
+    let keys = [52, 62, 72].map(|metric| {
+        ResourceKey::Route(
+            "198.18.0.1/32".parse().unwrap(),
+            RouteScope::LinuxMainPriority(metric),
+        )
+    });
+    let actual = network.read_many(&keys).unwrap();
+    for (value, (interface, metric)) in actual[..2].iter().zip([(10, 52), (20, 62)]) {
+        assert!(
+            matches!(value, Some(NetworkValue::Route(r)) if (r.interface, r.metric) == (interface, metric))
+        );
+    }
+    assert_eq!(actual[2], None);
+}
+
+#[test]
+fn main_route_transition_fences_early_policy_for_ipv6_data_without_an_ipv6_endpoint() {
+    let rule = r#"[{"priority":0,"src":"all","table":255},{"priority":100,"src":"all","table":100},{"priority":32766,"src":"all","table":254}]"#;
+    let mut network = adapter(&[rule]);
+    let route = RouteValue {
+        destination: "2001:db8::/32".parse().unwrap(),
+        scope: RouteScope::LinuxMainPriority(52),
+        interface: 10,
+        gateway: None,
+        metric: 52,
+    };
+    assert!(network.check_main_routes(&[], &[&route]).is_err());
+    assert_eq!(network.commands.calls, [["-j", "-N", "-6", "rule", "show"]]);
+}
+
+#[test]
+fn main_route_transition_accepts_only_an_owned_detached_probe_rule() {
+    let rules = r#"[{"priority":0,"src":"all","table":255},{"priority":12001,"src":"all","table":52001,"protocol":4,"oif":"nlm-wgb","oif_detached":null},{"priority":32766,"src":"all","table":254}]"#;
+    let target = RouteValue {
+        destination: "198.18.0.1/32".parse().unwrap(),
+        scope: RouteScope::LinuxMainPriority(52),
+        interface: 10,
+        gateway: None,
+        metric: 52,
+    };
+    let mut detached = adapter(&[rules, "[]"]);
+    detached.commands.missing_b = true;
+    detached.check_main_routes(&[], &[&target]).unwrap();
+
+    let mut foreign = adapter(&[rules]);
+    assert!(
+        foreign.check_main_routes(&[], &[&target]).is_err(),
+        "a detached rule for a live link is inconsistent"
+    );
+    let wrong_table = rules.replace("52001", "50001");
+    let mut foreign = adapter(&[&wrong_table]);
+    foreign.commands.missing_b = true;
+    assert!(foreign.check_main_routes(&[], &[&target]).is_err());
+}
+
+#[test]
+fn main_route_transition_rejects_a_foreign_route_between_member_priorities() {
+    let rows = r#"[{"dst":"198.18.0.1","dev":"nlm-wga","metric":52,"protocol":4,"scope":253},{"dst":"198.18.0.1","dev":"eth0","gateway":"192.0.2.1","metric":57,"protocol":16}]"#;
+    let mut network = adapter(&[MAIN_RULES, rows]);
+    let route = |metric, interface| RouteValue {
+        destination: "198.18.0.1/32".parse().unwrap(),
+        scope: RouteScope::LinuxMainPriority(metric),
+        interface,
+        gateway: None,
+        metric,
+    };
+    assert!(network
+        .check_main_routes(&[&route(52, 10)], &[&route(62, 20)])
+        .is_err());
+    assert_eq!(network.commands.calls.len(), 2);
+    assert!(network.commands.calls[1].iter().any(|arg| arg == "route"));
 }
 
 #[test]

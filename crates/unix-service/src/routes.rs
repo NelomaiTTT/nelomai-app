@@ -7,17 +7,15 @@ mod macos;
 
 use crate::ServiceError;
 use ipnet::Ipv4Net;
-use nelomai_client_tunnel::{DesktopTunnelOptions, Ipv4RoutePlan};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{ip_command, LinuxUserspaceRouteManager, SystemRouteBackend, AWG_FWMARK};
+pub(crate) use linux::{ip_command, LinuxOrdinaryRoutes, SystemRouteBackend};
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{endpoint_route_summary, verify_endpoint_routes, SystemRouteBackend};
 
@@ -74,22 +72,10 @@ pub(crate) trait RouteBackend {
     fn discover_egress(&self) -> Result<Self::Egress, ServiceError>;
     fn local_networks(&self, egress: &Self::Egress) -> Result<Vec<Ipv4Net>, ServiceError>;
     fn fingerprint_material(&self, egress: &Self::Egress, local_networks: &[Ipv4Net]) -> String;
-    fn owned_route(&self, egress: &Self::Egress, network: Ipv4Net) -> OwnedRoute;
-    fn route_exists(&self, route: &OwnedRoute) -> Result<bool, ServiceError>;
     fn route_presence(
         &self,
         routes: &[OwnedRoute],
-    ) -> Result<Vec<Option<RouteScope>>, ServiceError> {
-        routes
-            .iter()
-            .map(|route| {
-                self.route_exists(route)
-                    .map(|exists| exists.then_some(RouteScope::Unscoped))
-            })
-            .collect()
-    }
-    fn add_route(&self, route: &OwnedRoute) -> Result<(), ServiceError>;
-    fn remove_route(&self, route: &OwnedRoute, scope: RouteScope) -> Result<(), ServiceError>;
+    ) -> Result<Vec<Option<RouteScope>>, ServiceError>;
 }
 
 pub(crate) struct RouteManager<B> {
@@ -112,101 +98,30 @@ impl<B: RouteBackend> RouteManager<B> {
         })
     }
 
-    pub(crate) fn apply(&mut self, options: &DesktopTunnelOptions) -> Result<(), ServiceError> {
-        self.cleanup()?;
-        let plan = Ipv4RoutePlan::from_options(options)
-            .map_err(|error| ServiceError::Backend(error.stable_code().to_string()))?;
-        if !plan.active() {
-            return Ok(());
-        }
-        if plan.excluded_networks.is_empty() {
-            return Ok(());
-        }
-
-        let egress = self.backend.discover_egress()?;
-        let routes = plan
-            .excluded_networks
-            .into_iter()
-            .map(|network| self.backend.owned_route(&egress, network))
-            .collect::<Vec<_>>();
-        if self
-            .backend
-            .route_presence(&routes)?
-            .into_iter()
-            .any(|presence| presence.is_some())
-        {
-            return Err(ServiceError::Backend("route_conflict".to_string()));
-        }
-        self.state.policy_hash = plan.policy_hash;
-        self.state.pending_routes = routes.clone();
-        self.persist()?;
-
-        let mut applied = Vec::with_capacity(routes.len());
-        for route in &routes {
-            if let Err(error) = self.backend.add_route(route) {
-                self.state.routes = applied;
-                self.state.pending_routes.clear();
-                let _ = self.persist();
-                let _ = self.cleanup();
-                return Err(error);
-            }
-            applied.push(route.clone());
-        }
-        self.state.routes = applied;
-        self.state.pending_routes.clear();
-        if let Err(error) = self.persist() {
-            let _ = self.cleanup();
-            return Err(error);
-        }
-        Ok(())
-    }
-
+    /// Older versions installed gateway routes in the shared OS table. The old
+    /// journal records their values, but cannot distinguish a matching foreign
+    /// replacement. Only retire the journal after those values have disappeared.
     pub(crate) fn cleanup(&mut self) -> Result<(), ServiceError> {
-        let mut first_error = None;
-        let routes = std::mem::take(&mut self.state.routes);
-        self.state.routes = self.remove_present_routes(routes, &mut first_error);
-        let pending_routes = std::mem::take(&mut self.state.pending_routes);
-        self.state.pending_routes = self.remove_present_routes(pending_routes, &mut first_error);
-        if self.state.routes.is_empty() && self.state.pending_routes.is_empty() {
-            self.state.policy_hash = None;
-            remove_state(&self.state_path)?;
-        } else {
-            self.persist()?;
-        }
-        first_error.map_or(Ok(()), Err)
-    }
-
-    fn remove_present_routes(
-        &self,
-        routes: Vec<OwnedRoute>,
-        first_error: &mut Option<ServiceError>,
-    ) -> Vec<OwnedRoute> {
-        if routes.is_empty() {
-            return Vec::new();
-        }
-        let presence = match self.backend.route_presence(&routes) {
-            Ok(presence) if presence.len() == routes.len() => presence,
-            Ok(_) => {
-                first_error.get_or_insert_with(|| {
-                    ServiceError::Backend("route_table_unavailable".to_string())
-                });
-                return routes;
-            }
-            Err(error) => {
-                first_error.get_or_insert(error);
-                return routes;
-            }
-        };
-        let mut retained = Vec::new();
-        for (route, scope) in routes.into_iter().zip(presence) {
-            if let Some(scope) = scope {
-                if let Err(error) = self.backend.remove_route(&route, scope) {
-                    first_error.get_or_insert(error);
-                    retained.push(route);
-                }
+        if self.has_routes() {
+            let rows: Vec<_> = self
+                .state
+                .routes
+                .iter()
+                .chain(&self.state.pending_routes)
+                .cloned()
+                .collect();
+            let live = self.backend.route_presence(&rows)?;
+            if live.len() != rows.len() || live.iter().any(Option::is_some) {
+                return Err(ServiceError::Backend(
+                    "network_route_ownership_unconfirmed".into(),
+                ));
             }
         }
-        retained
+        remove_state(&self.state_path)?;
+        self.state.routes.clear();
+        self.state.pending_routes.clear();
+        self.state.policy_hash = None;
+        Ok(())
     }
 
     pub(crate) fn has_routes(&self) -> bool {
@@ -221,36 +136,6 @@ impl<B: RouteBackend> RouteManager<B> {
         let material = self.backend.fingerprint_material(&egress, &local_networks);
         let digest = Sha256::digest(material.as_bytes());
         Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
-    }
-
-    fn persist(&self) -> Result<(), ServiceError> {
-        if self
-            .state
-            .routes
-            .len()
-            .saturating_add(self.state.pending_routes.len())
-            > MAX_ROUTES
-        {
-            return Err(ServiceError::Backend("route_state_too_large".to_string()));
-        }
-        let bytes = serde_json::to_vec(&self.state)
-            .map_err(|_| ServiceError::Backend("route_state_serialize_failed".to_string()))?;
-        if bytes.len() as u64 > MAX_STATE_SIZE {
-            return Err(ServiceError::Backend("route_state_too_large".to_string()));
-        }
-        let temporary = self.state_path.with_extension("json.new");
-        remove_stale_temporary(&temporary)?;
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temporary)
-            .map_err(|_| ServiceError::Backend("route_state_write_failed".to_string()))?;
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|_| ServiceError::Backend("route_state_write_failed".to_string()))?;
-        fs::rename(&temporary, &self.state_path)
-            .map_err(|_| ServiceError::Backend("route_state_activate_failed".to_string()))
     }
 }
 
@@ -286,27 +171,6 @@ fn load_state(path: &Path) -> Result<OwnedRouteState, ServiceError> {
     Ok(state)
 }
 
-fn remove_stale_temporary(path: &Path) -> Result<(), ServiceError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => {
-            return Err(ServiceError::Backend(
-                "route_state_write_failed".to_string(),
-            ))
-        }
-    };
-    if !metadata.file_type().is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-    {
-        return Err(ServiceError::Backend(
-            "route_state_write_failed".to_string(),
-        ));
-    }
-    fs::remove_file(path).map_err(|_| ServiceError::Backend("route_state_write_failed".to_string()))
-}
-
 fn remove_state(path: &Path) -> Result<(), ServiceError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -324,9 +188,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeBackend {
-        removed: RefCell<Vec<String>>,
         installed: RefCell<Vec<String>>,
-        fail_add: Option<String>,
     }
 
     impl RouteBackend for FakeBackend {
@@ -348,163 +210,62 @@ mod tests {
             format!("fake\0{local_networks:?}")
         }
 
-        fn owned_route(&self, _egress: &Self::Egress, network: Ipv4Net) -> OwnedRoute {
-            OwnedRoute {
-                destination: network.to_string(),
-                interface_identifier: "test0".to_string(),
-                gateway: Some("192.168.1.1".to_string()),
-                metric: Some(42),
-            }
-        }
-
-        fn add_route(&self, route: &OwnedRoute) -> Result<(), ServiceError> {
-            if self.fail_add.as_deref() == Some(route.destination.as_str()) {
-                Err(ServiceError::Backend("route_add_failed".to_string()))
-            } else {
-                self.installed.borrow_mut().push(route.destination.clone());
-                Ok(())
-            }
-        }
-
-        fn route_exists(&self, route: &OwnedRoute) -> Result<bool, ServiceError> {
-            Ok(self
-                .installed
-                .borrow()
+        fn route_presence(
+            &self,
+            routes: &[OwnedRoute],
+        ) -> Result<Vec<Option<RouteScope>>, ServiceError> {
+            Ok(routes
                 .iter()
-                .any(|destination| destination == &route.destination))
-        }
-
-        fn remove_route(&self, route: &OwnedRoute, _scope: RouteScope) -> Result<(), ServiceError> {
-            self.removed.borrow_mut().push(route.destination.clone());
-            self.installed
-                .borrow_mut()
-                .retain(|destination| destination != &route.destination);
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn manager_persists_and_exactly_cleans_owned_routes() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut manager = RouteManager::new(directory.path(), FakeBackend::default()).unwrap();
-        manager
-            .apply(&DesktopTunnelOptions {
-                excluded_ipv4_cidrs: vec!["203.0.113.0/24".to_string()],
-                exclude_local_networks: true,
-                policy_hash: Some("sha256:test".to_string()),
-            })
-            .unwrap();
-        assert!(manager.has_routes());
-        assert!(directory.path().join(ROUTE_STATE_FILE).exists());
-
-        manager.cleanup().unwrap();
-        assert!(!manager.has_routes());
-        assert!(!directory.path().join(ROUTE_STATE_FILE).exists());
-        assert_eq!(
-            manager.backend.removed.borrow().as_slice(),
-            ["203.0.113.0/24"]
-        );
-    }
-
-    #[test]
-    fn manager_keeps_persisted_routes_until_the_backend_decides_recovery() {
-        let directory = tempfile::tempdir().unwrap();
-        {
-            let mut manager = RouteManager::new(directory.path(), FakeBackend::default()).unwrap();
-            manager
-                .apply(&DesktopTunnelOptions {
-                    excluded_ipv4_cidrs: vec!["203.0.113.0/24".to_string()],
-                    exclude_local_networks: false,
-                    policy_hash: Some("sha256:test".to_string()),
+                .map(|r| {
+                    self.installed
+                        .borrow()
+                        .contains(&r.destination)
+                        .then_some(RouteScope::Unscoped)
                 })
-                .unwrap();
+                .collect())
         }
-
-        let recovered = RouteManager::new(directory.path(), FakeBackend::default()).unwrap();
-
-        assert!(recovered.has_routes());
-        assert!(recovered.backend.removed.borrow().is_empty());
     }
 
     #[test]
-    fn failed_route_application_cleans_every_route_owned_by_the_attempt() {
-        let directory = tempfile::tempdir().unwrap();
-        let backend = FakeBackend {
-            fail_add: Some("203.0.113.0/24".to_string()),
-            ..FakeBackend::default()
-        };
-        let mut manager = RouteManager::new(directory.path(), backend).unwrap();
-
-        let error = manager
-            .apply(&DesktopTunnelOptions {
-                excluded_ipv4_cidrs: vec![
-                    "198.51.100.0/24".to_string(),
-                    "203.0.113.0/24".to_string(),
-                ],
-                exclude_local_networks: false,
-                policy_hash: Some("sha256:test".to_string()),
-            })
-            .unwrap_err();
-
-        assert_eq!(error.code(), "route_add_failed");
-        assert!(!manager.has_routes());
-        assert!(!directory.path().join(ROUTE_STATE_FILE).exists());
-        assert_eq!(
-            manager.backend.removed.borrow().as_slice(),
-            ["198.51.100.0/24"]
-        );
-    }
-
-    #[test]
-    fn recovery_does_not_remove_a_pending_route_that_was_never_installed() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut manager = RouteManager::new(directory.path(), FakeBackend::default()).unwrap();
-        manager.state.pending_routes = vec![manager
-            .backend
-            .owned_route(&(), "203.0.113.0/24".parse().unwrap())];
-        manager.persist().unwrap();
-
-        manager.cleanup().unwrap();
-
-        assert!(manager.backend.removed.borrow().is_empty());
-        assert!(!manager.has_routes());
-        assert!(!directory.path().join(ROUTE_STATE_FILE).exists());
-    }
-
-    #[test]
-    fn recovery_does_not_remove_a_committed_route_that_no_longer_matches() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut manager = RouteManager::new(directory.path(), FakeBackend::default()).unwrap();
-        manager.state.routes = vec![manager
-            .backend
-            .owned_route(&(), "203.0.113.0/24".parse().unwrap())];
-        manager.persist().unwrap();
-
-        manager.cleanup().unwrap();
-
-        assert!(manager.backend.removed.borrow().is_empty());
-        assert!(!manager.has_routes());
-        assert!(!directory.path().join(ROUTE_STATE_FILE).exists());
-    }
-
-    #[test]
-    fn recovery_removes_a_pending_route_that_reached_the_route_table() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut manager = RouteManager::new(directory.path(), FakeBackend::default()).unwrap();
-        let route = manager
-            .backend
-            .owned_route(&(), "203.0.113.0/24".parse().unwrap());
-        manager.backend.add_route(&route).unwrap();
-        manager.state.pending_routes = vec![route];
-        manager.persist().unwrap();
-
-        manager.cleanup().unwrap();
-
-        assert_eq!(
-            manager.backend.removed.borrow().as_slice(),
-            ["203.0.113.0/24"]
-        );
-        assert!(!manager.has_routes());
+    fn legacy_committed_and_pending_rows_never_grant_authority_to_delete() {
+        use std::os::unix::fs::PermissionsExt;
+        for pending in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(ROUTE_STATE_FILE);
+            let route = OwnedRoute {
+                destination: "203.0.113.0/24".into(),
+                interface_identifier: "en0".into(),
+                gateway: Some("192.168.1.1".into()),
+                metric: None,
+            };
+            let mut state = OwnedRouteState {
+                format_version: 1,
+                ..Default::default()
+            };
+            if pending {
+                state.pending_routes.push(route.clone());
+            } else {
+                state.routes.push(route.clone());
+            }
+            fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            let backend = FakeBackend::default();
+            backend
+                .installed
+                .borrow_mut()
+                .push(route.destination.clone());
+            let mut manager = RouteManager::new(dir.path(), backend).unwrap();
+            assert_eq!(
+                manager.cleanup().unwrap_err().code(),
+                "network_route_ownership_unconfirmed"
+            );
+            assert_eq!(&*manager.backend.installed.borrow(), &[route.destination]);
+            assert!(path.exists());
+            manager.backend.installed.borrow_mut().clear();
+            manager.cleanup().unwrap();
+            assert!(!manager.has_routes());
+            assert!(!path.exists());
+        }
     }
 
     #[test]
@@ -517,23 +278,6 @@ mod tests {
         assert_eq!(fingerprint.len(), 64);
         assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert!(!fingerprint.contains("192.168.1.0"));
-    }
-
-    #[test]
-    fn existing_local_networks_are_not_installed_as_owned_routes() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut manager = RouteManager::new(directory.path(), FakeBackend::default()).unwrap();
-
-        manager
-            .apply(&DesktopTunnelOptions {
-                excluded_ipv4_cidrs: Vec::new(),
-                exclude_local_networks: true,
-                policy_hash: Some("sha256:test".to_string()),
-            })
-            .unwrap();
-
-        assert!(!manager.has_routes());
-        assert!(!directory.path().join(ROUTE_STATE_FILE).exists());
     }
 
     #[test]

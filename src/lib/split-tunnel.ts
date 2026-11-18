@@ -1,3 +1,5 @@
+import type { NativeCommandError } from "./app-model";
+
 export type SplitTunnelMode = "exclude_selected" | "include_selected";
 
 export interface SplitTunnelCapabilities {
@@ -25,6 +27,15 @@ export interface SplitTunnelAddressRule {
   scope: "this_device" | "all_devices";
   kind: "ipv4" | "domain";
   value: string;
+}
+
+export interface SavedSplitTunnelAddressRules {
+  state: SplitTunnelState;
+  applyIssue: NativeCommandError | null;
+}
+
+export interface SplitTunnelAddressRuleChange {
+  pendingMessage: string | null;
 }
 
 export interface InstalledApplication {
@@ -66,6 +77,8 @@ export function splitTunnelWarningMessage(code: string): string {
       return "Настройки split-tunnel загружены и применятся при следующем подключении. Сейчас VPN работает с прямым доступом к локальной сети, без пользовательских исключений.";
     case "split_tunnel_apply_failed":
       return "Новые настройки не применились. Продолжаем использовать предыдущие.";
+    case "split_tunnel_default_routes_restored":
+      return "Новые правила не применились. VPN снова подключён без пользовательских исключений.";
     case "split_tunnel_stop_failed":
       return "Не удалось остановить VPN для применения настроек. Закройте split-tunnel и повторите отключение.";
     case "split_tunnel_rollback_failed":
@@ -78,6 +91,8 @@ export function splitTunnelWarningMessage(code: string): string {
       return "Не удалось применить новые настройки к текущему подключению. Отключитесь и подключитесь снова.";
     case "split_tunnel_domain_resolution_failed":
       return "Не удалось обновить адрес домена. Используем последний рабочий адрес и повторим позже.";
+    case "route_plan_too_large":
+      return "Список адресов для раздельного туннелирования слишком большой. Сократите список исключений.";
     case "split_tunnel_domain_resolution_unavailable":
       return "Не удалось определить адрес домена. Проверьте интернет и нажмите «Принудительная синхронизация».";
     case "tunnel_runtime_stopped":

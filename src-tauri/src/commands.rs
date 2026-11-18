@@ -11,7 +11,7 @@ use nelomai_client_application::{ApplicationError, LoginParameters};
 use nelomai_client_container::RuntimeSwitchStatusV1;
 use nelomai_client_core::{
     split_tunnel_active, ConnectOptions, CoreApiError, CoreError, CoreState, Phase,
-    SplitTunnelContext,
+    SavedSplitTunnelAddressRules, SplitTunnelContext,
 };
 use nelomai_client_tunnel::{TunnelCapabilities, TunnelPlatform};
 #[cfg(any(target_os = "android", test))]
@@ -19,8 +19,9 @@ use nelomai_contracts::ConnectionIntentCapability;
 use nelomai_contracts::{
     AppNotificationList, AppNotificationReadResponse, BindPeerRequest, Bootstrap, Connection,
     EgressMode, Layer, PeerBinding, PeerBindingResponse, PeerOptions, Platform, ProbeResults,
-    RouteMode, RuntimeSlot, SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate,
-    SplitTunnelMode, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
+    RouteMode, RuntimeSlot, SplitTunnelAddressRule, SplitTunnelAddressRuleScope,
+    SplitTunnelAddressRuleUpdate, SplitTunnelMode, SplitTunnelPolicy, SplitTunnelSelectedPackage,
+    SplitTunnelSettingsUpdate, TicConnectionMode,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "android")]
@@ -1072,6 +1073,9 @@ impl CommandError {
             ),
             CoreError::Api(error) => Self::from_api(error),
             CoreError::Tunnel(code) => match code.as_str() {
+                "split_tunnel_refresh_unconfirmed" => Self::new(
+                    code, "Служба VPN не подтвердила применение новых правил.",
+                ),
                 "tunnel_start_timeout" => Self::new(
                     "tunnel_start_timeout",
                     "Подключение не успело запуститься. Проверьте сеть и повторите запуск",
@@ -1097,9 +1101,23 @@ impl CommandError {
                     "split_tunnel_empty_include_selection",
                     "Выберите хотя бы одно приложение для подключения через VPN",
                 ),
+                "split_tunnel_domain_resolution_unavailable" => Self::new(
+                    code, "Не удалось определить адрес домена. Проверьте сеть и повторите синхронизацию.",
+                ),
+                "split_tunnel_policy_deferred" | "split_tunnel_saved_connection_unavailable" => Self::new(
+                    code, "Правила применятся при следующем подключении.",
+                ),
+                "split_tunnel_apply_deferred" => Self::new(
+                    "split_tunnel_apply_deferred",
+                    "Настройки сохранены. Приложение повторит их применение, когда подключение будет готово",
+                ),
                 "split_tunnel_apply_failed" => Self::new(
                     "split_tunnel_apply_failed",
                     "Не удалось применить новые настройки. Предыдущее подключение восстановлено",
+                ),
+                "split_tunnel_default_routes_restored" => Self::new(
+                    "split_tunnel_default_routes_restored",
+                    "Новые правила не применились. VPN снова подключён без пользовательских исключений",
                 ),
                 "split_tunnel_stop_failed" => Self::new(
                     "split_tunnel_stop_failed",
@@ -1113,10 +1131,12 @@ impl CommandError {
                     "split_tunnel_address_rule_invalid",
                     "Укажите корректный IPv4-адрес, домен или HTTP(S)-ссылку",
                 ),
-                _ => Self::new(
-                    "split_tunnel_policy_unavailable",
-                    "Настройки split-tunnel временно недоступны",
-                ),
+                _ => Self::from_route_error(&code).unwrap_or_else(|| {
+                    Self::new(
+                        "split_tunnel_policy_unavailable",
+                        "Настройки split-tunnel временно недоступны",
+                    )
+                }),
             },
         }
     }
@@ -2955,13 +2975,14 @@ pub async fn app_login(
         response.clone(),
     ))
     .await;
-    schedule_startup_split_tunnel_refresh(
+    Box::pin(schedule_startup_split_tunnel_refresh(
         app.clone(),
         application.inner().clone(),
         diagnostics.inner().clone(),
         split_tunnel_scheduler.inner().clone(),
         response.clone(),
-    );
+    ))
+    .await;
     observe_and_schedule_update(
         application.inner().clone(),
         updater.inner().clone(),
@@ -3046,13 +3067,14 @@ pub async fn app_bootstrap(
     );
     #[cfg(desktop)]
     diagnostics.set_automatic_device(&response.device.id);
-    schedule_startup_split_tunnel_refresh(
+    Box::pin(schedule_startup_split_tunnel_refresh(
         app.clone(),
         application.inner().clone(),
         diagnostics.inner().clone(),
         split_tunnel_scheduler.inner().clone(),
         response.clone(),
-    );
+    ))
+    .await;
     schedule_android_background_provision(
         app.clone(),
         application.inner().clone(),
@@ -4327,18 +4349,25 @@ pub struct SplitTunnelStateResponse {
     mandatory_excluded_packages: Vec<String>,
     suggested_name_fragments: Vec<String>,
     selected_packages: Vec<String>,
-    address_rules: Vec<SplitTunnelAddressRuleResponse>,
+    address_rules: Vec<SplitTunnelAddressRule>,
     warning: Option<String>,
     capabilities: SplitTunnelCapabilitiesResponse,
 }
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SplitTunnelAddressRuleResponse {
-    id: i64,
-    scope: &'static str,
-    kind: &'static str,
-    value: String,
+pub struct SavedAddressRulesResponse {
+    state: SplitTunnelStateResponse,
+    apply_issue: Option<CommandError>,
+}
+
+impl SavedAddressRulesResponse {
+    fn new(saved: SavedSplitTunnelAddressRules, capabilities: TunnelCapabilities) -> Self {
+        Self {
+            state: split_tunnel_state_response(Some(saved.policy), capabilities, saved.warning),
+            apply_issue: saved.apply_issue.map(CommandError::from_core),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -4401,10 +4430,19 @@ pub async fn app_split_tunnel_state(
     application: State<'_, Arc<NativeApplication>>,
     split_tunnel_scheduler: State<'_, Arc<SplitTunnelScheduler>>,
 ) -> Result<SplitTunnelStateResponse, CommandError> {
-    let _ = split_tunnel_scheduler
-        .synchronize(&application, false)
-        .await;
-    split_tunnel_state(&application).await
+    runtime_state_if_channel_open(|| application.runtime_channel_closed(), async {
+        if cfg!(windows) {
+            let epoch = application.start_cancellation_epoch();
+            split_tunnel_scheduler.wait_for_startup_sync().await;
+            application.check_start_cancellation(epoch)?;
+        }
+        #[cfg(target_os = "android")]
+        let _ = split_tunnel_scheduler
+            .synchronize(&application, false)
+            .await;
+        split_tunnel_state(&application).await
+    })
+    .await
 }
 
 #[tauri::command]
@@ -4461,18 +4499,20 @@ pub async fn app_split_tunnel_refresh(
 pub async fn app_split_tunnel_add_address_rule(
     application: State<'_, Arc<NativeApplication>>,
     request: SplitTunnelAddressRuleRequest,
-) -> Result<SplitTunnelStateResponse, CommandError> {
-    application
-        .add_split_tunnel_address_rule(
-            &SplitTunnelAddressRuleUpdate {
-                value: request.value,
-                scope: request.scope,
-            },
-            now_unix(),
-        )
-        .await
-        .map_err(CommandError::from)?;
-    split_tunnel_state(&application).await
+) -> Result<SavedAddressRulesResponse, CommandError> {
+    let request = SplitTunnelAddressRuleUpdate {
+        value: request.value,
+        scope: request.scope,
+    };
+    runtime_state_if_channel_open(|| application.runtime_channel_closed(), async {
+        let capabilities = application.split_tunnel_capabilities().await?;
+        application
+            .add_split_tunnel_address_rule(&request, now_unix())
+            .await
+            .map(|saved| SavedAddressRulesResponse::new(saved, capabilities))
+            .map_err(Into::into)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -4480,12 +4520,16 @@ pub async fn app_split_tunnel_remove_address_rule(
     application: State<'_, Arc<NativeApplication>>,
     rule_id: i64,
     scope: SplitTunnelAddressRuleScope,
-) -> Result<SplitTunnelStateResponse, CommandError> {
-    application
-        .remove_split_tunnel_address_rule(rule_id, scope, now_unix())
-        .await
-        .map_err(CommandError::from)?;
-    split_tunnel_state(&application).await
+) -> Result<SavedAddressRulesResponse, CommandError> {
+    runtime_state_if_channel_open(|| application.runtime_channel_closed(), async {
+        let capabilities = application.split_tunnel_capabilities().await?;
+        application
+            .remove_split_tunnel_address_rule(rule_id, scope, now_unix())
+            .await
+            .map(|saved| SavedAddressRulesResponse::new(saved, capabilities))
+            .map_err(Into::into)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -4633,15 +4677,26 @@ fn schedule_push_registration(
 async fn split_tunnel_state(
     application: &NativeApplication,
 ) -> Result<SplitTunnelStateResponse, CommandError> {
+    let epoch = application.start_cancellation_epoch();
     let capabilities = application
         .split_tunnel_capabilities()
         .await
         .map_err(CommandError::from)?;
     let warning = application.split_tunnel_warning().await;
     let policy = application
-        .cached_split_tunnel_policy()
+        .saved_split_tunnel_policy()
+        .await
         .map_err(CommandError::from)?;
-    Ok(match policy {
+    application.check_start_cancellation(epoch)?;
+    Ok(split_tunnel_state_response(policy, capabilities, warning))
+}
+
+fn split_tunnel_state_response(
+    policy: Option<SplitTunnelPolicy>,
+    capabilities: TunnelCapabilities,
+    warning: Option<String>,
+) -> SplitTunnelStateResponse {
+    match policy {
         Some(policy) => SplitTunnelStateResponse {
             available: true,
             enabled: policy.enabled,
@@ -4650,22 +4705,7 @@ async fn split_tunnel_state(
             mandatory_excluded_packages: policy.mandatory_excluded_packages,
             suggested_name_fragments: policy.suggested_name_fragments,
             selected_packages: policy.selected_packages,
-            address_rules: policy
-                .address_rules
-                .into_iter()
-                .map(|rule| SplitTunnelAddressRuleResponse {
-                    id: rule.id,
-                    scope: match rule.scope {
-                        SplitTunnelAddressRuleScope::ThisDevice => "this_device",
-                        SplitTunnelAddressRuleScope::AllDevices => "all_devices",
-                    },
-                    kind: match rule.kind {
-                        nelomai_contracts::SplitTunnelAddressRuleKind::Ipv4 => "ipv4",
-                        nelomai_contracts::SplitTunnelAddressRuleKind::Domain => "domain",
-                    },
-                    value: rule.value,
-                })
-                .collect(),
+            address_rules: policy.address_rules,
             warning,
             capabilities: capabilities.into(),
         },
@@ -4681,7 +4721,7 @@ async fn split_tunnel_state(
             warning,
             capabilities: capabilities.into(),
         },
-    })
+    }
 }
 
 impl From<TunnelCapabilities> for SplitTunnelCapabilitiesResponse {
@@ -4732,14 +4772,19 @@ fn refresh_installed_applications(
         .collect())
 }
 
-fn schedule_startup_split_tunnel_refresh(
+async fn schedule_startup_split_tunnel_refresh(
     app: AppHandle,
     application: Arc<NativeApplication>,
     diagnostics: Arc<AppDiagnostics>,
     scheduler: Arc<SplitTunnelScheduler>,
     bootstrap: Bootstrap,
 ) {
-    tauri::async_runtime::spawn(async move {
+    let wait_for_initial_policy = cfg!(windows)
+        && application
+            .cached_split_tunnel_policy()
+            .is_ok_and(|policy| policy.is_none());
+    let sync_scheduler = scheduler.clone();
+    let sync = async move {
         #[cfg(target_os = "android")]
         {
             diagnostics.record_named("startup.application_inventory.scheduled", None, None, None);
@@ -4790,7 +4835,7 @@ fn schedule_startup_split_tunnel_refresh(
         }
         #[cfg(not(target_os = "android"))]
         let _ = (&app, &diagnostics, &bootstrap);
-        let synchronized = scheduler.synchronize(&application, false).await;
+        let synchronized = sync_scheduler.synchronize(&application, false).await;
         #[cfg(target_os = "android")]
         if synchronized.is_ok() {
             // A first login may have prepared a fallback before policy and
@@ -4807,7 +4852,10 @@ fn schedule_startup_split_tunnel_refresh(
         }
         #[cfg(not(target_os = "android"))]
         let _ = synchronized;
-    });
+    };
+    scheduler
+        .schedule_startup_sync(wait_for_initial_policy, sync)
+        .await;
 }
 
 pub(crate) async fn refresh_installed_applications_before_start(
@@ -4816,6 +4864,13 @@ pub(crate) async fn refresh_installed_applications_before_start(
     layer: Layer,
     route_mode: RouteMode,
 ) -> Result<(), ApplicationError> {
+    if cfg!(windows) {
+        let epoch = application.start_cancellation_epoch();
+        app.state::<Arc<SplitTunnelScheduler>>()
+            .wait_for_startup_sync()
+            .await;
+        application.check_start_cancellation(epoch)?;
+    }
     let capabilities = application.split_tunnel_capabilities().await?;
     let policy = application.cached_split_tunnel_policy()?;
     let inventory_required = capabilities.application_split_tunnel

@@ -141,13 +141,8 @@ fn assert_start_fenced(pair: &mut Pair) {
         timeout_ms: 4000,
     };
     let policy = super::super::session::NetworkPolicy {
-        bypasses: vec![nelomai_client_tunnel::redundancy::network::RouteValue {
-            destination: "192.0.2.1/32".parse().unwrap(),
-            scope: nelomai_client_tunnel::redundancy::network::RouteScope::Global,
-            interface: 5,
-            gateway: Some("192.0.2.254".parse().unwrap()),
-            metric: 42,
-        }],
+        exclusions: vec!["192.0.2.1/32".parse().unwrap()],
+        existing: vec![],
         retained_routes: vec![],
         dns_services: vec![],
         metric: 42,

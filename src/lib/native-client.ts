@@ -25,6 +25,7 @@ import type {
   SplitTunnelSaveResult,
   SplitTunnelSettingsUpdate,
   SplitTunnelAddressRule,
+  SavedSplitTunnelAddressRules,
   SplitTunnelState,
 } from "./split-tunnel";
 
@@ -254,7 +255,7 @@ export function createNativeClient(
     ) =>
       invoke("app_split_tunnel_add_address_rule", {
         request: { value, scope },
-      }) as Promise<SplitTunnelState>,
+      }) as Promise<SavedSplitTunnelAddressRules>,
     removeSplitTunnelAddressRule: (
       ruleId: number,
       scope: SplitTunnelAddressRule["scope"],
@@ -262,7 +263,7 @@ export function createNativeClient(
       invoke("app_split_tunnel_remove_address_rule", {
         ruleId,
         scope,
-      }) as Promise<SplitTunnelState>,
+      }) as Promise<SavedSplitTunnelAddressRules>,
     logout: () => invoke("app_logout") as Promise<void>,
   };
 }

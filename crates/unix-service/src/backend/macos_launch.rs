@@ -1,6 +1,7 @@
 //! Launch provenance, never name-only adoption. The native reader sends no UAPI
 //! requests. Environment buffers are bounded and zeroized; errors are redacted.
 use super::member_owner::{MemberTransport, UserspaceIdentity};
+use super::redundancy::SocketIdentity;
 use serde::{Deserialize, Serialize};
 use std::{
     io,
@@ -12,59 +13,8 @@ pub(super) const NONCE_ENV: &str = "NELOMAI_MEMBER_LAUNCH_NONCE";
 const NAME_ENV: &[u8] = b"WG_TUN_NAME_FILE";
 const MAX_ARGS: usize = 256 * 1024;
 const PEER_WAIT_MS: u64 = 200;
+const MANAGED_PEER_WAIT_MS: u64 = 3000;
 const PEER_POLL_MS: u64 = 10;
-const MAX_PEER_RETRIES: usize = 20;
-
-/// Invocation-local evidence, never serialized or reconstructed from absence.
-pub(super) enum LaunchFailure<E> {
-    NotSpawned(E),
-    SpawnedOrUnknown(E),
-}
-impl<E> std::fmt::Debug for LaunchFailure<E> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::NotSpawned(_) => "NotSpawned([redacted])",
-            Self::SpawnedOrUnknown(_) => "SpawnedOrUnknown([redacted])",
-        })
-    }
-}
-impl<E> LaunchFailure<E> {
-    #[cfg(target_os = "macos")]
-    pub(super) fn map<F>(self, map: impl FnOnce(E) -> F) -> LaunchFailure<F> {
-        match self {
-            Self::NotSpawned(e) => LaunchFailure::NotSpawned(map(e)),
-            Self::SpawnedOrUnknown(e) => LaunchFailure::SpawnedOrUnknown(map(e)),
-        }
-    }
-    pub(super) fn into_error(self) -> E {
-        match self {
-            Self::NotSpawned(e) | Self::SpawnedOrUnknown(e) => e,
-        }
-    }
-}
-trait CommandLauncher {
-    type Guardian;
-    type Child;
-    fn prepare(&mut self) -> io::Result<Self::Guardian>;
-    fn spawn(&mut self) -> io::Result<Self::Child>;
-    fn wait(&mut self, child: &mut Self::Child, guardian: &mut Self::Guardian) -> io::Result<bool>;
-}
-fn command_attempt(
-    launcher: &mut impl CommandLauncher,
-    nonzero: &'static str,
-) -> Result<(), LaunchFailure<io::Error>> {
-    let mut guardian = launcher.prepare().map_err(LaunchFailure::NotSpawned)?;
-    let mut child = launcher.spawn().map_err(LaunchFailure::NotSpawned)?;
-    // Once spawn returns a child, neither an error nor successful termination
-    // proves that the daemon never ran (including guardian release failure).
-    if !launcher
-        .wait(&mut child, &mut guardian)
-        .map_err(LaunchFailure::SpawnedOrUnknown)?
-    {
-        return Err(LaunchFailure::SpawnedOrUnknown(io::Error::other(nonzero)));
-    }
-    Ok(())
-}
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,6 +23,16 @@ pub(super) struct LaunchReceipt {
     pub boot: String,
     pub launch_nonce: String,
     pub executable: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed: Option<ManagedUtun>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ManagedUtun {
+    pub name: String,
+    pub index: u32,
+    /// Written before publishing the listener or handing either FD to the child.
+    pub socket: Option<SocketIdentity>,
 }
 impl std::fmt::Debug for LaunchReceipt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -92,6 +52,15 @@ impl LaunchReceipt {
                     c,
                     std::path::Component::RootDir | std::path::Component::Normal(_)
                 )
+            })
+            && self.managed.as_ref().is_none_or(|managed| {
+                managed.index != 0
+                    && managed.name.strip_prefix("utun").is_some_and(|unit| {
+                        !unit.is_empty()
+                            && unit.len() <= 10
+                            && unit.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                    && managed.socket.is_none_or(|socket| socket.inode != 0)
             })
             && n.len() == 36
             && n[14] == b'4'
@@ -121,6 +90,27 @@ struct Process {
     started_usec: u64,
     executable: PathBuf,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProcessStamp {
+    pid: i32,
+    started_sec: u64,
+    started_usec: u64,
+}
+impl ProcessStamp {
+    pub(super) fn valid(self) -> bool {
+        self.pid > 1 && self.started_sec != 0 && self.started_usec < 1_000_000
+    }
+}
+impl From<Process> for ProcessStamp {
+    fn from(value: Process) -> Self {
+        Self {
+            pid: value.pid,
+            started_sec: value.started_sec,
+            started_usec: value.started_usec,
+        }
+    }
+}
 /// Each read is independently fallible. Holding the channel across the two
 /// observations ties PID evidence to the actual named UAPI listener.
 trait LaunchProbe {
@@ -136,8 +126,12 @@ trait LaunchProbe {
 pub(super) struct VerifiedLaunch {
     receipt: LaunchReceipt,
     identity: UserspaceIdentity,
+    process: ProcessStamp,
 }
 impl VerifiedLaunch {
+    pub(super) fn managed_process(&self) -> Option<ProcessStamp> {
+        self.receipt.managed.as_ref().map(|_| self.process)
+    }
     pub(super) fn into_identity(self, receipt: &LaunchReceipt) -> io::Result<UserspaceIdentity> {
         if self.receipt != *receipt {
             return Err(invalid());
@@ -145,6 +139,21 @@ impl VerifiedLaunch {
         Ok(self.identity)
     }
 }
+#[cfg(target_os = "macos")]
+pub(super) struct VerifiedLegacy {
+    transport: MemberTransport,
+    identity: UserspaceIdentity,
+}
+#[cfg(target_os = "macos")]
+impl VerifiedLegacy {
+    pub(super) fn transport(&self) -> MemberTransport {
+        self.transport
+    }
+    pub(super) fn into_identity(self) -> UserspaceIdentity {
+        self.identity
+    }
+}
+
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, "member_launch_unproven")
 }
@@ -156,12 +165,51 @@ fn attest(
     state_file: &Path,
     probe: &mut impl LaunchProbe,
 ) -> io::Result<VerifiedLaunch> {
-    if !receipt.valid() || !state_file.is_absolute() {
+    if !receipt.valid() {
         return Err(invalid());
     }
-    let deadline = probe.now_ms().saturating_add(PEER_WAIT_MS);
+    let (identity, process) = attest_identity(
+        &receipt.boot,
+        &receipt.executable,
+        Some(&receipt.launch_nonce),
+        state_file,
+        probe,
+        receipt.managed.as_ref(),
+    )?;
+    Ok(VerifiedLaunch {
+        receipt: receipt.clone(),
+        identity,
+        process,
+    })
+}
+
+fn attest_identity(
+    boot: &str,
+    executable: &Path,
+    nonce: Option<&str>,
+    state_file: &Path,
+    probe: &mut impl LaunchProbe,
+    managed: Option<&ManagedUtun>,
+) -> io::Result<(UserspaceIdentity, ProcessStamp)> {
+    if !state_file.is_absolute() {
+        return Err(invalid());
+    }
+    let wait_ms = if managed.is_some() {
+        MANAGED_PEER_WAIT_MS
+    } else {
+        PEER_WAIT_MS
+    };
+    let deadline = probe.now_ms().saturating_add(wait_ms);
+    let retries = wait_ms / PEER_POLL_MS;
     let before = probe.resource()?;
-    if !before.valid() || before.boot != receipt.boot {
+    if !before.valid()
+        || before.boot != boot
+        || managed.is_some_and(|managed| {
+            managed.name != before.interface
+                || managed.index != before.index
+                || managed.socket != Some(before.socket)
+        })
+    {
         return Err(invalid());
     }
     let channel = probe.connect(&before)?;
@@ -173,21 +221,16 @@ fn attest(
     // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_socket.c
     // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_usrreq.c
     // This source-based contract is not a native runtime timing test.
-    for attempt in 0..=MAX_PEER_RETRIES {
-        let observed = attest_channel(receipt, state_file, probe, &channel);
+    for attempt in 0..=retries {
+        let observed = attest_channel(executable, nonce, state_file, probe, &channel);
         if probe.resource()? != before {
             return Err(invalid());
         }
         match observed {
-            Ok(()) if probe.now_ms() <= deadline => {
-                return Ok(VerifiedLaunch {
-                    receipt: receipt.clone(),
-                    identity: before,
-                })
-            }
+            Ok(process) if probe.now_ms() <= deadline => return Ok((before, process.into())),
             Err(error)
-                if error.kind() == io::ErrorKind::WouldBlock
-                    && attempt < MAX_PEER_RETRIES
+                if (error.kind() == io::ErrorKind::WouldBlock || managed.is_some())
+                    && attempt < retries
                     && probe.now_ms() < deadline =>
             {
                 probe.wait_peer(PEER_POLL_MS.min(deadline.saturating_sub(probe.now_ms())));
@@ -198,11 +241,12 @@ fn attest(
     Err(invalid())
 }
 fn attest_channel<P: LaunchProbe>(
-    receipt: &LaunchReceipt,
+    executable: &Path,
+    nonce: Option<&str>,
     state_file: &Path,
     probe: &mut P,
     channel: &P::Channel,
-) -> io::Result<()> {
+) -> io::Result<Process> {
     let peer = probe.peer(channel)?;
     if peer.uid != 0 || peer.pid <= 0 {
         return Err(invalid());
@@ -214,12 +258,12 @@ fn attest_channel<P: LaunchProbe>(
         || process.saved_uid != 0
         || process.started_sec == 0
         || process.started_usec >= 1_000_000
-        || process.executable != receipt.executable
+        || process.executable != executable
     {
         return Err(invalid());
     }
     let args = probe.arguments(peer.pid)?;
-    check_arguments(&args, receipt, state_file)?;
+    check_process_arguments(&args, executable, nonce, state_file)?;
     drop(args); // Zeroize the whole sysctl allocation before further observations.
     if probe.process(peer.pid)? != process {
         return Err(invalid());
@@ -231,7 +275,7 @@ fn attest_channel<P: LaunchProbe>(
     if after != peer {
         return Err(peer_pending());
     }
-    Ok(())
+    Ok(process)
 }
 // Layout follows Apple's KERN_PROCARGS2 / ps: argc, saved executable path,
 // alignment NULs, argc terminated argv strings, terminated environment strings.
@@ -241,7 +285,22 @@ fn attest_channel<P: LaunchProbe>(
 // NUL/alignment. Like ps, stop at that boundary; auxiliary data is not evidence.
 // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_exec.c
 // Missing/omitted or unterminated environment is not proof.
+#[cfg(test)]
 fn check_arguments(bytes: &[u8], receipt: &LaunchReceipt, state_file: &Path) -> io::Result<()> {
+    check_process_arguments(
+        bytes,
+        &receipt.executable,
+        Some(&receipt.launch_nonce),
+        state_file,
+    )
+}
+
+fn check_process_arguments(
+    bytes: &[u8],
+    executable: &Path,
+    expected_nonce: Option<&str>,
+    state_file: &Path,
+) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     if bytes.len() < 4 || bytes.len() >= MAX_ARGS {
         return Err(invalid());
@@ -251,7 +310,7 @@ fn check_arguments(bytes: &[u8], receipt: &LaunchReceipt, state_file: &Path) -> 
         return Err(invalid());
     }
     let mut rest = &bytes[4..];
-    if take_string(&mut rest)? != receipt.executable.as_os_str().as_bytes() {
+    if take_string(&mut rest)? != executable.as_os_str().as_bytes() {
         return Err(invalid());
     }
     while rest.first() == Some(&0) {
@@ -267,7 +326,7 @@ fn check_arguments(bytes: &[u8], receipt: &LaunchReceipt, state_file: &Path) -> 
         let split = entry.iter().position(|b| *b == b'=').ok_or_else(invalid)?;
         let (key, value) = (&entry[..split], &entry[split + 1..]);
         if key == NONCE_ENV.as_bytes() {
-            if nonce || value != receipt.launch_nonce.as_bytes() {
+            if nonce || Some(value) != expected_nonce.map(str::as_bytes) {
                 return Err(invalid());
             }
             nonce = true;
@@ -278,7 +337,7 @@ fn check_arguments(bytes: &[u8], receipt: &LaunchReceipt, state_file: &Path) -> 
             name = true;
         }
     }
-    if !nonce || !name || rest.first() != Some(&0) {
+    if nonce != expected_nonce.is_some() || !name || rest.first() != Some(&0) {
         return Err(invalid());
     }
     Ok(())
@@ -308,7 +367,7 @@ fn bounded_connection<S: SocketConnect>(socket: &mut S, path: &Path) -> io::Resu
 }
 
 #[cfg(target_os = "macos")]
-pub(super) use native::{command_status, new_receipt, prove};
+pub(super) use native::{new_receipt, probe_listener, process_alive, prove, prove_ordinary_legacy};
 #[cfg(target_os = "macos")]
 mod native {
     use super::*;
@@ -326,69 +385,40 @@ mod native {
     };
     use zeroize::Zeroize;
 
-    /// Member-only typed counterpart of process::status_with_timeout. Keep
-    /// single-backend behavior on that existing runner; preserve its guardian,
-    /// timeout and error behavior here without flattening the spawn boundary.
-    pub(in crate::backend) fn command_status(
-        command: &mut std::process::Command,
-        timeout: std::time::Duration,
-        nonzero: &'static str,
-    ) -> Result<(), LaunchFailure<io::Error>> {
-        struct NativeLauncher<'a> {
-            command: &'a mut std::process::Command,
-            timeout: std::time::Duration,
+    pub(in crate::backend) fn probe_listener(path: &Path) -> io::Result<()> {
+        bounded_connection(&mut NativeSocket, path).map(drop)
+    }
+
+    pub(in crate::backend) fn process_alive(expected: ProcessStamp) -> io::Result<bool> {
+        let (count, info) = process_info(expected.pid);
+        if count == std::mem::size_of_val(&info) as i32 && info.pbi_pid as i32 == expected.pid {
+            return Ok(info.pbi_start_tvsec == expected.started_sec
+                && info.pbi_start_tvusec == expected.started_usec);
         }
-        impl CommandLauncher for NativeLauncher<'_> {
-            type Guardian = UnixStream;
-            type Child = std::process::Child;
-            fn prepare(&mut self) -> io::Result<UnixStream> {
-                use std::os::unix::process::CommandExt;
-                self.command.process_group(0);
-                nelomai_contracts::dispatcher::own_process_group(self.command)
+        // Signal 0 only tests existence. An unreadable PID is not absence.
+        if count <= 0 {
+            if unsafe { libc::kill(expected.pid, 0) } == 0 {
+                return Ok(true);
             }
-            fn spawn(&mut self) -> io::Result<std::process::Child> {
-                self.command.spawn()
-            }
-            fn wait(
-                &mut self,
-                child: &mut std::process::Child,
-                guardian: &mut UnixStream,
-            ) -> io::Result<bool> {
-                use std::{
-                    io::Write,
-                    time::{Duration, Instant},
-                };
-                fn terminate(child: &mut std::process::Child) {
-                    let _ = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                let deadline = Instant::now() + self.timeout;
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(status)) => {
-                            // Go daemon intentionally outlives this command.
-                            guardian.write_all(&[1])?;
-                            return Ok(status.success());
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            terminate(child);
-                            return Err(error);
-                        }
-                    }
-                    if Instant::now() >= deadline {
-                        terminate(child);
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "helper command timed out",
-                        ));
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
+            if io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return Ok(false);
             }
         }
-        command_attempt(&mut NativeLauncher { command, timeout }, nonzero)
+        Err(invalid())
+    }
+
+    fn process_info(pid: i32) -> (i32, libc::proc_bsdinfo) {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let count = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                std::mem::size_of_val(&info) as i32,
+            )
+        };
+        (count, info)
     }
 
     pub(in crate::backend) fn new_receipt(
@@ -417,6 +447,7 @@ mod native {
             executable,
             launch_nonce: nonce,
             boot: super::super::macos::boot_identity().map_err(|_| invalid())?,
+            managed: None,
         };
         if !receipt.valid() {
             return Err(invalid());
@@ -444,6 +475,7 @@ mod native {
     pub(in crate::backend) fn prove(
         directory: &Path,
         receipt: &LaunchReceipt,
+        ordinary: bool,
     ) -> io::Result<VerifiedLaunch> {
         trusted_binary(&receipt.executable)?;
         let proof = attest(
@@ -451,14 +483,42 @@ mod native {
             &directory.join("interface-name"),
             &mut Native {
                 directory,
+                ordinary,
                 started: std::time::Instant::now(),
             },
         )?;
         trusted_binary(&receipt.executable)?;
         Ok(proof)
     }
+    pub(in crate::backend) fn prove_ordinary_legacy(
+        directory: &Path,
+        boot: &str,
+        executable: &Path,
+        transport: MemberTransport,
+    ) -> io::Result<VerifiedLegacy> {
+        let executable = fs::canonicalize(executable)?;
+        trusted_binary(&executable)?;
+        let (identity, _) = attest_identity(
+            boot,
+            &executable,
+            None,
+            &directory.join("interface-name"),
+            &mut Native {
+                directory,
+                ordinary: true,
+                started: std::time::Instant::now(),
+            },
+            None,
+        )?;
+        trusted_binary(&executable)?;
+        Ok(VerifiedLegacy {
+            transport,
+            identity,
+        })
+    }
     struct Native<'a> {
         directory: &'a Path,
+        ordinary: bool,
         started: std::time::Instant,
     }
     struct NativeSocket;
@@ -504,7 +564,7 @@ mod native {
             // Includes EINPROGRESS/EAGAIN: do not wait for a listener or assume
             // asynchronous success. The owned fd is closed on every error.
             if result != 0 {
-                return Err(invalid());
+                return Err(io::Error::last_os_error());
             }
             Ok(())
         }
@@ -550,7 +610,7 @@ mod native {
             if !self.directory.is_absolute()
                 || !dir.is_dir()
                 || dir.uid() != 0
-                || dir.mode() & 0o077 != 0
+                || dir.mode() & (if self.ordinary { 0o022 } else { 0o077 }) != 0
             {
                 return Err(invalid());
             }
@@ -621,6 +681,7 @@ mod native {
                 &super::super::userspace_socket_path(&resource.interface),
             )
             .map(UnixStream::from)
+            .map_err(|_| invalid())
         }
         fn peer(&mut self, channel: &UnixStream) -> io::Result<Peer> {
             let mut uid = 0;
@@ -647,17 +708,7 @@ mod native {
         fn process(&mut self, pid: i32) -> io::Result<Process> {
             // Use libc's Darwin ABI, requiring the full PROC_PIDTBSDINFO size.
             // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/proc_info.h
-            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-            let size = std::mem::size_of_val(&info) as i32;
-            let count = unsafe {
-                libc::proc_pidinfo(
-                    pid,
-                    libc::PROC_PIDTBSDINFO,
-                    0,
-                    (&mut info as *mut libc::proc_bsdinfo).cast(),
-                    size,
-                )
-            };
+            let (count, info) = process_info(pid);
             check_process_info(count, &info, pid)?;
             let mut path = [0u8; 4096];
             let count =
@@ -714,6 +765,21 @@ mod native {
     mod abi_tests {
         use super::*;
         #[test]
+        fn listener_probe_distinguishes_missing_and_closed_unix_sockets() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("probe.sock");
+            assert_eq!(
+                probe_listener(&path).unwrap_err().raw_os_error(),
+                Some(libc::ENOENT)
+            );
+            drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+            assert_eq!(
+                probe_listener(&path).unwrap_err().raw_os_error(),
+                Some(libc::ECONNREFUSED)
+            );
+        }
+
+        #[test]
         fn vanished_or_exiting_parent_is_transient_but_partial_abi_and_wrong_pid_are_not() {
             let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
             info.pbi_pid = 123;
@@ -757,96 +823,6 @@ pub(super) mod tests {
     use super::super::redundancy::SocketIdentity;
     use super::*;
     use std::collections::VecDeque;
-    #[derive(Clone, Copy)]
-    pub(crate) enum LaunchCase {
-        PrepareError,
-        SpawnError,
-        Nonzero,
-        Timeout,
-        WaitError,
-        GuardianError,
-        Success,
-    }
-    pub(crate) fn fake_command(case: LaunchCase) -> Result<(), LaunchFailure<io::Error>> {
-        struct FakeLauncher {
-            case: LaunchCase,
-            prepared: bool,
-            spawned: bool,
-        }
-        impl CommandLauncher for FakeLauncher {
-            type Guardian = ();
-            type Child = ();
-            fn prepare(&mut self) -> io::Result<()> {
-                self.prepared = true;
-                if matches!(self.case, LaunchCase::PrepareError) {
-                    Err(io::Error::other("prepare failed"))
-                } else {
-                    Ok(())
-                }
-            }
-            fn spawn(&mut self) -> io::Result<()> {
-                assert!(self.prepared);
-                self.spawned = true;
-                if matches!(self.case, LaunchCase::SpawnError) {
-                    Err(io::Error::other("spawn failed"))
-                } else {
-                    Ok(())
-                }
-            }
-            fn wait(&mut self, _: &mut (), _: &mut ()) -> io::Result<bool> {
-                assert!(self.spawned);
-                match self.case {
-                    LaunchCase::Nonzero => Ok(false),
-                    LaunchCase::Timeout => Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "helper command timed out",
-                    )),
-                    LaunchCase::WaitError => Err(io::Error::other("wait failed")),
-                    LaunchCase::GuardianError => {
-                        Err(io::Error::other("guardian acknowledgement failed"))
-                    }
-                    LaunchCase::Success => Ok(true),
-                    _ => panic!("must not wait without a child"),
-                }
-            }
-        }
-        command_attempt(
-            &mut FakeLauncher {
-                case,
-                prepared: false,
-                spawned: false,
-            },
-            "amneziawg_go_start_failed",
-        )
-    }
-    #[test]
-    fn only_prepare_and_spawn_errors_are_proof_of_no_returned_child() {
-        for case in [LaunchCase::PrepareError, LaunchCase::SpawnError] {
-            assert!(matches!(
-                fake_command(case),
-                Err(LaunchFailure::NotSpawned(_))
-            ));
-        }
-        for case in [
-            LaunchCase::Nonzero,
-            LaunchCase::Timeout,
-            LaunchCase::WaitError,
-            LaunchCase::GuardianError,
-        ] {
-            assert!(matches!(
-                fake_command(case),
-                Err(LaunchFailure::SpawnedOrUnknown(_))
-            ));
-        }
-        assert!(fake_command(LaunchCase::Success).is_ok());
-        assert_eq!(
-            fake_command(LaunchCase::Nonzero)
-                .unwrap_err()
-                .into_error()
-                .to_string(),
-            "amneziawg_go_start_failed"
-        );
-    }
     const STATE: &str = "/private/var/run/nelomai/slot-a/interface-name";
     pub(crate) fn receipt(transport: MemberTransport) -> LaunchReceipt {
         LaunchReceipt {
@@ -854,6 +830,7 @@ pub(super) mod tests {
             boot: "boot-one".into(),
             launch_nonce: "72cc17e2-0000-4000-8000-000000000001".into(),
             executable: "/Library/Nelomai/awg".into(),
+            managed: None,
         }
     }
     fn identity() -> UserspaceIdentity {
@@ -981,6 +958,74 @@ pub(super) mod tests {
             Ok(self.args.clone())
         }
     }
+    #[test]
+    fn legacy_ordinary_proof_requires_exact_binary_and_runtime_and_rejects_a_nonce() {
+        let binary = Path::new("/Library/Nelomai/awg");
+        let state = Path::new(STATE);
+        let mut old_args = args(&[]);
+        let nonce = old_args
+            .windows(NONCE_ENV.len())
+            .position(|v| v == NONCE_ENV.as_bytes())
+            .unwrap();
+        let end = nonce + old_args[nonce..].iter().position(|v| *v == 0).unwrap() + 1;
+        old_args.drain(nonce..end);
+        for (path, executable, legacy, valid) in [
+            (state, binary, true, true),
+            (Path::new("/other/interface-name"), binary, true, false),
+            (state, Path::new("/Library/Nelomai/other"), true, false),
+            (state, binary, false, false),
+        ] {
+            let mut fake = Fake::new();
+            if legacy {
+                fake.args = old_args.clone();
+            }
+            assert_eq!(
+                attest_identity("boot-one", executable, None, path, &mut fake, None).is_ok(),
+                valid
+            );
+        }
+    }
+
+    #[test]
+    fn managed_launch_checks_the_recorded_interface_and_listener_before_connecting() {
+        let expected = identity();
+        let mut r = receipt(MemberTransport::WireGuard);
+        let managed = ManagedUtun {
+            name: expected.interface.clone(),
+            index: expected.index,
+            socket: Some(expected.socket),
+        };
+        r.managed = Some(managed.clone());
+        assert!(attest(&r, Path::new(STATE), &mut Fake::new()).is_ok());
+
+        for altered in [
+            ManagedUtun {
+                name: "utun199".into(),
+                ..managed.clone()
+            },
+            ManagedUtun {
+                index: managed.index + 1,
+                ..managed.clone()
+            },
+            ManagedUtun {
+                socket: Some(SocketIdentity {
+                    inode: expected.socket.inode + 1,
+                    ..expected.socket
+                }),
+                ..managed.clone()
+            },
+            ManagedUtun {
+                socket: None,
+                ..managed.clone()
+            },
+        ] {
+            r.managed = Some(altered);
+            let mut fake = Fake::new();
+            assert!(attest(&r, Path::new(STATE), &mut fake).is_err());
+            assert_eq!(fake.events, ["resource"]);
+        }
+    }
+
     pub(crate) fn verified() -> VerifiedLaunch {
         attest(
             &receipt(MemberTransport::WireGuard),

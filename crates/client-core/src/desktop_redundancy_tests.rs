@@ -778,6 +778,7 @@ fn canonical_role_ack_same_generation_is_action_fenced_for_running_and_stopped()
 
 mod live_split_refresh {
     use super::*;
+    use crate::split_tunnel::DomainResolutionMode;
     use crate::{CoreApi, CoreApiError, CoreError, CoreLocalStop, CoreLogger, RuntimeAuthProvider};
     use async_trait::async_trait;
     use nelomai_client_api::{AccessSnapshot, RuntimeAuthState, RuntimeLogin};
@@ -801,6 +802,8 @@ mod live_split_refresh {
         policy: Mutex<Option<SplitTunnelPolicy>>,
         bootstrap: Mutex<Option<Bootstrap>>,
         offline: std::sync::atomic::AtomicBool,
+        policy_offline: std::sync::atomic::AtomicBool,
+        apply_results: Mutex<Vec<nelomai_contracts::SplitTunnelApplyResult>>,
     }
     #[async_trait]
     impl CoreApi for Api {
@@ -860,6 +863,12 @@ mod live_split_refresh {
             &self,
             _: &AccessSnapshot,
         ) -> Result<SplitTunnelPolicy, CoreApiError> {
+            if self
+                .policy_offline
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(CoreApiError::Retryable);
+            }
             Ok(self
                 .policy
                 .lock()
@@ -867,11 +876,22 @@ mod live_split_refresh {
                 .clone()
                 .expect("unexpected full fetch"))
         }
+        async fn update_split_tunnel_settings(
+            &self,
+            _: &AccessSnapshot,
+            _: &nelomai_contracts::SplitTunnelSettingsUpdate,
+        ) -> Result<SplitTunnelPolicy, CoreApiError> {
+            Ok(self.policy.lock().unwrap().clone().unwrap())
+        }
         async fn report_split_tunnel_apply_result(
             &self,
             _: &AccessSnapshot,
-            _: &nelomai_contracts::SplitTunnelApplyResult,
+            result: &nelomai_contracts::SplitTunnelApplyResult,
         ) -> Result<(), CoreApiError> {
+            if self.offline.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(CoreApiError::Retryable);
+            }
+            self.apply_results.lock().unwrap().push(result.clone());
             Ok(())
         }
     }
@@ -923,8 +943,20 @@ mod live_split_refresh {
         Live,
         Restored(&'a str),
         Ambiguous(RefreshReply),
+        StalledSettings,
+        BackgroundAfterStall,
+        DeferredWithoutDomains,
+        InvalidDomainBeforeSync,
+        SameHashForce,
+        ManualSupersedesPending,
+        ManualRevisionAhead,
+        ScheduledSupersedesPending,
+        CoordinatorBeforeDueRevisionCheck,
+        StartAfterCurrentPolicyApplyFailure,
+        DeferredWithFullOutbox,
     }
     struct Tunnel {
+        platform: TunnelPlatform,
         snapshot: Mutex<Snapshot>,
         applied: Mutex<Vec<DesktopTunnelOptions>>,
         next_reply: Mutex<RefreshReply>,
@@ -933,7 +965,7 @@ mod live_split_refresh {
     impl TunnelController for Tunnel {
         async fn capabilities(&self) -> Result<TunnelCapabilities, TunnelError> {
             Ok(TunnelCapabilities {
-                platform: TunnelPlatform::Windows,
+                platform: self.platform,
                 address_split_tunnel: true,
                 ..Default::default()
             })
@@ -996,32 +1028,229 @@ mod live_split_refresh {
     #[tokio::test]
     async fn expired_domain_refresh_updates_retained_pair_before_revision_gate_without_saved_config(
     ) {
-        retained_pair_refresh_case(RefreshCase::Live).await;
+        for platform in [
+            TunnelPlatform::Windows,
+            TunnelPlatform::Macos,
+            TunnelPlatform::Linux,
+        ] {
+            retained_pair_refresh_case(platform, RefreshCase::Live).await;
+        }
     }
 
     #[tokio::test]
     async fn bootstrap_retained_split_recipe_requires_native_ack_even_with_equal_routes() {
         for resolution in ["198.51.100.10/32", "203.0.113.9/32"] {
-            retained_pair_refresh_case(RefreshCase::Restored(resolution)).await;
+            retained_pair_refresh_case(TunnelPlatform::Windows, RefreshCase::Restored(resolution))
+                .await;
         }
     }
 
     #[tokio::test]
     async fn retained_split_lost_ack_requires_reapply_when_exclusions_are_disabled() {
-        retained_pair_refresh_case(RefreshCase::Ambiguous(RefreshReply::Lost)).await;
+        retained_pair_refresh_case(
+            TunnelPlatform::Windows,
+            RefreshCase::Ambiguous(RefreshReply::Lost),
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn retained_split_invalid_ack_requires_reapply_when_exclusions_are_disabled() {
-        retained_pair_refresh_case(RefreshCase::Ambiguous(RefreshReply::Invalid)).await;
+        retained_pair_refresh_case(
+            TunnelPlatform::Windows,
+            RefreshCase::Ambiguous(RefreshReply::Invalid),
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn retained_split_interrupted_apply_requires_reapply_when_exclusions_are_disabled() {
-        retained_pair_refresh_case(RefreshCase::Ambiguous(RefreshReply::Pending)).await;
+        retained_pair_refresh_case(
+            TunnelPlatform::Windows,
+            RefreshCase::Ambiguous(RefreshReply::Pending),
+        )
+        .await;
     }
 
-    async fn retained_pair_refresh_case(case: RefreshCase<'_>) {
+    #[tokio::test]
+    async fn retained_pair_save_defers_live_route_change_windows() {
+        retained_pair_refresh_case(TunnelPlatform::Windows, RefreshCase::StalledSettings).await;
+    }
+
+    #[tokio::test]
+    async fn retained_pair_save_defers_live_route_change_macos() {
+        retained_pair_refresh_case(TunnelPlatform::Macos, RefreshCase::StalledSettings).await;
+    }
+
+    #[tokio::test]
+    async fn retained_pair_save_defers_live_route_change_linux() {
+        retained_pair_refresh_case(TunnelPlatform::Linux, RefreshCase::StalledSettings).await;
+    }
+
+    #[tokio::test]
+    async fn retained_pair_sync_replaces_unresolvable_cached_domain_macos() {
+        retained_pair_refresh_case(TunnelPlatform::Macos, RefreshCase::InvalidDomainBeforeSync)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn retained_pair_sync_replaces_unresolvable_cached_domain_linux() {
+        retained_pair_refresh_case(TunnelPlatform::Linux, RefreshCase::InvalidDomainBeforeSync)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn background_reports_deferred_policy_windows() {
+        retained_pair_refresh_case(TunnelPlatform::Windows, RefreshCase::BackgroundAfterStall)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn background_reports_deferred_policy_macos() {
+        retained_pair_refresh_case(TunnelPlatform::Macos, RefreshCase::BackgroundAfterStall).await;
+    }
+
+    #[tokio::test]
+    async fn background_reports_deferred_policy_linux() {
+        retained_pair_refresh_case(TunnelPlatform::Linux, RefreshCase::BackgroundAfterStall).await;
+    }
+
+    #[tokio::test]
+    async fn background_retries_saved_ip_rules_while_panel_offline_windows() {
+        retained_pair_refresh_case(TunnelPlatform::Windows, RefreshCase::DeferredWithoutDomains)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn background_retries_saved_ip_rules_while_panel_offline_macos() {
+        retained_pair_refresh_case(TunnelPlatform::Macos, RefreshCase::DeferredWithoutDomains)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn background_retries_saved_ip_rules_while_panel_offline_linux() {
+        retained_pair_refresh_case(TunnelPlatform::Linux, RefreshCase::DeferredWithoutDomains)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn retained_pair_retries_same_hash_force_revision_windows() {
+        retained_pair_refresh_case(TunnelPlatform::Windows, RefreshCase::SameHashForce).await;
+    }
+
+    #[tokio::test]
+    async fn retained_pair_retries_same_hash_force_revision_macos() {
+        retained_pair_refresh_case(TunnelPlatform::Macos, RefreshCase::SameHashForce).await;
+    }
+
+    #[tokio::test]
+    async fn retained_pair_retries_same_hash_force_revision_linux() {
+        retained_pair_refresh_case(TunnelPlatform::Linux, RefreshCase::SameHashForce).await;
+    }
+
+    #[tokio::test]
+    async fn retained_pair_manual_sync_skips_superseded_pending_rule_macos() {
+        retained_pair_refresh_case(TunnelPlatform::Macos, RefreshCase::ManualSupersedesPending)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn retained_pair_manual_sync_skips_superseded_pending_rule_linux() {
+        retained_pair_refresh_case(TunnelPlatform::Linux, RefreshCase::ManualSupersedesPending)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn retained_pair_newer_revision_blocks_stale_cached_policy_windows() {
+        retained_pair_refresh_case(TunnelPlatform::Windows, RefreshCase::ManualRevisionAhead).await;
+    }
+
+    #[tokio::test]
+    async fn retained_pair_newer_revision_blocks_stale_cached_policy_macos() {
+        retained_pair_refresh_case(TunnelPlatform::Macos, RefreshCase::ManualRevisionAhead).await;
+    }
+
+    #[tokio::test]
+    async fn retained_pair_newer_revision_blocks_stale_cached_policy_linux() {
+        retained_pair_refresh_case(TunnelPlatform::Linux, RefreshCase::ManualRevisionAhead).await;
+    }
+
+    #[tokio::test]
+    async fn retained_pair_full_outbox_keeps_current_applied_receipt_macos() {
+        retained_pair_refresh_case(TunnelPlatform::Macos, RefreshCase::DeferredWithFullOutbox)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn retained_pair_full_outbox_keeps_current_applied_receipt_linux() {
+        retained_pair_refresh_case(TunnelPlatform::Linux, RefreshCase::DeferredWithFullOutbox)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn retained_pair_scheduled_sync_skips_superseded_pending_rule_macos() {
+        retained_pair_refresh_case(
+            TunnelPlatform::Macos,
+            RefreshCase::ScheduledSupersedesPending,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn retained_pair_scheduled_sync_skips_superseded_pending_rule_linux() {
+        retained_pair_refresh_case(
+            TunnelPlatform::Linux,
+            RefreshCase::ScheduledSupersedesPending,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pair_coordinator_waits_for_due_revision_check_windows() {
+        retained_pair_refresh_case(
+            TunnelPlatform::Windows,
+            RefreshCase::CoordinatorBeforeDueRevisionCheck,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pair_coordinator_waits_for_due_revision_check_macos() {
+        retained_pair_refresh_case(
+            TunnelPlatform::Macos,
+            RefreshCase::CoordinatorBeforeDueRevisionCheck,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pair_coordinator_waits_for_due_revision_check_linux() {
+        retained_pair_refresh_case(
+            TunnelPlatform::Linux,
+            RefreshCase::CoordinatorBeforeDueRevisionCheck,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn start_keeps_revoked_exclusion_off_after_apply_failure_linux() {
+        retained_pair_refresh_case(
+            TunnelPlatform::Linux,
+            RefreshCase::StartAfterCurrentPolicyApplyFailure,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn start_keeps_revoked_exclusion_off_after_apply_failure_macos() {
+        retained_pair_refresh_case(
+            TunnelPlatform::Macos,
+            RefreshCase::StartAfterCurrentPolicyApplyFailure,
+        )
+        .await;
+    }
+
+    async fn retained_pair_refresh_case(platform: TunnelPlatform, case: RefreshCase<'_>) {
         let pair = pair();
         let before = both(&pair);
         let identity = RuntimeIdentity {
@@ -1068,6 +1297,12 @@ mod live_split_refresh {
             .save(&StoredSplitTunnelState {
                 cached_policy: Some(policy.clone()),
                 working_policy_hash: Some(policy.policy_hash.clone()),
+                working_policy_revision: Some(nelomai_contracts::SplitTunnelRevision {
+                    enabled: policy.enabled,
+                    revision: policy.revision,
+                    force_revision: policy.force_revision,
+                    address_revision: policy.address_revision,
+                }),
                 last_revision_check_unix: Some(100),
                 domain_resolutions: vec![StoredSplitTunnelDomainResolution {
                     domain: "cached.example".into(),
@@ -1078,6 +1313,7 @@ mod live_split_refresh {
             })
             .unwrap();
         let tunnel = Arc::new(Tunnel {
+            platform,
             snapshot: Mutex::new(before.clone()),
             applied: Mutex::new(vec![]),
             next_reply: Mutex::new(RefreshReply::Ack),
@@ -1094,6 +1330,424 @@ mod live_split_refresh {
             CoreLocalStop::new(tunnel.clone()),
             Arc::new(Log),
         ));
+        if matches!(case, RefreshCase::StartAfterCurrentPolicyApplyFailure) {
+            let revoked = "203.0.113.9/32";
+            let mut previous = policy.clone();
+            previous.address_rules.clear();
+            previous.excluded_ipv4_cidrs = vec![revoked.into()];
+            let mut stored = split.load().unwrap();
+            stored.cached_policy = Some(previous.clone());
+            split.save(&stored).unwrap();
+
+            let mut current = previous.clone();
+            current.revision += 1;
+            current.policy_hash = format!("sha256:{}", "b".repeat(64));
+            current.excluded_ipv4_cidrs.clear();
+            *api.policy.lock().unwrap() = Some(current.clone());
+            core.synchronize_split_tunnel_with_resolver(401, true, |_| async {
+                panic!("no domains")
+            })
+            .await
+            .unwrap();
+
+            let mut stored = split.load().unwrap();
+            assert_eq!(
+                stored.observed_panel_revision.as_ref().unwrap().revision,
+                current.revision
+            );
+            assert_eq!(stored.cached_policy, Some(current.clone()));
+            assert_eq!(stored.previous_working_policy, Some(previous));
+            // Persist the state produced by a failed apply/rollback on a single tunnel.
+            stored.failed_policy_hash = Some(current.policy_hash);
+            split.save(&stored).unwrap();
+
+            let policy = core.cached_policy_for_start().unwrap();
+            assert!(
+                !policy
+                    .as_ref()
+                    .is_some_and(|p| p.excluded_ipv4_cidrs.iter().any(|cidr| cidr == revoked)),
+                "{platform:?}: Start would restore the revoked exclusion {revoked}: {policy:?}"
+            );
+            return;
+        }
+        if matches!(
+            case,
+            RefreshCase::SameHashForce
+                | RefreshCase::ManualSupersedesPending
+                | RefreshCase::ManualRevisionAhead
+                | RefreshCase::ScheduledSupersedesPending
+                | RefreshCase::CoordinatorBeforeDueRevisionCheck
+        ) {
+            *core.state.lock().await = crate::CoreState {
+                phase: crate::Phase::Connected,
+                connection: Some(pair.connection.clone()),
+            };
+            let mut applied = policy.clone();
+            applied.address_rules.clear();
+            let mut cached = split.load().unwrap();
+            cached.cached_policy = Some(applied.clone());
+            split.save(&cached).unwrap();
+            if matches!(case, RefreshCase::SameHashForce) {
+                let mut forced = applied;
+                forced.force_revision += 1;
+                *api.policy.lock().unwrap() = Some(forced.clone());
+                tunnel.snapshot.lock().unwrap().stalled = true;
+                core.synchronize_split_tunnel_with_resolver(401, false, |_| async {
+                    panic!("no domains to resolve")
+                })
+                .await
+                .unwrap();
+                let saved = split.load().unwrap();
+                assert_eq!(saved.cached_policy, Some(forced.clone()));
+                assert!(tunnel.applied.lock().unwrap().is_empty());
+                assert_eq!(saved.last_seen_force_revision, forced.force_revision);
+                assert_eq!(saved.working_policy_revision.unwrap().force_revision, 0);
+                assert!(api.apply_results.lock().unwrap().is_empty());
+                tunnel.snapshot.lock().unwrap().stalled = false;
+                core.synchronize_split_tunnel_with_resolver(702, false, |_| async {
+                    panic!("no domains to resolve")
+                })
+                .await
+                .unwrap();
+                let saved = split.load().unwrap();
+                let working = saved.working_policy_revision.unwrap();
+                assert_eq!(working.revision, forced.revision);
+                assert_eq!(working.force_revision, forced.force_revision);
+                assert_eq!(working.address_revision, forced.address_revision);
+                assert!(saved.pending_apply_results.is_empty());
+                let results = api.apply_results.lock().unwrap();
+                assert_eq!(results.len(), 1, "{platform:?}: forced revision receipt");
+                assert_eq!(results[0].force_revision, forced.force_revision);
+                assert_eq!(results[0].policy_hash, forced.policy_hash);
+            } else {
+                let added = "203.0.113.9/32";
+                let mut pending = applied.clone();
+                pending.revision += 1;
+                pending.policy_hash = format!("sha256:{}", "b".repeat(64));
+                pending.excluded_ipv4_cidrs.push(added.into());
+                let mut newer = applied;
+                newer.revision = pending.revision + 1;
+                newer.enabled = false;
+                newer.policy_hash = format!("sha256:{}", "c".repeat(64));
+                cached.cached_policy = Some(pending.clone());
+                split.save(&cached).unwrap();
+                *api.policy.lock().unwrap() = Some(newer.clone());
+                if matches!(case, RefreshCase::CoordinatorBeforeDueRevisionCheck) {
+                    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                    cached.last_revision_check_unix = Some(now - 301);
+                    split.save(&cached).unwrap();
+                    core.desktop_redundancy_tick(Vec::new()).await.unwrap();
+                    let native = tunnel.applied.lock().unwrap().clone();
+                    assert!(
+                        native.is_empty(),
+                        "{platform:?}: coordinator installed the obsolete exclusion before the overdue revision check"
+                    );
+                    core.synchronize_split_tunnel_with_resolver(now, false, |_| async {
+                        panic!("no domains to resolve")
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(split.load().unwrap().cached_policy, Some(newer));
+                    let applied = tunnel.applied.lock().unwrap();
+                    assert_eq!(applied.len(), 1);
+                    assert!(applied[0].excluded_ipv4_cidrs.is_empty());
+                    return;
+                }
+                if matches!(case, RefreshCase::ManualRevisionAhead) {
+                    api.policy_offline
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    assert_eq!(
+                        core.synchronize_split_tunnel_with_resolver(401, true, |_| async {
+                            panic!("no domains")
+                        })
+                        .await
+                        .unwrap(),
+                        crate::SplitTunnelSyncOutcome::CachedOffline
+                    );
+                    let saved = split.load().unwrap();
+                    assert!(
+                        tunnel.applied.lock().unwrap().is_empty(),
+                        "{platform:?}: revision {} already seen but stale CIDR was installed; working hash {:?}",
+                        newer.revision, saved.working_policy_hash
+                    );
+                    assert_eq!(saved.working_policy_hash, Some(policy.policy_hash.clone()));
+                    assert_eq!(
+                        saved.observed_panel_revision.unwrap().revision,
+                        newer.revision
+                    );
+                    assert!(core.cached_policy_for_start().unwrap().is_none());
+                    assert_eq!(
+                        core.synchronize_split_tunnel_with_resolver(402, false, |_| async {
+                            panic!("no domains")
+                        })
+                        .await
+                        .unwrap(),
+                        crate::SplitTunnelSyncOutcome::Skipped
+                    );
+                    assert!(tunnel.applied.lock().unwrap().is_empty());
+
+                    api.policy_offline
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    *api.policy.lock().unwrap() = Some(pending);
+                    assert_eq!(
+                        core.synchronize_split_tunnel_with_resolver(403, true, |_| async {
+                            panic!("no domains")
+                        })
+                        .await
+                        .unwrap(),
+                        crate::SplitTunnelSyncOutcome::CachedOffline
+                    );
+                    assert!(tunnel.applied.lock().unwrap().is_empty());
+                    *api.policy.lock().unwrap() = Some(newer.clone());
+                    core.synchronize_split_tunnel_with_resolver(404, true, |_| async {
+                        panic!("no domains")
+                    })
+                    .await
+                    .unwrap();
+                    let applied = tunnel.applied.lock().unwrap();
+                    assert_eq!(applied.len(), 1);
+                    assert!(applied[0].excluded_ipv4_cidrs.is_empty());
+                    assert_eq!(split.load().unwrap().cached_policy, Some(newer));
+                    return;
+                }
+                let forced = !matches!(case, RefreshCase::ScheduledSupersedesPending);
+                core.synchronize_split_tunnel_with_resolver(401, forced, |_| async {
+                    panic!("no domains to resolve")
+                })
+                .await
+                .unwrap();
+                let saved = split.load().unwrap();
+                assert_eq!(
+                    saved.working_policy_hash.as_deref(),
+                    Some(newer.policy_hash.as_str())
+                );
+                assert_eq!(saved.cached_policy, Some(newer.clone()));
+                {
+                    let applied = tunnel.applied.lock().unwrap();
+                    assert_eq!(applied.len(), 1, "{platform:?}: temporarily installed superseded bypass during successful forced sync");
+                    assert!(applied[0].excluded_ipv4_cidrs.is_empty());
+                }
+                if !forced {
+                    return;
+                }
+
+                let mut pending = newer;
+                pending.enabled = true;
+                pending.revision += 1;
+                pending.policy_hash = format!("sha256:{}", "d".repeat(64));
+                pending.excluded_ipv4_cidrs = vec![added.into()];
+                let mut saved = saved;
+                saved.cached_policy = Some(pending.clone());
+                split.save(&saved).unwrap();
+                api.offline.store(true, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(
+                    core.synchronize_split_tunnel_with_resolver(402, true, |_| async {
+                        panic!("no domains to resolve")
+                    })
+                    .await
+                    .unwrap(),
+                    crate::SplitTunnelSyncOutcome::CachedOffline
+                );
+                let saved = split.load().unwrap();
+                assert_eq!(saved.working_policy_hash, Some(pending.policy_hash));
+                assert_eq!(saved.pending_apply_results.len(), 1);
+                assert_eq!(
+                    tunnel.applied.lock().unwrap()[1].excluded_ipv4_cidrs,
+                    [added]
+                );
+            }
+            return;
+        }
+        if matches!(
+            case,
+            RefreshCase::StalledSettings
+                | RefreshCase::BackgroundAfterStall
+                | RefreshCase::DeferredWithoutDomains
+                | RefreshCase::DeferredWithFullOutbox
+                | RefreshCase::InvalidDomainBeforeSync
+        ) {
+            *core.state.lock().await = crate::CoreState {
+                phase: crate::Phase::Connected,
+                connection: Some(pair.connection.clone()),
+            };
+            let mut updated = policy.clone();
+            updated.revision += 1;
+            updated.policy_hash = format!("sha256:{}", "b".repeat(64));
+            updated.exclude_local_networks = false;
+            if matches!(
+                case,
+                RefreshCase::StalledSettings
+                    | RefreshCase::BackgroundAfterStall
+                    | RefreshCase::DeferredWithoutDomains
+                    | RefreshCase::DeferredWithFullOutbox
+            ) {
+                tunnel.snapshot.lock().unwrap().stalled = true;
+                // Save can return a newer full policy, including a panel-side
+                // change to the active address exclusions.
+                updated.excluded_ipv4_cidrs = vec!["203.0.113.0/24".into()];
+                if matches!(
+                    case,
+                    RefreshCase::DeferredWithoutDomains | RefreshCase::DeferredWithFullOutbox
+                ) {
+                    updated.address_rules.clear();
+                }
+                *api.policy.lock().unwrap() = Some(updated.clone());
+                let request = nelomai_contracts::SplitTunnelSettingsUpdate {
+                    mode: policy.mode,
+                    exclude_local_networks: false,
+                    selected_packages: vec![],
+                };
+                let reply = core.save_split_tunnel_settings(&request, 161).await;
+                let saved = split.load().unwrap();
+                assert!(!saved.cached_policy.unwrap().exclude_local_networks);
+                assert_eq!(
+                    saved.working_policy_hash.as_deref(),
+                    Some(policy.policy_hash.as_str())
+                );
+                assert!(tunnel.applied.lock().unwrap().is_empty());
+                assert!(
+                    matches!(reply, Err(CoreError::SplitTunnel(code)) if code == "split_tunnel_apply_deferred"),
+                    "save must report deferred application for {platform:?}"
+                );
+
+                assert!(api.apply_results.lock().unwrap().is_empty());
+                tunnel.snapshot.lock().unwrap().stalled = false;
+                if matches!(
+                    case,
+                    RefreshCase::DeferredWithoutDomains | RefreshCase::DeferredWithFullOutbox
+                ) {
+                    api.offline.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if matches!(case, RefreshCase::DeferredWithFullOutbox) {
+                        let mut saved = split.load().unwrap();
+                        saved.pending_apply_results = (0..32)
+                            .map(|_| nelomai_contracts::SplitTunnelApplyResult {
+                                format_version: policy.format_version,
+                                revision: policy.revision,
+                                force_revision: policy.force_revision,
+                                address_revision: policy.address_revision,
+                                policy_hash: policy.policy_hash.clone(),
+                                status: nelomai_contracts::SplitTunnelApplyStatus::Failed,
+                                error_code: Some("split_tunnel_apply_failed".into()),
+                                applied_at: policy.generated_at.clone(),
+                            })
+                            .collect();
+                        split.save(&saved).unwrap();
+                        let result = core
+                            .synchronize_split_tunnel_with_resolver(162, false, |_| async {
+                                panic!("no domains")
+                            })
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            result,
+                            crate::SplitTunnelSyncOutcome::Updated { reconnected: false }
+                        );
+                        let saved = split.load().unwrap();
+                        assert_eq!(
+                            saved.working_policy_hash.as_deref(),
+                            Some(updated.policy_hash.as_str())
+                        );
+                        assert_eq!(saved.pending_apply_results.len(), 32);
+                        assert!(
+                            saved.pending_apply_results.iter().any(|report| report.policy_hash == updated.policy_hash),
+                            "{platform:?}: stored working revision but discarded its only Applied receipt"
+                        );
+                        return;
+                    }
+                    let poll = core
+                        .synchronize_split_tunnel_with_resolver(462, false, |_| async {
+                            panic!("no domain addresses are needed")
+                        })
+                        .await
+                        .unwrap();
+                    let saved = split.load().unwrap();
+                    assert_eq!(saved.cached_policy, Some(updated.clone()));
+                    assert_eq!(
+                        saved.working_policy_hash,
+                        Some(updated.policy_hash),
+                        "{platform:?}: acknowledged IP-only policy still pending after healthy pair, poll={poll:?}"
+                    );
+                    let commands = tunnel.applied.lock().unwrap();
+                    assert_eq!(commands.len(), 1);
+                    assert_eq!(commands[0].excluded_ipv4_cidrs, ["203.0.113.0/24"]);
+                    let [queued] = saved.pending_apply_results.as_slice() else {
+                        panic!("the confirmed result must survive the panel outage");
+                    };
+                    assert_eq!(queued.revision, updated.revision);
+                    assert_eq!(
+                        queued.status,
+                        nelomai_contracts::SplitTunnelApplyStatus::Applied
+                    );
+                    return;
+                }
+                if matches!(case, RefreshCase::BackgroundAfterStall) {
+                    for now in [162, 462] {
+                        core.synchronize_split_tunnel_with_resolver(now, false, |_| async {
+                            Some(vec!["198.51.100.10/32".into()])
+                        })
+                        .await
+                        .unwrap();
+                    }
+                    assert_eq!(tunnel.applied.lock().unwrap().len(), 1);
+                    let saved = split.load().unwrap();
+                    assert_eq!(
+                        saved.working_policy_hash.as_deref(),
+                        Some(updated.policy_hash.as_str())
+                    );
+                    let results = api.apply_results.lock().unwrap();
+                    assert_eq!(
+                        results.len(),
+                        1,
+                        "{platform:?}: revision {} applied locally",
+                        updated.revision
+                    );
+                    assert_eq!(results[0].policy_hash, updated.policy_hash);
+                    assert_eq!(results[0].revision, updated.revision);
+                    assert_eq!(
+                        results[0].status,
+                        nelomai_contracts::SplitTunnelApplyStatus::Applied
+                    );
+                    assert!(saved.pending_apply_results.is_empty());
+                    return;
+                }
+                let applied = core
+                    .save_split_tunnel_settings(&request, 162)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    split.load().unwrap().working_policy_hash.as_deref(),
+                    Some(applied.policy_hash.as_str())
+                );
+                let commands = tunnel.applied.lock().unwrap();
+                assert_eq!(commands.len(), 1);
+                assert_eq!(
+                    commands[0].excluded_ipv4_cidrs,
+                    ["198.51.100.10/32", "203.0.113.0/24"]
+                );
+            } else {
+                let mut cached = split.load().unwrap();
+                cached.domain_resolutions.clear();
+                split.save(&cached).unwrap();
+                updated.enabled = false;
+                updated.address_rules.clear();
+                *api.policy.lock().unwrap() = Some(updated.clone());
+                let outcome = core
+                    .synchronize_split_tunnel_with_resolver(401, true, |_| async { None })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    outcome,
+                    crate::SplitTunnelSyncOutcome::Updated { reconnected: false }
+                );
+                let saved = split.load().unwrap();
+                assert_eq!(saved.cached_policy, Some(updated.clone()));
+                assert_eq!(saved.working_policy_hash, Some(updated.policy_hash));
+                let commands = tunnel.applied.lock().unwrap();
+                assert_eq!(commands.len(), 1);
+                assert!(commands[0].excluded_ipv4_cidrs.is_empty());
+            }
+            return;
+        }
         if let RefreshCase::Ambiguous(reply) = case {
             *core.state.lock().await = crate::CoreState {
                 phase: crate::Phase::Connected,
@@ -1119,7 +1773,10 @@ mod live_split_refresh {
                     161,
                     |_| async { Some(vec!["203.0.113.9/32".into()]) },
                     None,
-                    true,
+                    Some((
+                        DomainResolutionMode::Refresh,
+                        core.start_cancellation_epoch(),
+                    )),
                 ),
             )
             .await;
@@ -1140,7 +1797,10 @@ mod live_split_refresh {
                 162,
                 |_| async { panic!("disabled policy must not resolve domains") },
                 None,
-                true,
+                Some((
+                    DomainResolutionMode::Refresh,
+                    core.start_cancellation_epoch(),
+                )),
             )
             .await
             .unwrap();
@@ -1159,7 +1819,10 @@ mod live_split_refresh {
                 163,
                 |_| async { panic!("disabled policy must not resolve domains") },
                 None,
-                true,
+                Some((
+                    DomainResolutionMode::Refresh,
+                    core.start_cancellation_epoch(),
+                )),
             )
             .await
             .unwrap();
@@ -1204,6 +1867,7 @@ mod live_split_refresh {
                 &pair.connection.lease_id,
                 core.start_cancellation_epoch(),
             );
+        let preserves_previous_answers = platform == TunnelPlatform::Windows;
         let outcome = core
             .synchronize_split_tunnel_with_resolver(161, false, |_| async {
                 Some(vec!["203.0.113.9/32".into()])
@@ -1217,10 +1881,12 @@ mod live_split_refresh {
         {
             let applied = tunnel.applied.lock().unwrap();
             assert_eq!(applied.len(), 1);
-            assert_eq!(
-                applied[0].excluded_ipv4_cidrs,
-                ["198.51.100.10/32", "203.0.113.9/32"]
-            );
+            let expected: &[&str] = if preserves_previous_answers {
+                &["198.51.100.10/32", "203.0.113.9/32"]
+            } else {
+                &["203.0.113.9/32"]
+            };
+            assert_eq!(applied[0].excluded_ipv4_cidrs, expected, "{platform:?}");
             let after = tunnel.snapshot.lock().unwrap();
             assert_eq!(after.session.scope, before.session.scope);
             assert_eq!(after.session.active, before.session.active);
@@ -1244,11 +1910,12 @@ mod live_split_refresh {
             crate::SplitTunnelSyncOutcome::Skipped
         );
         assert_eq!(tunnel.applied.lock().unwrap().len(), 1);
-        // A new policy with identical effective routes still publishes its
-        // identity; the subsequent DNS rotation must union within that policy.
+        // A new policy with identical effective routes still publishes its identity.
         let mut next = policy.clone();
         next.policy_hash = format!("sha256:{}", "b".repeat(64));
-        next.excluded_ipv4_cidrs = vec!["198.51.100.10/32".into()];
+        if preserves_previous_answers {
+            next.excluded_ipv4_cidrs = vec!["198.51.100.10/32".into()];
+        }
         let mut cached = split.load().unwrap();
         cached.cached_policy = Some(next.clone());
         split.save(&cached).unwrap();
@@ -1258,7 +1925,10 @@ mod live_split_refresh {
                 163,
                 |_| async { Some(vec!["203.0.113.9/32".into()]) },
                 None,
-                true,
+                Some((
+                    DomainResolutionMode::Refresh,
+                    core.start_cancellation_epoch(),
+                )),
             )
             .await
             .unwrap()
@@ -1286,15 +1956,46 @@ mod live_split_refresh {
         })
         .await
         .unwrap();
+        let expected: &[&str] = if preserves_previous_answers {
+            &["198.51.100.10/32", "203.0.113.10/32", "203.0.113.9/32"]
+        } else {
+            &["203.0.113.10/32"]
+        };
         assert_eq!(
             tunnel.applied.lock().unwrap()[1].excluded_ipv4_cidrs,
-            ["198.51.100.10/32", "203.0.113.10/32", "203.0.113.9/32"]
+            expected,
+            "{platform:?}"
         );
+        assert_eq!(
+            core.synchronize_split_tunnel_with_resolver(285, false, |_| async { None })
+                .await
+                .unwrap(),
+            crate::SplitTunnelSyncOutcome::Updated { reconnected: false }
+        );
+        assert_eq!(tunnel.applied.lock().unwrap().len(), 2);
+        let failed_refresh = split.load().unwrap();
+        assert_eq!(failed_refresh.domain_resolutions[0].resolved_at_unix, 224);
+        assert_eq!(
+            failed_refresh.domain_resolutions[0].ipv4_cidrs,
+            ["203.0.113.10/32"]
+        );
+        if !preserves_previous_answers {
+            assert_eq!(
+                core.split_tunnel_warning().await.as_deref(),
+                Some("split_tunnel_domain_resolution_failed")
+            );
+            core.synchronize_split_tunnel_with_resolver(346, false, |_| async {
+                Some(vec!["203.0.113.10/32".into()])
+            })
+            .await
+            .unwrap();
+            assert_eq!(core.split_tunnel_warning().await, None);
+        }
         // A Stop epoch wins while the system resolver is awaiting its response.
         let cancel = core.clone();
         api.offline.store(true, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
-            core.synchronize_split_tunnel_with_resolver(401, false, move |_| {
+            core.synchronize_split_tunnel_with_resolver(461, false, move |_| {
                 let cancel = cancel.clone();
                 async move {
                     cancel
@@ -1310,12 +2011,11 @@ mod live_split_refresh {
         assert_eq!(tunnel.applied.lock().unwrap().len(), 2);
         assert_eq!(
             split.load().unwrap().domain_resolutions[0].resolved_at_unix,
-            224
+            if preserves_previous_answers { 224 } else { 346 }
         );
         api.offline
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        // An explicit policy removal must remove the retained domain union and
-        // still never require saved configuration or Stop/Start.
+        // Disabling split must clear domain routes without saved configuration or Stop/Start.
         let mut removed = policy;
         removed.enabled = false;
         removed.address_rules[0].value = "uncached.invalid".into();
@@ -1323,7 +2023,7 @@ mod live_split_refresh {
         removed.revision += 1;
         *api.policy.lock().unwrap() = Some(removed);
         assert_eq!(
-            core.synchronize_split_tunnel(402, true).await.unwrap(),
+            core.synchronize_split_tunnel(462, true).await.unwrap(),
             crate::SplitTunnelSyncOutcome::Updated { reconnected: false }
         );
         let applied = tunnel.applied.lock().unwrap();

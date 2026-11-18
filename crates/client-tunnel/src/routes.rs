@@ -1,5 +1,5 @@
 use crate::DesktopTunnelOptions;
-use ipnet::Ipv4Net;
+use ipnet::{IpNet, Ipv4Net};
 use std::fmt;
 use thiserror::Error;
 
@@ -31,6 +31,39 @@ impl Ipv4RoutePlan {
             excluded_networks: compact(networks)?,
             exclude_local_networks: options.exclude_local_networks,
         })
+    }
+
+    /// Preflight the expanded dual-stack Unix desktop full-tunnel plan,
+    /// including the platform's built-in exclusions. The helper also checks
+    /// the exact plan with live routes and endpoints.
+    pub fn validate_unix_route_budget(
+        &self,
+        preserve_macos_scoped_defaults: bool,
+    ) -> Result<(), RoutePlanError> {
+        use crate::redundancy::route_plan::{
+            macos_scoped_default_exclusions, tunnel_destinations, UNIX_DATA_ROUTE_LIMIT,
+        };
+        // Either peer can have an IPv6 endpoint. Subtracting one host can
+        // split one CIDR into up to 128 siblings (a net increase of at most
+        // 127). Leave space for both peers before replacing a running plan.
+        const PEER_ENDPOINT_HEADROOM: usize = 2 * (128 - 1);
+
+        let mut excluded = self
+            .excluded_networks
+            .iter()
+            .copied()
+            .map(IpNet::V4)
+            .collect::<Vec<_>>();
+        if preserve_macos_scoped_defaults {
+            excluded.extend(macos_scoped_default_exclusions());
+        }
+        let full = ["0.0.0.0/0", "::/0"].map(|s| s.parse().expect("fixed default prefix"));
+        let destinations =
+            tunnel_destinations(&full, &excluded).map_err(|_| RoutePlanError::TooLarge)?;
+        if destinations.len() + PEER_ENDPOINT_HEADROOM > UNIX_DATA_ROUTE_LIMIT {
+            return Err(RoutePlanError::TooLarge);
+        }
+        Ok(())
     }
 
     pub fn active(&self) -> bool {

@@ -8,6 +8,7 @@ import { beginConnectionStart, beginConnectionStop, initialConnectionActionState
   finishConnectionStart, finishConnectionStop, prepareConnectionStartForPlatform } from "./connection-action";
 import { clearOwnedConnectionIntentNotice } from "./connection-intent-notice";
 import { primaryAction, type Phase, type ConnectionIntentStatus, bindingPreferenceUpdateRequest, connectionEgressMode } from "./app-model";
+import type { SplitTunnelState } from "./split-tunnel";
 
 // Execute the page's actual async callback with controlled native replies. No
 // duplicate implementation of its application/epoch checks in the test.
@@ -16,7 +17,7 @@ const ast = ts.createSourceFile("page.ts", script, ts.ScriptTarget.Latest, true)
 const callback = ast.statements.find((node) => ts.isFunctionDeclaration(node)
   && node.name?.text === "synchronizeRuntimeState")!;
 const sharedFunctions = ast.statements.filter((node) => ts.isFunctionDeclaration(node)
-  && ["applyRuntimeChannelClosure", "requireRuntimeChannelOpen", "observeUpdateStatus", "readDesktopTunnelBackend", "defenderRepairStatusMessage"].includes(node.name?.text ?? ""))
+  && ["applyRuntimeChannelClosure", "requireRuntimeChannelOpen", "observeUpdateStatus", "readDesktopTunnelBackend", "defenderRepairStatusMessage", "changeSplitTunnelAddressRule"].includes(node.name?.text ?? ""))
   .map((node) => node.getText(ast)).join("\n");
 const executable = ts.transpile(sharedFunctions + callback.getText(ast), { target: ts.ScriptTarget.ES2022 });
 const synchronize = new Function("context", "foreground = true", `with (context) { ${executable}; return synchronizeRuntimeState(foreground); }`);
@@ -73,7 +74,7 @@ function fixture() {
     runtimeChannelClosed: false, runtimeSelectionBusy: false,
     startupRetry: { cancel: () => {}, checkpoint: () => () => true },
     splitTunnelOpen: false, splitTunnelState: null,
-    splitTunnelBusy: false, splitTunnelLoaded: false, splitTunnelApplications: [],
+    splitTunnelRequestId: 0, splitTunnelBusy: false, splitTunnelLoaded: false, splitTunnelApplications: [],
     pinnedStray: null, loadPeers: async () => {},
     connectionActionState: initialConnectionActionState(),
     localStopPendingCleanup: false, connectionMetrics: null, reserveState: null,
@@ -101,6 +102,161 @@ function logoutFixture() {
   });
   return result;
 }
+
+describe("split-tunnel address rule changes", () => {
+  const emptyRules: SplitTunnelState = {
+    available: true, enabled: true, mode: "exclude_selected", excludeLocalNetworks: true,
+    mandatoryExcludedPackages: [], suggestedNameFragments: [], selectedPackages: [],
+    addressRules: [], warning: null,
+    capabilities: {
+      platform: "macos", androidApiLevel: null, addressSplitTunnel: true, applicationSplitTunnel: false,
+    },
+  };
+  const withRule: SplitTunnelState = {
+    ...emptyRules,
+    addressRules: [{ id: 42, scope: "this_device", kind: "domain", value: "example.test" }],
+    warning: "split_tunnel_policy_deferred",
+  };
+  for (const [name, args, before, saved] of [
+    ["addSplitTunnelAddressRule", ["example.test", "this_device"], emptyRules, withRule],
+    ["removeSplitTunnelAddressRule", [42, "this_device"], withRule, emptyRules],
+  ] as const) {
+    for (const issue of [
+      null,
+      { code: "split_tunnel_domain_resolution_unavailable", message: "Не удалось определить адрес домена." },
+      { code: "split_tunnel_refresh_unconfirmed", message: "Служба не подтвердила новые правила." },
+      { code: "split_tunnel_apply_deferred", message: "Правила применятся позднее." },
+    ]) {
+      it(`shows the saved list for ${name} with ${issue?.code ?? "successful apply"} in one request`, async () => {
+        const { context } = fixture();
+        Object.assign(context, { splitTunnelState: before });
+        const requests: string[] = [];
+        Object.assign(context.nativeClient, {
+          [name]: async () => {
+            requests.push(name);
+            return { state: saved, applyIssue: issue };
+          },
+          splitTunnelState: async () => { requests.push("read"); return before; },
+          refreshSplitTunnel: async () => { requests.push("refresh"); return before; },
+        });
+
+        await expect(executePageFunction(name, context, ...args)).resolves.toEqual({
+          pendingMessage: issue ? `Изменение сохранено. ${issue.message}` : null,
+        });
+        expect(context.splitTunnelState).toEqual(saved);
+        expect(context.runtimeWarning).toBe(saved.warning);
+        expect(context.splitTunnelBusy).toBe(false);
+        expect(requests).toEqual([name]);
+      });
+    }
+  }
+
+  it("uses the full policy from an address edit when other settings changed on the panel", async () => {
+    const { context } = fixture();
+    const saved = {
+      ...withRule,
+      enabled: false,
+      mode: "include_selected",
+      excludeLocalNetworks: false,
+      selectedPackages: ["com.example.browser"],
+    };
+    Object.assign(context, { splitTunnelState: emptyRules });
+    Object.assign(context.nativeClient, {
+      addSplitTunnelAddressRule: async () => ({ state: saved, applyIssue: null }),
+    });
+
+    await executePageFunction("addSplitTunnelAddressRule", context, "example.test", "this_device");
+
+    expect(context.splitTunnelState).toEqual(saved);
+    expect(context.runtimeWarning).toBe(saved.warning);
+  });
+
+  for (const code of ["split_tunnel_address_rule_invalid", "signed_out", "storage_unavailable",
+    "temporarily_unavailable", "split_tunnel_apply_deferred"]) {
+    it(`preserves the list when the mutation rejects with ${code}`, async () => {
+      const { context } = fixture();
+      const failure = { code };
+      Object.assign(context, { splitTunnelState: emptyRules });
+      let reads = 0;
+      Object.assign(context.nativeClient, {
+        addSplitTunnelAddressRule: async () => { throw failure; },
+        splitTunnelState: async () => { reads++; return withRule; },
+      });
+
+      await expect(executePageFunction("addSplitTunnelAddressRule", context, "invalid", "this_device"))
+        .rejects.toBe(failure);
+      expect(context.splitTunnelState).toEqual(emptyRules);
+      expect(context.splitTunnelBusy).toBe(false);
+      expect(reads).toBe(0);
+    });
+  }
+
+  for (const supersededBy of ["account", "action", "closure"] as const) {
+    it(`discards an address mutation superseded by ${supersededBy}`, async () => {
+      const { context } = fixture();
+      let finish!: () => void;
+      Object.assign(context, { splitTunnelState: emptyRules });
+      Object.assign(context.nativeClient, {
+        addSplitTunnelAddressRule: () => new Promise((resolve) => {
+          finish = () => resolve({ state: withRule, applyIssue: null });
+        }),
+      });
+      const result = executePageFunction("addSplitTunnelAddressRule", context, "example.test", "this_device");
+      if (supersededBy === "account") {
+        context.bootstrap = { binding: {} };
+      } else if (supersededBy === "action") {
+        context.connectionActionState = beginConnectionStop(context.connectionActionState).state;
+      } else {
+        executePageFunction("applyRuntimeChannelClosure", context, { code: "runtime_channel_closed" });
+      }
+      finish();
+
+      await expect(result).resolves.toBeNull();
+      expect(context.splitTunnelState).toEqual(emptyRules);
+      expect(context.splitTunnelBusy).toBe(false);
+      expect(context.runtimeWarning).toBe(supersededBy === "closure" ? "runtime_channel_closed" : "tunnel_runtime_stopped");
+    });
+  }
+
+  it("discards another account's pending status read and keeps its successor busy", async () => {
+    const { context } = fixture();
+    let finish!: () => void;
+    let enter!: () => void;
+    const reading = new Promise<void>((resolve) => { enter = resolve; });
+    Object.assign(context.nativeClient, {
+      splitTunnelInstalledApplications: async () => [],
+      splitTunnelState: () => new Promise((resolve) => {
+        finish = () => resolve(withRule);
+        enter();
+      }),
+    });
+    const pending = executePageFunction("loadSplitTunnel", context, false);
+    await reading;
+    context.bootstrap = { binding: {} };
+    context.splitTunnelRequestId++;
+    context.splitTunnelBusy = true;
+    finish();
+    await pending;
+    expect(context.splitTunnelState).toBeNull();
+    expect(context.splitTunnelLoaded).toBe(false);
+    expect(context.splitTunnelBusy).toBe(true);
+  });
+
+  it("closes the split-tunnel overlay when the mutation discovers owner EOF", async () => {
+    const { context } = fixture();
+    const closure = { code: "runtime_channel_closed" };
+    Object.assign(context, { splitTunnelOpen: true, splitTunnelState: emptyRules });
+    Object.assign(context.nativeClient, {
+      addSplitTunnelAddressRule: async () => { throw closure; },
+    });
+
+    await expect(executePageFunction("addSplitTunnelAddressRule", context, "example.test", "this_device"))
+      .rejects.toBe(closure);
+    expect(context.runtimeChannelClosed).toBe(true);
+    expect(context.splitTunnelOpen).toBe(false);
+    expect(context.splitTunnelBusy).toBe(false);
+  });
+});
 
 describe("async Stop presentation", () => {
   function stopFixture() {

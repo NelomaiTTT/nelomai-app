@@ -1,5 +1,7 @@
 use crate::{create_protected_dir, StorageError};
-use nelomai_contracts::{SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelPolicy};
+use nelomai_contracts::{
+    SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelPolicy, SplitTunnelRevision,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     fmt,
@@ -35,7 +37,11 @@ impl fmt::Debug for StoredSplitTunnelDomainResolution {
 #[serde(default)]
 pub struct StoredSplitTunnelState {
     pub cached_policy: Option<SplitTunnelPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_panel_revision: Option<SplitTunnelRevision>,
     pub working_policy_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_policy_revision: Option<SplitTunnelRevision>,
     pub previous_working_policy: Option<SplitTunnelPolicy>,
     pub applied_physical_network_fingerprint: Option<String>,
     pub last_full_sync_unix: Option<i64>,
@@ -57,6 +63,8 @@ impl fmt::Debug for StoredSplitTunnelState {
                 &self.cached_policy.as_ref().map(|policy| policy.revision),
             )
             .field("working_policy_hash", &self.working_policy_hash)
+            .field("observed_panel_revision", &self.observed_panel_revision)
+            .field("working_policy_revision", &self.working_policy_revision)
             .field(
                 "previous_working_policy_revision",
                 &self
@@ -95,11 +103,30 @@ impl fmt::Debug for StoredSplitTunnelState {
 impl StoredSplitTunnelState {
     fn normalized(mut self) -> Self {
         while self.pending_apply_results.len() > MAX_PENDING_APPLY_RESULTS {
+            let current_applied = self.pending_apply_results.iter().rposition(|result| {
+                result.status == SplitTunnelApplyStatus::Applied
+                    && self.working_policy_hash.as_deref() == Some(result.policy_hash.as_str())
+                    && self
+                        .working_policy_revision
+                        .as_ref()
+                        .is_none_or(|revision| {
+                            revision.revision == result.revision
+                                && revision.force_revision == result.force_revision
+                                && revision.address_revision == result.address_revision
+                        })
+            });
             let remove_at = self
                 .pending_apply_results
                 .iter()
-                .position(|result| result.status == SplitTunnelApplyStatus::Applied)
-                .unwrap_or(0);
+                .enumerate()
+                .find(|(index, result)| {
+                    Some(*index) != current_applied
+                        && result.status == SplitTunnelApplyStatus::Applied
+                })
+                .map_or_else(
+                    || usize::from(current_applied == Some(0)),
+                    |(index, _)| index,
+                );
             self.pending_apply_results.remove(remove_at);
         }
         self.domain_resolutions

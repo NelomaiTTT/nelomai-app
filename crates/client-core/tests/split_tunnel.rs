@@ -21,9 +21,9 @@ use nelomai_contracts::{
     ConnectionOperationRequest, ConnectionOperationResponse, ConnectionStartRequest,
     ConnectionStartResponse, Device, EgressMode, Layer, LeaseStatus, PeerBinding, Platform,
     RouteMode, SplitTunnelAddressRule, SplitTunnelAddressRuleKind, SplitTunnelAddressRuleScope,
-    SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelMode, SplitTunnelPolicy,
-    SplitTunnelRevision, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
-    UpdateState,
+    SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelMode,
+    SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate,
+    TicConnectionMode, UpdateState,
 };
 use std::{
     collections::VecDeque,
@@ -314,6 +314,51 @@ fn ambiguous_case_insensitive_package_match_is_never_applied() {
     .unwrap_err();
 
     assert_eq!(error, SplitTunnelPolicyError::EmptyIncludeSelection);
+}
+
+#[test]
+fn sparse_exclusions_that_exceed_unix_route_budget_are_rejected_before_start() {
+    let mut policy = policy(SplitTunnelMode::ExcludeSelected);
+    policy.excluded_ipv4_cidrs = (0u32..1024)
+        .map(|i| format!("{}/32", std::net::Ipv4Addr::from(0x4000_0001 + (i << 18))))
+        .collect();
+    nelomai_client_core::validate_split_tunnel_policy(&policy).unwrap();
+    for (count, linux_fits, macos_fits) in [
+        (1024, false, false),
+        (909, false, false),
+        (900, false, false),
+        (895, true, false),
+        (885, true, true),
+    ] {
+        policy.excluded_ipv4_cidrs.truncate(count);
+        for (platform, fits) in [
+            (TunnelPlatform::Macos, macos_fits),
+            (TunnelPlatform::Linux, linux_fits),
+            (TunnelPlatform::Windows, true),
+        ] {
+            let result = EffectiveSplitTunnelPolicy::build(
+                &policy,
+                &[],
+                TunnelCapabilities {
+                    platform,
+                    address_split_tunnel: true,
+                    ..Default::default()
+                },
+                Layer::Stray,
+                RouteMode::Standalone,
+            );
+            if fits {
+                assert!(result.is_ok(), "{platform:?} count={count}");
+            } else {
+                assert_eq!(
+                    result
+                        .expect_err(&format!("{platform:?} count={count}"))
+                        .stable_code(),
+                    "route_plan_too_large"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -968,6 +1013,62 @@ async fn changed_hash_with_identical_effective_routes_is_applied_without_reconne
 }
 
 #[tokio::test]
+async fn late_policy_fetch_does_not_restart_the_desktop_tunnel_after_stop() {
+    let fixture = coordinator_fixture(capabilities(TunnelPlatform::Linux, None, true, false));
+    fixture
+        .core
+        .synchronize_split_tunnel(1_000, true)
+        .await
+        .unwrap();
+    fixture
+        .core
+        .start(
+            ConnectOptions {
+                layer: Layer::Tic,
+                tic_connection_mode: TicConnectionMode::Personal,
+                route_mode: RouteMode::ViaTak,
+                egress_mode: EgressMode::Ipv4,
+                probes: Vec::new(),
+                allow_alternate: true,
+            },
+            1_010,
+        )
+        .await
+        .unwrap();
+    let mut changed = policy(SplitTunnelMode::ExcludeSelected);
+    changed.revision = 8;
+    changed.policy_hash = format!("sha256:{}", "e".repeat(64));
+    changed.excluded_ipv4_cidrs = vec!["198.51.100.0/24".into()];
+    fixture.api.set_policy(changed.clone());
+    fixture.api.set_revision(8, changed.force_revision);
+    fixture.api.block_policy.store(true, Ordering::SeqCst);
+    let sync = fixture.core.synchronize_split_tunnel(1_300, true);
+    tokio::pin!(sync);
+    tokio::select! {
+        _ = fixture.api.policy_entered.notified() => (),
+        _ = &mut sync => panic!("policy fetch was not blocked"),
+    }
+    // The native Stop can finish before
+    // Core reconciles its Connected projection.
+    fixture.core.signal_start_cancellation();
+    *fixture.tunnel.status.lock().unwrap() = TunnelStatus::Stopped;
+    fixture.api.policy_release.notify_one();
+    assert_eq!(
+        sync.await.unwrap(),
+        SplitTunnelSyncOutcome::Updated { reconnected: false }
+    );
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *fixture.tunnel.status.lock().unwrap(),
+        TunnelStatus::Stopped
+    );
+    assert_eq!(
+        fixture.split_store.load().unwrap().cached_policy,
+        Some(changed)
+    );
+}
+
+#[tokio::test]
 async fn failed_reapply_and_failed_rollback_leave_the_tunnel_stopped() {
     let fixture = coordinator_fixture(android_35_capabilities());
     fixture
@@ -1066,6 +1167,277 @@ async fn settings_save_reports_apply_and_rollback_failures() {
             Some(expected_code)
         );
     }
+}
+
+#[tokio::test]
+async fn address_rule_edits_return_saved_list_even_when_live_application_fails() {
+    let fixture = coordinator_fixture(android_35_capabilities());
+    fixture
+        .core
+        .synchronize_split_tunnel(900, true)
+        .await
+        .unwrap();
+    fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_000)
+        .await
+        .unwrap();
+    let mut policy = policy(SplitTunnelMode::ExcludeSelected);
+    policy.format_version = 2;
+    policy.address_revision = 1;
+    policy.policy_hash = format!("sha256:{}", "b".repeat(64));
+    policy.address_rules = vec![SplitTunnelAddressRule {
+        id: 42,
+        scope: SplitTunnelAddressRuleScope::ThisDevice,
+        kind: SplitTunnelAddressRuleKind::Domain,
+        value: "unresolved-address-rule.invalid".into(),
+    }];
+    fixture.api.set_policy(policy.clone());
+    let result = fixture
+        .core
+        .add_split_tunnel_address_rule(
+            &SplitTunnelAddressRuleUpdate {
+                value: policy.address_rules[0].value.clone(),
+                scope: SplitTunnelAddressRuleScope::ThisDevice,
+            },
+            1_100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.policy, policy);
+    assert!(
+        matches!(result.apply_issue, Some(CoreError::SplitTunnel(code))
+        if code == "split_tunnel_domain_resolution_unavailable")
+    );
+    assert_eq!(
+        fixture.core.saved_split_tunnel_policy().await.unwrap(),
+        Some(policy.clone())
+    );
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+
+    // A simultaneous panel policy change also requires native replacement on removal.
+    policy.address_rules.clear();
+    policy.address_revision = 2;
+    policy.policy_hash = format!("sha256:{}", "c".repeat(64));
+    policy.exclude_local_networks = false;
+    fixture.api.set_policy(policy.clone());
+    fixture.tunnel.fail_next_stops.store(1, Ordering::SeqCst);
+    let removed = fixture
+        .core
+        .remove_split_tunnel_address_rule(42, SplitTunnelAddressRuleScope::ThisDevice, 1_101)
+        .await
+        .unwrap();
+    assert!(removed.policy.address_rules.is_empty());
+    assert!(
+        matches!(removed.apply_issue, Some(CoreError::SplitTunnel(code))
+        if code == "split_tunnel_stop_failed")
+    );
+    assert_eq!(
+        fixture.core.saved_split_tunnel_policy().await.unwrap(),
+        Some(policy)
+    );
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.api.policy_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.api.revision_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn first_desktop_address_edit_persists_the_panel_revision_without_polling() {
+    for platform in [TunnelPlatform::Macos, TunnelPlatform::Linux] {
+        let fixture = coordinator_fixture(capabilities(platform, None, true, false));
+        let mut policy = policy(SplitTunnelMode::ExcludeSelected);
+        policy.format_version = 2;
+        policy.address_revision = 15;
+        policy.address_rules = vec![SplitTunnelAddressRule {
+            id: 42,
+            scope: SplitTunnelAddressRuleScope::AllDevices,
+            kind: SplitTunnelAddressRuleKind::Ipv4,
+            value: "192.0.2.1".into(),
+        }];
+        fixture.api.set_policy(policy.clone());
+        let result = fixture
+            .core
+            .add_split_tunnel_address_rule(
+                &SplitTunnelAddressRuleUpdate {
+                    value: "192.0.2.1".into(),
+                    scope: SplitTunnelAddressRuleScope::AllDevices,
+                },
+                1_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.policy, policy);
+        assert!(result.apply_issue.is_none());
+        assert_eq!(
+            fixture
+                .split_store
+                .load()
+                .unwrap()
+                .observed_panel_revision
+                .unwrap()
+                .address_revision,
+            15
+        );
+        assert_eq!(fixture.api.revision_calls.load(Ordering::SeqCst), 0);
+        fixture.core.sign_out().await.unwrap();
+        assert!(matches!(
+            fixture.core.saved_split_tunnel_policy().await,
+            Err(CoreError::SignedOut)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn logout_during_an_address_edit_discards_the_old_accounts_panel_response() {
+    let fixture = Arc::new(coordinator_fixture(android_35_capabilities()));
+    fixture.api.block_address_edit.store(true, Ordering::SeqCst);
+    let worker = fixture.clone();
+    let edit = tokio::spawn(async move {
+        worker
+            .core
+            .add_split_tunnel_address_rule(
+                &SplitTunnelAddressRuleUpdate {
+                    value: "example.test".into(),
+                    scope: SplitTunnelAddressRuleScope::ThisDevice,
+                },
+                1_000,
+            )
+            .await
+    });
+    fixture.api.address_edit_entered.notified().await;
+    fixture.core.sign_out().await.unwrap();
+    fixture.api.address_edit_release.notify_one();
+    assert!(matches!(
+        edit.await.unwrap(),
+        Err(CoreError::StartCancelled)
+    ));
+    assert!(fixture.split_store.load().unwrap().cached_policy.is_none());
+}
+
+#[tokio::test]
+async fn stop_then_start_uses_an_address_deletion_committed_before_stop() {
+    let fixture = Arc::new(coordinator_fixture(capabilities(
+        TunnelPlatform::Linux,
+        None,
+        true,
+        false,
+    )));
+    let mut original = policy(SplitTunnelMode::ExcludeSelected);
+    original.format_version = 2;
+    original.address_revision = 1;
+    original.address_rules = vec![SplitTunnelAddressRule {
+        id: 42,
+        scope: SplitTunnelAddressRuleScope::ThisDevice,
+        kind: SplitTunnelAddressRuleKind::Ipv4,
+        value: "203.0.113.19".into(),
+    }];
+    fixture.api.set_policy(original.clone());
+    fixture
+        .core
+        .synchronize_split_tunnel(900, true)
+        .await
+        .unwrap();
+    fixture
+        .core
+        .start(ConnectOptions::android_default(), 1000)
+        .await
+        .unwrap();
+    assert!(fixture.tunnel.options.lock().unwrap()[0]
+        .excluded_ipv4_cidrs
+        .iter()
+        .any(|net| net == "203.0.113.19/32"));
+
+    let mut committed = original;
+    committed.address_revision += 1;
+    committed.policy_hash = format!("sha256:{}", "d".repeat(64));
+    committed.address_rules.clear();
+    fixture.api.block_address_edit.store(true, Ordering::SeqCst);
+    let active_edit = fixture.clone();
+    let edit = tokio::spawn(async move {
+        active_edit
+            .core
+            .remove_split_tunnel_address_rule(42, SplitTunnelAddressRuleScope::ThisDevice, 1001)
+            .await
+    });
+    fixture.api.address_edit_entered.notified().await;
+    // The panel has committed the change. Only its response is delayed.
+    fixture.api.set_policy(committed.clone());
+    let mut stop = Box::pin(fixture.core.stop_locally());
+    tokio::select! {
+        biased;
+        _ = &mut stop => panic!("Stop should wait for the in-flight policy command"),
+        _ = std::future::ready(()) => (),
+    }
+    fixture.api.address_edit_release.notify_one();
+    assert!(matches!(
+        edit.await.unwrap(),
+        Err(CoreError::StartCancelled)
+    ));
+    stop.await.unwrap();
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+
+    fixture.api.stop_succeeds.store(true, Ordering::SeqCst);
+    fixture.core.complete_pending_stop().await.unwrap();
+    fixture
+        .core
+        .start(ConnectOptions::android_default(), 1002)
+        .await
+        .unwrap();
+    assert!(!fixture.tunnel.options.lock().unwrap()[1]
+        .excluded_ipv4_cidrs
+        .iter()
+        .any(|net| net == "203.0.113.19/32"));
+    assert_eq!(
+        fixture.split_store.load().unwrap().cached_policy,
+        Some(committed)
+    );
+}
+
+#[tokio::test]
+async fn invalid_or_unconfirmed_address_edits_never_return_a_saved_list() {
+    let fixture = coordinator_fixture(android_35_capabilities());
+    let request = |value: &str| SplitTunnelAddressRuleUpdate {
+        value: value.into(),
+        scope: SplitTunnelAddressRuleScope::ThisDevice,
+    };
+    assert!(
+        matches!(fixture.core.add_split_tunnel_address_rule(&request("ftp://example.test"), 1_000).await,
+        Err(CoreError::SplitTunnel(code)) if code == "split_tunnel_address_rule_invalid")
+    );
+    assert!(
+        matches!(fixture.core.remove_split_tunnel_address_rule(0, SplitTunnelAddressRuleScope::ThisDevice, 1_000).await,
+        Err(CoreError::SplitTunnel(code)) if code == "split_tunnel_address_rule_invalid")
+    );
+    fixture.api.online.store(false, Ordering::SeqCst);
+    assert!(matches!(
+        fixture
+            .core
+            .add_split_tunnel_address_rule(&request("example.test"), 1_001)
+            .await,
+        Err(CoreError::Api(CoreApiError::Retryable))
+    ));
+    assert!(fixture.split_store.load().unwrap().cached_policy.is_none());
+}
+
+#[tokio::test]
+async fn an_address_mutation_with_a_failed_cache_write_returns_storage_error() {
+    let fixture = coordinator_fixture(android_35_capabilities());
+    let store = Arc::new(FailingSplitTunnelStore::default());
+    store.fail_saves.store(true, Ordering::SeqCst);
+    let core = support::core_with_split(
+        fixture.api.clone(),
+        fixture.secret_store.clone(),
+        store.clone(),
+        fixture.tunnel.clone(),
+        fixture.logger.clone(),
+    );
+    assert!(matches!(
+        core.remove_split_tunnel_address_rule(42, SplitTunnelAddressRuleScope::ThisDevice, 1_000)
+            .await,
+        Err(CoreError::Storage)
+    ));
+    assert!(store.load().unwrap().cached_policy.is_none());
+    assert!(fixture.api.apply_results.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -2317,6 +2689,12 @@ async fn windows_without_policy_keeps_lan_and_defers_late_policy_until_next_star
         Some("split_tunnel_local_only")
     );
 
+    assert!(!fixture
+        .core
+        .split_tunnel_settings_require_reconnect(&same_split_settings())
+        .await
+        .unwrap());
+
     fixture.api.policy_online.store(true, Ordering::SeqCst);
     for now in [1_001, 1_301] {
         assert_eq!(
@@ -2796,8 +3174,14 @@ impl TunnelController for CoordinatorTunnel {
 }
 
 struct CoordinatorApi {
+    block_address_edit: AtomicBool,
+    address_edit_entered: Notify,
+    address_edit_release: Notify,
     online: AtomicBool,
     policy_online: AtomicBool,
+    block_policy: AtomicBool,
+    policy_entered: Notify,
+    policy_release: Notify,
     revision: Mutex<SplitTunnelRevision>,
     policy: Mutex<SplitTunnelPolicy>,
     revision_calls: AtomicUsize,
@@ -2816,8 +3200,14 @@ struct CoordinatorApi {
 impl CoordinatorApi {
     fn new() -> Self {
         Self {
+            block_address_edit: AtomicBool::new(false),
+            address_edit_entered: Notify::new(),
+            address_edit_release: Notify::new(),
             online: AtomicBool::new(true),
             policy_online: AtomicBool::new(true),
+            block_policy: AtomicBool::new(false),
+            policy_entered: Notify::new(),
+            policy_release: Notify::new(),
             revision: Mutex::new(SplitTunnelRevision {
                 enabled: true,
                 revision: 7,
@@ -3014,6 +3404,10 @@ impl CoreApi for CoordinatorApi {
             return Err(CoreApiError::Retryable);
         }
         self.policy_calls.fetch_add(1, Ordering::SeqCst);
+        if self.block_policy.load(Ordering::SeqCst) {
+            self.policy_entered.notify_one();
+            self.policy_release.notified().await;
+        }
         Ok(self.policy.lock().unwrap().clone())
     }
 
@@ -3024,6 +3418,33 @@ impl CoreApi for CoordinatorApi {
     ) -> Result<SplitTunnelPolicy, CoreApiError> {
         self.available()?;
         self.settings_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.policy.lock().unwrap().clone())
+    }
+
+    async fn add_split_tunnel_address_rule(
+        &self,
+        _token: &AccessSnapshot,
+        _request: &SplitTunnelAddressRuleUpdate,
+    ) -> Result<SplitTunnelPolicy, CoreApiError> {
+        self.available()?;
+        if self.block_address_edit.load(Ordering::SeqCst) {
+            self.address_edit_entered.notify_one();
+            self.address_edit_release.notified().await;
+        }
+        Ok(self.policy.lock().unwrap().clone())
+    }
+
+    async fn remove_split_tunnel_address_rule(
+        &self,
+        _token: &AccessSnapshot,
+        _rule_id: i64,
+        _scope: SplitTunnelAddressRuleScope,
+    ) -> Result<SplitTunnelPolicy, CoreApiError> {
+        self.available()?;
+        if self.block_address_edit.load(Ordering::SeqCst) {
+            self.address_edit_entered.notify_one();
+            self.address_edit_release.notified().await;
+        }
         Ok(self.policy.lock().unwrap().clone())
     }
 
@@ -5627,4 +6048,465 @@ async fn settings_confirmation_uses_live_plan_instead_of_changed_cache() {
         .await
         .unwrap();
     assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn recovery_after_reopen_keeps_revoked_exclusion_out_macos() {
+    recovery_after_reopen_helper(TunnelPlatform::Macos).await;
+}
+
+#[tokio::test]
+async fn recovery_after_reopen_keeps_revoked_exclusion_out_linux() {
+    recovery_after_reopen_helper(TunnelPlatform::Linux).await;
+}
+
+async fn recovery_after_reopen_helper(platform: TunnelPlatform) {
+    let fixture = coordinator_fixture(TunnelCapabilities {
+        platform,
+        address_split_tunnel: true,
+        ..Default::default()
+    });
+    let revoked = "203.0.113.9/32";
+    let mut previous = policy(SplitTunnelMode::ExcludeSelected);
+    previous.exclude_local_networks = false;
+    previous.excluded_ipv4_cidrs = vec![revoked.into()];
+    let mut current = previous.clone();
+    current.revision += 1;
+    current.policy_hash = format!("sha256:{}", "b".repeat(64));
+    current.excluded_ipv4_cidrs.clear();
+    fixture.api.set_policy(current.clone());
+    fixture
+        .split_store
+        .save(&StoredSplitTunnelState {
+            cached_policy: Some(current.clone()),
+            previous_working_policy: Some(previous.clone()),
+            working_policy_hash: Some(previous.policy_hash),
+            failed_policy_hash: Some(current.policy_hash),
+            observed_panel_revision: Some(SplitTunnelRevision {
+                enabled: current.enabled,
+                revision: current.revision,
+                force_revision: current.force_revision,
+                address_revision: current.address_revision,
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    let connection = fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_000)
+        .await
+        .unwrap();
+    assert!(fixture
+        .tunnel
+        .options
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .excluded_ipv4_cidrs
+        .is_empty());
+    fixture.api.set_bootstrap_connection(connection.clone());
+
+    let local = nelomai_client_core::CoreLocalStop::new(fixture.tunnel.clone());
+    let reopened = ClientCore::with_split_tunnel_store(
+        fixture.api.clone(),
+        Arc::new(support::LegacyRuntime::new(fixture.secret_store.clone())),
+        fixture.split_store.clone(),
+        Arc::new(support::TestOwner::new(
+            fixture.api.clone(),
+            fixture.secret_store.clone(),
+            local.clone(),
+        )),
+        local,
+        fixture.logger.clone(),
+    );
+    reopened.bootstrap(1_050).await.unwrap();
+    assert_eq!(reopened.state().await.phase, Phase::Connected);
+    assert_eq!(
+        reopened
+            .recover_stalled_data_plane(
+                &connection.lease_id,
+                StalledDataPlaneRecovery::RestartLocalTunnel
+            )
+            .await
+            .unwrap(),
+        StalledDataPlaneRecoveryOutcome::Reconnected,
+    );
+    let dispatched = fixture.tunnel.options.lock().unwrap();
+    assert!(
+        !dispatched
+            .last()
+            .unwrap()
+            .excluded_ipv4_cidrs
+            .iter()
+            .any(|cidr| cidr == revoked),
+        "recovery after reopen dispatched the revoked CIDR {revoked}: {dispatched:?}"
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn recovery_filters_an_obsolete_running_plan_before_native_restart() {
+    let fixture = coordinator_fixture(TunnelCapabilities {
+        platform: TunnelPlatform::Macos,
+        address_split_tunnel: true,
+        ..Default::default()
+    });
+    let revoked = "203.0.113.9/32";
+    let mut previous = policy(SplitTunnelMode::ExcludeSelected);
+    previous.excluded_ipv4_cidrs = vec![revoked.into()];
+    fixture.api.set_policy(previous.clone());
+    fixture
+        .core
+        .synchronize_split_tunnel(900, true)
+        .await
+        .unwrap();
+    let connection = fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .tunnel
+            .options
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .excluded_ipv4_cidrs,
+        [revoked]
+    );
+
+    let mut current = previous;
+    current.revision += 1;
+    current.policy_hash = format!("sha256:{}", "b".repeat(64));
+    current.excluded_ipv4_cidrs.clear();
+    fixture
+        .api
+        .set_revision(current.revision, current.force_revision);
+    fixture.api.set_policy(current);
+    fixture.api.policy_online.store(false, Ordering::SeqCst);
+    assert_eq!(
+        fixture
+            .core
+            .synchronize_split_tunnel(1_050, true)
+            .await
+            .unwrap(),
+        SplitTunnelSyncOutcome::CachedOffline
+    );
+    assert_eq!(
+        fixture
+            .core
+            .recover_stalled_data_plane(
+                &connection.lease_id,
+                StalledDataPlaneRecovery::RestartLocalTunnel
+            )
+            .await
+            .unwrap(),
+        StalledDataPlaneRecoveryOutcome::Reconnected
+    );
+    assert!(fixture
+        .tunnel
+        .options
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .excluded_ipv4_cidrs
+        .is_empty());
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn failed_policy_apply_does_not_restore_revoked_exclusion_macos() {
+    assert_safe_policy_apply_rollback(TunnelPlatform::Macos).await;
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn failed_policy_apply_does_not_restore_revoked_exclusion_linux() {
+    assert_safe_policy_apply_rollback(TunnelPlatform::Linux).await;
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn assert_safe_policy_apply_rollback(platform: TunnelPlatform) {
+    let fixture = coordinator_fixture(TunnelCapabilities {
+        platform,
+        address_split_tunnel: true,
+        ..Default::default()
+    });
+    let revoked = "203.0.113.9/32";
+    let mut original = policy(SplitTunnelMode::ExcludeSelected);
+    original.format_version = 2;
+    original.excluded_ipv4_cidrs = vec![revoked.into()];
+    original.address_rules = vec![SplitTunnelAddressRule {
+        id: 1,
+        scope: SplitTunnelAddressRuleScope::ThisDevice,
+        kind: SplitTunnelAddressRuleKind::Domain,
+        value: "cached.invalid".into(),
+    }];
+    fixture
+        .api
+        .set_revision(original.revision, original.force_revision);
+    fixture.api.set_policy(original.clone());
+    fixture
+        .core
+        .synchronize_split_tunnel(900, true)
+        .await
+        .unwrap();
+    let mut stored = fixture.split_store.load().unwrap();
+    stored.domain_resolutions = vec![StoredSplitTunnelDomainResolution {
+        domain: "cached.invalid".into(),
+        ipv4_cidrs: vec!["198.51.100.10/32".into()],
+        resolved_at_unix: 900,
+    }];
+    fixture.split_store.save(&stored).unwrap();
+    let running = fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .tunnel
+            .options
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .excluded_ipv4_cidrs,
+        ["198.51.100.10/32", revoked]
+    );
+    let initially_applied = fixture.split_store.load().unwrap();
+    assert_eq!(
+        initially_applied.working_policy_hash,
+        Some(original.policy_hash.clone())
+    );
+    assert_eq!(
+        initially_applied.working_policy_revision.unwrap().revision,
+        original.revision
+    );
+
+    let mut new = original;
+    new.revision += 1;
+    new.policy_hash = format!("sha256:{}", "b".repeat(64));
+    new.excluded_ipv4_cidrs.clear();
+    new.address_rules.clear();
+    fixture.api.set_revision(new.revision, new.force_revision);
+    fixture.api.set_policy(new.clone());
+    fixture.tunnel.fail_next_starts.store(1, Ordering::SeqCst);
+    assert_eq!(
+        fixture
+            .core
+            .synchronize_split_tunnel(1_050, true)
+            .await
+            .unwrap(),
+        SplitTunnelSyncOutcome::Updated { reconnected: true }
+    );
+
+    let saved = fixture.split_store.load().unwrap();
+    assert_eq!(
+        saved.observed_panel_revision.unwrap().revision,
+        new.revision
+    );
+    assert_eq!(saved.cached_policy, Some(new.clone()));
+    assert_eq!(saved.failed_policy_hash, Some(new.policy_hash));
+    assert!(saved.working_policy_hash.is_none());
+    assert!(saved.working_policy_revision.is_none());
+    assert!(saved.previous_working_policy.is_none());
+    assert!(saved.domain_resolutions.is_empty());
+    let state = fixture.core.state().await;
+    assert_eq!(state.phase, Phase::Connected);
+    assert_eq!(state.connection, Some(running));
+    assert_eq!(
+        fixture.core.split_tunnel_warning().await.as_deref(),
+        Some("split_tunnel_default_routes_restored")
+    );
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        fixture.tunnel.options.lock().unwrap().last(),
+        Some(&TunnelOptions::default())
+    );
+    let results = fixture.api.apply_results.lock().unwrap();
+    let failed = results.last().unwrap();
+    assert_eq!(failed.status, SplitTunnelApplyStatus::Failed);
+    assert_eq!(
+        failed.error_code.as_deref(),
+        Some("split_tunnel_default_routes_restored")
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn equivalent_desktop_policy_preserves_routes_during_automatic_restart() {
+    for platform in [TunnelPlatform::Macos, TunnelPlatform::Linux] {
+        let fixture = coordinator_fixture(capabilities(platform, None, true, false));
+        let old = policy(SplitTunnelMode::ExcludeSelected);
+        fixture.api.set_policy(old.clone());
+        fixture
+            .core
+            .synchronize_split_tunnel(900, true)
+            .await
+            .unwrap();
+        let connection = fixture
+            .core
+            .start(ConnectOptions::android_default(), 1000)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .tunnel
+                .options
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .excluded_ipv4_cidrs,
+            old.excluded_ipv4_cidrs
+        );
+        let mut new = old.clone();
+        new.revision += 1;
+        new.policy_hash = format!("sha256:{}", "b".repeat(64));
+        new.selected_packages = vec!["com.example.chat".to_string()]; // Changes the policy, not desktop routes.
+        fixture.api.set_revision(new.revision, new.force_revision);
+        fixture.api.set_policy(new.clone());
+        assert_eq!(
+            fixture
+                .core
+                .synchronize_split_tunnel(1100, true)
+                .await
+                .unwrap(),
+            SplitTunnelSyncOutcome::Updated { reconnected: false }
+        );
+        assert_eq!(
+            fixture.split_store.load().unwrap().working_policy_hash,
+            Some(new.policy_hash)
+        );
+        assert_eq!(
+            fixture
+                .core
+                .recover_stalled_data_plane(
+                    &connection.lease_id,
+                    StalledDataPlaneRecovery::RestartLocalTunnel
+                )
+                .await
+                .unwrap(),
+            StalledDataPlaneRecoveryOutcome::Reconnected
+        );
+        assert_eq!(
+            fixture
+                .tunnel
+                .options
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .excluded_ipv4_cidrs,
+            old.excluded_ipv4_cidrs,
+            "valid exclusions were dropped on {platform:?}"
+        );
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn first_save_on_legacy_cache_does_not_restore_revoked_bypass() {
+    let fixture = coordinator_fixture(capabilities(TunnelPlatform::Macos, None, true, false));
+    let old = policy(SplitTunnelMode::ExcludeSelected);
+    fixture
+        .split_store
+        .save(&StoredSplitTunnelState {
+            cached_policy: Some(old.clone()),
+            working_policy_hash: Some(old.policy_hash.clone()),
+            last_full_sync_unix: Some(900),
+            last_revision_check_unix: Some(900),
+            ..Default::default()
+        })
+        .unwrap();
+    let _connection = fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_000)
+        .await
+        .unwrap();
+    assert!(fixture
+        .split_store
+        .load()
+        .unwrap()
+        .observed_panel_revision
+        .is_none());
+    let mut new = old.clone();
+    new.revision += 1;
+    new.policy_hash = format!("sha256:{}", "b".repeat(64));
+    new.excluded_ipv4_cidrs.clear();
+    new.exclude_local_networks = false;
+    fixture.api.set_policy(new.clone());
+    fixture.tunnel.fail_next_starts.store(1, Ordering::SeqCst);
+    assert!(fixture
+        .core
+        .save_split_tunnel_settings(
+            &SplitTunnelSettingsUpdate {
+                mode: new.mode,
+                exclude_local_networks: false,
+                selected_packages: vec![],
+            },
+            1_050
+        )
+        .await
+        .is_err());
+    assert_eq!(fixture.split_store.load().unwrap().cached_policy, Some(new));
+    assert!(fixture.tunnel.options.lock().unwrap().last().unwrap().excluded_ipv4_cidrs.is_empty(),
+        "an old policy bypass was reinstalled although the successful settings response already revoked it");
+}
+
+#[tokio::test]
+async fn ordinary_save_requires_reconnect_confirmation_when_cache_is_superseded() {
+    let fixture = coordinator_fixture(capabilities(TunnelPlatform::Macos, None, true, false));
+    let old = policy(SplitTunnelMode::ExcludeSelected);
+    fixture.api.set_policy(old.clone());
+    fixture
+        .core
+        .synchronize_split_tunnel(900, true)
+        .await
+        .unwrap();
+    fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_000)
+        .await
+        .unwrap();
+    let mut new = old;
+    new.revision += 1;
+    new.policy_hash = format!("sha256:{}", "b".repeat(64));
+    new.exclude_local_networks = false;
+    new.excluded_ipv4_cidrs.clear();
+    fixture.api.set_revision(new.revision, new.force_revision);
+    fixture.api.set_policy(new.clone());
+    fixture.api.policy_online.store(false, Ordering::SeqCst);
+    assert_eq!(
+        fixture
+            .core
+            .synchronize_split_tunnel(1_050, true)
+            .await
+            .unwrap(),
+        SplitTunnelSyncOutcome::CachedOffline
+    );
+    fixture.api.policy_online.store(true, Ordering::SeqCst);
+    let request = SplitTunnelSettingsUpdate {
+        mode: new.mode,
+        exclude_local_networks: false,
+        selected_packages: vec![],
+    };
+    let warned = fixture
+        .core
+        .split_tunnel_settings_require_reconnect(&request)
+        .await
+        .unwrap();
+    let before = fixture.tunnel.starts.load(Ordering::SeqCst);
+    fixture
+        .core
+        .save_split_tunnel_settings(&request, 1_055)
+        .await
+        .unwrap();
+    let after = fixture.tunnel.starts.load(Ordering::SeqCst);
+    assert!(after > before);
+    assert!(warned, "ordinary settings Save restarts the active tunnel without the expected confirmation: starts {before} -> {after}");
 }

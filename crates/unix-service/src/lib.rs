@@ -599,6 +599,7 @@ fn stable_route_error_code(code: &str) -> Option<&'static str> {
     Some(match code {
         "route_plan_too_large" => "route_plan_too_large",
         "route_conflict" => "route_conflict",
+        "network_route_ownership_unconfirmed" => "network_route_ownership_unconfirmed",
         "route_state_too_large" => "route_state_too_large",
         "route_state_invalid" => "route_state_invalid",
         "route_state_read_failed" => "route_state_read_failed",
