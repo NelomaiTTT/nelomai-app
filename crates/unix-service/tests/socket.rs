@@ -454,3 +454,139 @@ async fn timed_out_dispatcher_stop_is_drained_before_retry_ack_and_new_start() {
         "new engine survives after all earlier stops and a positive cleanup receipt"
     );
 }
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires a disposable macOS VM and the installed test transport binaries"]
+async fn native_macos_start_fits_the_client_ipc_deadline() {
+    use nelomai_client_tunnel::{
+        redundancy::{
+            protocol::{Command, Member},
+            SessionScope, Slot,
+        },
+        DesktopTunnelOptions, TunnelConfiguration,
+    };
+    use nelomai_contracts::RuntimeSlot;
+    use nelomai_unix_service::{
+        member_network::{actor::CompositeBackend, runtime::NativePairFactory},
+        PlatformBackend, Request, ServiceTransport, PROTOCOL_VERSION,
+    };
+
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    let model = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "hw.model"])
+        .output()
+        .unwrap();
+    assert!(model.status.success() && model.stdout.starts_with(b"VirtualMac"));
+    let binaries = std::path::PathBuf::from(std::env::var_os("NELOMAI_MAC_QA_BINARIES").unwrap());
+
+    let configuration = "[Interface]\nPrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=\nAddress = 10.8.0.2/32, fd12:ca6e::2/128\n[Peer]\nPublicKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAI=\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = 198.19.237.60:51820\n";
+    // Individual bypasses distributed across the full-tunnel address space
+    // reproduce the large route plan without reaching those destinations.
+    let options = DesktopTunnelOptions {
+        excluded_ipv4_cidrs: (0..40)
+            .map(|i| format!("{}.1.2.3/32", 11 + 4 * i))
+            .collect(),
+        exclude_local_networks: true,
+        policy_hash: Some("sha256:test".into()),
+    };
+    let scope = SessionScope {
+        runtime: RuntimeSlot::Latest,
+        runtime_generation: 1,
+        session_id: "11111111-1111-4111-8111-111111111111".into(),
+        connection_generation: 1,
+    };
+    let command = |request| Request::Redundant {
+        protocol_version: PROTOCOL_VERSION,
+        request,
+    };
+
+    for reserve in [false, true] {
+        let root = tempdir().unwrap();
+        let runtime = root.path().join("runtime");
+        let pair_root = root.path().join("pair");
+        fs::create_dir(&runtime).unwrap();
+        fs::create_dir(&pair_root).unwrap();
+        fs::set_permissions(&pair_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = root.path().join("tunnel.sock");
+        let listener = bind_listener(&socket, 0).unwrap();
+        let server = std::thread::spawn({
+            let binaries = binaries.clone();
+            move || {
+                let platform = PlatformBackend::new(
+                    binaries.join("wireguard-go"),
+                    binaries.join("amneziawg-go"),
+                    runtime,
+                )
+                .unwrap();
+                let factory =
+                    NativePairFactory::new(&pair_root, RuntimeSlot::Latest, &binaries).unwrap();
+                let backend =
+                    CompositeBackend::new(RuntimeSlot::Latest, platform, factory).unwrap();
+                let mut handler = TunnelRequestHandler::new(backend, "0.4.4");
+                let policy = ClientPolicy {
+                    owner_uid: 0,
+                    installed_client_path: std::env::current_exe().unwrap().canonicalize().unwrap(),
+                };
+                let start = serve_one(&listener, &policy, &mut handler);
+                // Process Stop before asserting the Start result, including
+                // when the client gives up before the server completes.
+                let stop = serve_one(&listener, &policy, &mut handler);
+                (start, stop)
+            }
+        });
+        let (start, stop) = if reserve {
+            let member = Member {
+                slot: Slot::A,
+                lease_id: "22222222-2222-4222-8222-222222222222".into(),
+                configuration: TunnelConfiguration::new(configuration.into()),
+                probe: serde_json::from_value(serde_json::json!({
+                    "kind": "dns_a",
+                    "target_ipv4": "198.19.237.100",
+                    "query_name": "example.com",
+                    "timeout_ms": 2000,
+                }))
+                .unwrap(),
+            };
+            (
+                command(Command::Start {
+                    scope: scope.clone(),
+                    primary: member,
+                    role_generation: 1,
+                    membership_generation: 1,
+                    warm_stop_v1: true,
+                    options: options.clone(),
+                }),
+                command(Command::Stop {
+                    scope: scope.clone(),
+                }),
+            )
+        } else {
+            (
+                Request::start_with_options(configuration.into(), options.clone()),
+                Request::stop(),
+            )
+        };
+        let transport = UnixSocketTransport::new(socket);
+        let started_at = std::time::Instant::now();
+        let started = transport.exchange(start).await;
+        let start_ms = started_at.elapsed().as_millis();
+        let stopped = transport.exchange(stop).await;
+        let service = server.join().unwrap();
+        let started = started.expect("native Start must answer before the client IPC deadline");
+        assert!(
+            started.error_code.is_none(),
+            "Start returned {:?}",
+            started.error_code
+        );
+        assert!(service.0.is_ok(), "Start response failed: {:?}", service.0);
+        assert!(service.1.is_ok(), "Stop response failed: {:?}", service.1);
+        let stopped = stopped.unwrap();
+        assert!(
+            stopped.error_code.is_none(),
+            "Stop returned {:?}",
+            stopped.error_code
+        );
+        eprintln!("reserve={reserve} start_ms={start_ms}");
+    }
+}

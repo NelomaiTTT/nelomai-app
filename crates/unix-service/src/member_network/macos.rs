@@ -5,10 +5,72 @@ use std::{
     net::{IpAddr, Ipv4Addr},
 };
 
+#[cfg(target_os = "macos")]
+mod routing;
+
+#[derive(Clone, Copy)]
+pub enum RouteAction {
+    Add,
+    Change,
+    Delete,
+}
+
 pub trait MacNetworkCommands {
     fn run(&mut self, program: &str, args: &[String]) -> io::Result<String>;
     fn interface_name(&self, index: u32) -> io::Result<String>;
     fn interface_index(&self, name: &str) -> io::Result<u32>;
+    #[cfg(not(test))]
+    fn read_routes(
+        &mut self,
+        ipv4: bool,
+        keys: &[(IpNet, RouteScope)],
+    ) -> io::Result<Vec<Option<RouteValue>>>;
+
+    #[cfg(not(test))]
+    fn mutate_route(
+        &mut self,
+        action: RouteAction,
+        route: &RouteValue,
+        interface: &str,
+    ) -> io::Result<()>;
+
+    fn check_route_before(
+        &mut self,
+        _action: RouteAction,
+        _previous: &RouteValue,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    // Preserve the existing command fixtures for policy and ownership tests.
+    #[cfg(test)]
+    fn read_routes(
+        &mut self,
+        ipv4: bool,
+        keys: &[(IpNet, RouteScope)],
+    ) -> io::Result<Vec<Option<RouteValue>>> {
+        let table = self.run(
+            "/usr/sbin/netstat",
+            &[
+                "-rn".into(),
+                "-f".into(),
+                if ipv4 { "inet" } else { "inet6" }.into(),
+            ],
+        )?;
+        keys.iter()
+            .map(|&(destination, scope)| read_route_table(self, destination, scope, &table))
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn mutate_route(
+        &mut self,
+        action: RouteAction,
+        route: &RouteValue,
+        interface: &str,
+    ) -> io::Result<()> {
+        test_mutate_route(self, action, route, interface)
+    }
 }
 
 /// XNU treats an unscoped route whose destination key is zero as a primary
@@ -42,7 +104,13 @@ impl<C: MacNetworkCommands> NetworkSystem for MacNetwork<C> {
     }
 
     fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
-        if matches!(key, ResourceKey::Route(_, RouteScope::WindowsInterface(_))) {
+        if matches!(
+            key,
+            ResourceKey::Route(
+                _,
+                RouteScope::LinuxMainPriority(_) | RouteScope::WindowsInterface(_)
+            )
+        ) {
             return Err(invalid());
         }
         match key {
@@ -68,53 +136,47 @@ impl<C: MacNetworkCommands> NetworkSystem for MacNetwork<C> {
                 })))
             }
             ResourceKey::Route(destination, scope) => {
-                let family = if destination.addr().is_ipv4() {
-                    "inet"
-                } else {
-                    "inet6"
-                };
-                let text = self.commands.run(
-                    "/usr/sbin/netstat",
-                    &["-rn".into(), "-f".into(), family.into()],
-                )?;
-                self.read_route_table(*destination, *scope, &text)
+                let result = self
+                    .commands
+                    .read_routes(destination.addr().is_ipv4(), &[(*destination, *scope)])?;
+                Ok(result
+                    .into_iter()
+                    .next()
+                    .ok_or_else(invalid)?
+                    .map(NetworkValue::Route))
             }
         }
     }
 
     fn read_many(&mut self, keys: &[ResourceKey]) -> io::Result<Vec<Option<NetworkValue>>> {
-        let mut tables = [None, None];
-        let mut values = Vec::with_capacity(keys.len());
+        let mut route_keys = [Vec::new(), Vec::new()];
         for key in keys {
-            match key {
-                ResourceKey::Route(destination, scope) => {
-                    if matches!(
-                        scope,
-                        RouteScope::LinuxMainPriority(_) | RouteScope::WindowsInterface(_)
-                    ) {
-                        return Err(invalid());
-                    }
-                    let family = usize::from(destination.addr().is_ipv6());
-                    if tables[family].is_none() {
-                        tables[family] = Some(self.commands.run(
-                            "/usr/sbin/netstat",
-                            &[
-                                "-rn".into(),
-                                "-f".into(),
-                                if family == 0 { "inet" } else { "inet6" }.into(),
-                            ],
-                        )?);
-                    }
-                    values.push(self.read_route_table(
-                        *destination,
-                        *scope,
-                        tables[family].as_deref().unwrap(),
-                    )?);
+            if let ResourceKey::Route(destination, scope) = key {
+                if matches!(
+                    scope,
+                    RouteScope::LinuxMainPriority(_) | RouteScope::WindowsInterface(_)
+                ) {
+                    return Err(invalid());
                 }
-                _ => values.push(self.read(key)?),
+                route_keys[usize::from(destination.addr().is_ipv6())].push((*destination, *scope));
             }
         }
-        Ok(values)
+        let mut found = [Vec::new().into_iter(), Vec::new().into_iter()];
+        for (family, routes) in route_keys.iter().enumerate() {
+            if !routes.is_empty() {
+                found[family] = self.commands.read_routes(family == 0, routes)?.into_iter();
+            }
+        }
+        keys.iter()
+            .map(|key| match key {
+                ResourceKey::Route(destination, _) => Ok(found
+                    [usize::from(destination.addr().is_ipv6())]
+                .next()
+                .ok_or_else(invalid)?
+                .map(NetworkValue::Route)),
+                _ => self.read(key),
+            })
+            .collect()
     }
 
     fn compare_exchange(
@@ -185,15 +247,23 @@ impl<C: MacNetworkCommands> NetworkSystem for MacNetwork<C> {
             ResourceKey::Route(..) => {
                 self.prepare_exchange(key, before, prepare)?;
                 match (before, after) {
-                    (Some(NetworkValue::Route(_)), Some(NetworkValue::Route(route))) => {
+                    (Some(NetworkValue::Route(previous)), Some(NetworkValue::Route(route))) => {
+                        self.commands
+                            .check_route_before(RouteAction::Change, previous)
+                            .map_err(unchanged)?;
                         // RTM_CHANGE keeps the prefix in the kernel FIB during
                         // promotion. Only use it after the exact old row was
                         // rechecked, including after the owner intent was saved.
-                        self.mutate("change", route)?;
+                        self.mutate(RouteAction::Change, route)?;
                     }
-                    (Some(NetworkValue::Route(route)), None) => self.mutate("delete", route)?,
+                    (Some(NetworkValue::Route(route)), None) => {
+                        self.commands
+                            .check_route_before(RouteAction::Delete, route)
+                            .map_err(unchanged)?;
+                        self.mutate(RouteAction::Delete, route)?;
+                    }
                     (None, Some(NetworkValue::Route(route))) => {
-                        self.mutate("add", route).map_err(|error| {
+                        self.mutate(RouteAction::Add, route).map_err(|error| {
                             if error.kind() == io::ErrorKind::AlreadyExists {
                                 unchanged(error)
                             } else {
@@ -210,45 +280,6 @@ impl<C: MacNetworkCommands> NetworkSystem for MacNetwork<C> {
 }
 
 impl<C: MacNetworkCommands> MacNetwork<C> {
-    fn read_route_table(
-        &self,
-        destination: IpNet,
-        scope: RouteScope,
-        text: &str,
-    ) -> io::Result<Option<NetworkValue>> {
-        let mut result = None;
-        for line in text.lines() {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            if fields.len() < 4 {
-                continue;
-            }
-            if table_destination(fields[0], destination.addr().is_ipv4()) != Some(destination) {
-                continue;
-            }
-            let interface = self.commands.interface_index(fields[3])?;
-            let actual_scope = if fields[2].contains('I') {
-                RouteScope::Member(interface)
-            } else {
-                RouteScope::Global
-            };
-            if actual_scope != scope {
-                continue;
-            }
-            let gateway = table_gateway(fields[1], fields[3])?;
-            let value = NetworkValue::Route(RouteValue {
-                destination,
-                scope,
-                interface,
-                gateway,
-                metric: 0,
-            });
-            if result.replace(value).is_some() {
-                return Err(io::Error::other("ambiguous_owned_route"));
-            }
-        }
-        Ok(result)
-    }
-
     /// Read-only physical policy discovery. `owned` comes from the session's
     /// durable route journal, never from the application request.
     pub fn resolve_policy(
@@ -443,7 +474,7 @@ impl<C: MacNetworkCommands> MacNetwork<C> {
         Ok(policy)
     }
 
-    fn mutate(&mut self, action: &str, route: &RouteValue) -> io::Result<()> {
+    fn mutate(&mut self, action: RouteAction, route: &RouteValue) -> io::Result<()> {
         let interface = self.commands.interface_name(route.interface)?;
         if route.gateway.is_some()
             || !utun(&interface)
@@ -451,42 +482,97 @@ impl<C: MacNetworkCommands> MacNetwork<C> {
         {
             return Err(invalid());
         }
-        let max_prefix = if route.destination.addr().is_ipv4() {
-            32
-        } else {
-            128
-        };
-        let host = route.destination.prefix_len() == max_prefix;
-        let mut args = vec![
-            "-n".into(),
-            action.into(),
-            if max_prefix == 32 {
-                "-inet".into()
-            } else {
-                "-inet6".into()
-            },
-        ];
-        if host {
-            args.extend(["-host".into(), route.destination.addr().to_string()]);
-        } else if let IpNet::V4(net) = route.destination {
-            // Darwin route(8)'s classful "-net CIDR" parser shifts low addresses:
-            // 0.0.0.2/31 becomes 2.0.0.0/31. Supply the address and mask separately.
-            args.extend([
-                "-dst".into(),
-                net.network().to_string(),
-                "-netmask".into(),
-                net.netmask().to_string(),
-            ]);
-        } else {
-            args.extend(["-net".into(), route.destination.to_string()]);
-        }
-        args.extend(["-interface".into(), interface.clone()]);
-        if matches!(route.scope, RouteScope::Member(_)) {
-            args.extend(["-ifscope".into(), interface]);
-        }
-        self.commands.run("/sbin/route", &args)?;
-        Ok(())
+        self.commands.mutate_route(action, route, &interface)
     }
+}
+
+#[cfg(test)]
+fn read_route_table(
+    commands: &(impl MacNetworkCommands + ?Sized),
+    destination: IpNet,
+    scope: RouteScope,
+    text: &str,
+) -> io::Result<Option<RouteValue>> {
+    let mut result = None;
+    for line in text.lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 4 {
+            continue;
+        }
+        if table_destination(fields[0], destination.addr().is_ipv4()) != Some(destination) {
+            continue;
+        }
+        let interface = commands.interface_index(fields[3])?;
+        let actual_scope = if fields[2].contains('I') {
+            RouteScope::Member(interface)
+        } else {
+            RouteScope::Global
+        };
+        if actual_scope != scope {
+            continue;
+        }
+        let gateway = table_gateway(fields[1], fields[3])?;
+        let value = RouteValue {
+            destination,
+            scope,
+            interface,
+            gateway,
+            metric: 0,
+        };
+        if result.replace(value).is_some() {
+            return Err(io::Error::other("ambiguous_owned_route"));
+        }
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+fn test_mutate_route(
+    commands: &mut (impl MacNetworkCommands + ?Sized),
+    action: RouteAction,
+    route: &RouteValue,
+    interface: &str,
+) -> io::Result<()> {
+    let max_prefix = if route.destination.addr().is_ipv4() {
+        32
+    } else {
+        128
+    };
+    let host = route.destination.prefix_len() == max_prefix;
+    let mut args = vec![
+        "-n".into(),
+        match action {
+            RouteAction::Add => "add",
+            RouteAction::Change => "change",
+            RouteAction::Delete => "delete",
+        }
+        .into(),
+        if max_prefix == 32 {
+            "-inet".into()
+        } else {
+            "-inet6".into()
+        },
+    ];
+    if host {
+        args.extend(["-host".into(), route.destination.addr().to_string()]);
+    } else if let IpNet::V4(net) = route.destination {
+        // Darwin route(8)'s classful "-net CIDR" parser shifts low addresses:
+        // 0.0.0.2/31 becomes 2.0.0.0/31. Supply the address and mask separately.
+        args.extend([
+            "-dst".into(),
+            net.network().to_string(),
+            "-netmask".into(),
+            net.netmask().to_string(),
+        ]);
+    } else {
+        args.extend(["-net".into(), route.destination.to_string()]);
+    }
+    args.extend(["-interface".into(), interface.into()]);
+    if matches!(route.scope, RouteScope::Member(_)) {
+        args.extend(["-ifscope".into(), interface.into()]);
+    }
+    commands.run("/sbin/route", &args)?;
+    Ok(())
 }
 
 pub(crate) fn physical_endpoint<C: MacNetworkCommands>(
@@ -664,20 +750,32 @@ impl MacNetworkCommands for NativeMacCommands {
                 .env("LC_ALL", "C"),
             crate::process::COMMAND_TIMEOUT,
         )?;
-        if program == "/sbin/route"
-            && args.get(1).is_some_and(|action| action == "add")
-            && output
-                .stderr
-                .split(|byte| *byte == b'\n')
-                .any(|line| line == b"route: writing to routing socket: File exists")
-        {
-            return Err(io::ErrorKind::AlreadyExists.into());
-        }
         if !output.status.success() {
             return Err(io::Error::other("native_network_command_failed"));
         }
         String::from_utf8(output.stdout).map_err(|_| invalid())
     }
+    fn check_route_before(&mut self, action: RouteAction, previous: &RouteValue) -> io::Result<()> {
+        routing::check_route_before(action, previous)
+    }
+
+    fn read_routes(
+        &mut self,
+        ipv4: bool,
+        keys: &[(IpNet, RouteScope)],
+    ) -> io::Result<Vec<Option<RouteValue>>> {
+        routing::read_routes(ipv4, keys)
+    }
+
+    fn mutate_route(
+        &mut self,
+        action: RouteAction,
+        route: &RouteValue,
+        interface: &str,
+    ) -> io::Result<()> {
+        routing::mutate(action, route, interface)
+    }
+
     fn interface_name(&self, index: u32) -> io::Result<String> {
         let mut buffer = [0 as libc::c_char; libc::IF_NAMESIZE];
         if index == 0 || unsafe { libc::if_indextoname(index, buffer.as_mut_ptr()) }.is_null() {

@@ -1567,10 +1567,12 @@ fn native_mac_pair_routes_refresh_promote_and_stop() {
         (name, index, meta.dev(), meta.ino())
     };
     let full = std::env::var_os("NELOMAI_ROUTE_QA_FULL").is_some();
-    let allowed = if full {
-        "0.0.0.0/0, ::/0"
-    } else {
-        "198.19.237.0/24"
+    let probe_overlap = std::env::var_os("NELOMAI_ROUTE_QA_PROBE_OVERLAP").is_some();
+    let allowed = match (full, probe_overlap) {
+        (true, true) => "0.0.0.0/0, ::/0, 198.19.237.100/32",
+        (true, false) => "0.0.0.0/0, ::/0",
+        (false, true) => "198.19.237.0/24, 198.19.237.100/32",
+        (false, false) => "198.19.237.0/24",
     };
     let ips = ["198.19.237.60", "198.19.237.61"];
     let options = |ip: &str| DesktopTunnelOptions {
@@ -1618,6 +1620,45 @@ fn native_mac_pair_routes_refresh_promote_and_stop() {
     check_panel(&physical, false);
     let mut probe = probe();
     probe.target_ipv4 = "198.19.237.100".parse().unwrap();
+    let confirm_probe_routes = |active: &str| {
+        if !probe_overlap {
+            return;
+        }
+        let target = "198.19.237.100";
+        assert_eq!(lookup(target), active);
+        for slot in ["slot-a", "slot-b"] {
+            let interface = member_name(slot);
+            let index = NativeMacCommands.interface_index(&interface).unwrap();
+            let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+            let bound = unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::IPPROTO_IP,
+                    libc::IP_BOUND_IF,
+                    (&index as *const u32).cast(),
+                    std::mem::size_of::<u32>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(bound, 0, "{}", std::io::Error::last_os_error());
+            assert_eq!(socket.send_to(b"probe", (target, 45970)).unwrap(), 5);
+            let route = NativeMacCommands
+                .run(
+                    "/sbin/route",
+                    &[
+                        "-n".into(),
+                        "get".into(),
+                        "-inet".into(),
+                        "-ifscope".into(),
+                        interface.clone(),
+                        target.into(),
+                    ],
+                )
+                .unwrap();
+            assert!(route.lines().any(|line| {
+                line.trim().strip_prefix("interface: ") == Some(interface.as_str())
+            }));
+        }
+    };
     let member = |slot, endpoint, suffix| {
         Member {
         slot,
@@ -1672,6 +1713,7 @@ fn native_mac_pair_routes_refresh_promote_and_stop() {
     let primary = engine_identity("slot-a");
     let standby = engine_identity("slot-b");
     assert_ne!(primary.1, standby.1);
+    confirm_probe_routes(&primary.0);
     sample(45993, &mut || {
         pair.refresh_split_tunnel(&scope(), &options(new)).unwrap();
     });
@@ -1684,6 +1726,7 @@ fn native_mac_pair_routes_refresh_promote_and_stop() {
     assert_eq!(engine_identity("slot-b"), standby);
     assert_eq!(lookup(old), member_name("slot-b"));
     assert_eq!(lookup(new), physical);
+    confirm_probe_routes(&standby.0);
     for ip in ips {
         assert_eq!(lookup(ip), physical);
     }
@@ -1783,6 +1826,10 @@ fn native_mac_pair_routes_refresh_promote_and_stop() {
     }
     if matches!(stage.as_str(), "crash" | "engine-exit") {
         std::process::exit(79);
+    }
+    if probe_overlap && stage == "live" {
+        pair.select_active(&scope(), Slot::A).unwrap();
+        confirm_probe_routes(&primary.0);
     }
     pair.close(&scope()).unwrap();
     sample(45995, &mut || control());
