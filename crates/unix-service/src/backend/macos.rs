@@ -1524,7 +1524,7 @@ fn native_ordinary_userspace_owner() {
                     .as_ref(),
                 Some(&live)
             );
-            super::redundancy::remove_userspace_member(&name, live.socket).unwrap();
+            super::redundancy::remove_userspace_member(&name, live.index, live.socket).unwrap();
         } else {
             assert_eq!(backend.transport_owner.identity(), Some(&live));
             assert!(backend.transport_owner.stopping());
@@ -1892,7 +1892,8 @@ fn native_ordinary_userspace_owner() {
             // Model a daemon that exited without unlinking the public name.
             fs::rename(&held, &socket).unwrap();
         } else {
-            super::redundancy::remove_userspace_member(&live.interface, live.socket).unwrap();
+            super::redundancy::remove_userspace_member(&live.interface, live.index, live.socket)
+                .unwrap();
         }
         backend = open();
         assert!(backend.api.is_none());

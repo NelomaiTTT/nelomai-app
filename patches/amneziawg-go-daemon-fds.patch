@@ -1,0 +1,26 @@
+diff --git a/main.go b/main.go
+--- a/main.go
++++ b/main.go
+@@ -177,10 +177,19 @@
+ 	// daemonize the process
+ 
+ 	if !foreground {
++		// Replace inherited descriptor numbers before exec. Go uses the
++		// first value when an environment variable appears twice.
++		for key, value := range map[string]string{
++			ENV_WG_TUN_FD:             "3",
++			ENV_WG_UAPI_FD:            "4",
++			ENV_WG_PROCESS_FOREGROUND: "1",
++		} {
++			if err := os.Setenv(key, value); err != nil {
++				logger.Errorf("Failed to prepare daemon environment: %v", err)
++				os.Exit(ExitSetupFailed)
++			}
++		}
+ 		env := os.Environ()
+-		env = append(env, fmt.Sprintf("%s=3", ENV_WG_TUN_FD))
+-		env = append(env, fmt.Sprintf("%s=4", ENV_WG_UAPI_FD))
+-		env = append(env, fmt.Sprintf("%s=1", ENV_WG_PROCESS_FOREGROUND))
+ 		files := [3]*os.File{}
+ 		if os.Getenv("LOG_LEVEL") != "" && logLevel != device.LogLevelSilent {
+ 			files[0], _ = os.Open(os.DevNull)

@@ -159,15 +159,26 @@ pub(super) fn remove_kernel_member<C: KernelMemberControl>(
 #[cfg(any(target_os = "linux", test))]
 pub(super) fn remove_userspace_member(
     interface: &str,
+    expected_index: u32,
     identity: SocketIdentity,
 ) -> Result<(), crate::ServiceError> {
+    let name =
+        std::ffi::CString::new(interface).map_err(|_| crate::ServiceError::InvalidRequest)?;
+    let has_owned_link = || match unsafe { libc::if_nametoindex(name.as_ptr()) } {
+        0 => Ok(false),
+        index if index == expected_index => Ok(true),
+        _ => Err(crate::ServiceError::Backend(
+            "slot_interface_identity_changed".into(),
+        )),
+    };
+
+    has_owned_link()?;
     let path = super::userspace_socket_path(interface);
     unlink_socket_identity(&path, 0, identity)
         .map_err(|_| crate::ServiceError::Backend("slot_socket_cleanup_failed".into()))?;
-    let name =
-        std::ffi::CString::new(interface).map_err(|_| crate::ServiceError::InvalidRequest)?;
+
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    while unsafe { libc::if_nametoindex(name.as_ptr()) } != 0 {
+    while has_owned_link()? {
         if std::time::Instant::now() >= deadline {
             return Err(crate::ServiceError::Backend(
                 "slot_interface_cleanup_pending".into(),

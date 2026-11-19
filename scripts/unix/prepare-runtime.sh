@@ -54,6 +54,9 @@ tar -xf "$WORK/amneziawg-go.tar" -C "$AMNEZIA_SOURCE"
 (
   cd "$AMNEZIA_SOURCE"
   git apply "$ROOT/patches/amneziawg-go-first-packet-padding.patch"
+  if [ "$PLATFORM" = "linux" ]; then
+    git apply "$ROOT/patches/amneziawg-go-daemon-fds.patch"
+  fi
   export GOWORK=off
   go test ./device
   go build -trimpath \

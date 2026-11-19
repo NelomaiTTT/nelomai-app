@@ -379,7 +379,11 @@ impl OrdinaryLinkStore {
                 }
                 if live != (false, false) {
                     record.present()?;
-                    remove_userspace_member(&record.identity.interface, socket)?;
+                    remove_userspace_member(
+                        &record.identity.interface,
+                        record.identity.index,
+                        socket,
+                    )?;
                 }
             }
             _ => (),

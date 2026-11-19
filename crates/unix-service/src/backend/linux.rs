@@ -396,7 +396,7 @@ impl LinuxBackend {
         if let Some(owner) = &mut self.member_owner {
             let boot = boot_identity()?;
             owner
-                .stop_owned(&boot, inspect_member, remove_member)
+                .stop_owned(&boot, inspect_member_for_stop, remove_member)
                 .map_err(backend_error)?;
             self.active_transport = None;
             self.rebind_peers.clear();
@@ -642,15 +642,48 @@ fn verify_member(saved: &LinuxIdentity) -> std::io::Result<()> {
     Ok(())
 }
 
+fn inspect_member_for_stop(saved: &LinuxIdentity) -> std::io::Result<Option<LinuxIdentity>> {
+    use std::io::{Error, ErrorKind};
+
+    let NativeProof::Userspace(expected) = saved.proof else {
+        return inspect_member(saved);
+    };
+    if boot_identity().map_err(Error::other)? != saved.boot {
+        return Err(Error::other("slot_boot_changed"));
+    }
+    let index = kernel_interface_index(&saved.interface).map_err(Error::other)?;
+    if index != 0 && index != saved.index {
+        return Err(Error::other("slot_interface_identity_changed"));
+    }
+    let path = userspace_socket_path(&saved.interface);
+    let has_socket = match super::redundancy::socket_identity(&path, 0) {
+        Ok(socket) if socket == expected => true,
+        Ok(_) => return Err(Error::other("slot_interface_identity_changed")),
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    let current_index = kernel_interface_index(&saved.interface).map_err(Error::other)?;
+    if current_index != 0 && current_index != index {
+        return Err(Error::other("slot_interface_identity_changed"));
+    }
+    // A crash can leave the socket behind. Graceful exit closes UAPI first.
+    // Keep the cleanup obligation until both resources are gone.
+    Ok((current_index != 0 || has_socket).then(|| saved.clone()))
+}
+
 fn remove_member(saved: &LinuxIdentity) -> std::io::Result<()> {
-    verify_member(saved)?;
+    match inspect_member_for_stop(saved)? {
+        None => return Ok(()),
+        Some(actual) if actual == *saved => (),
+        Some(_) => return Err(std::io::Error::other("slot_interface_identity_changed")),
+    }
     match saved.proof {
         NativeProof::Kernel { .. } => super::redundancy::remove_kernel_member(
             &mut Some(saved.index),
             &mut NativeKernelMember { identity: saved },
         ),
         NativeProof::Userspace(socket) => {
-            super::redundancy::remove_userspace_member(&saved.interface, socket)
+            super::redundancy::remove_userspace_member(&saved.interface, saved.index, socket)
         }
     }
     .map_err(std::io::Error::other)
