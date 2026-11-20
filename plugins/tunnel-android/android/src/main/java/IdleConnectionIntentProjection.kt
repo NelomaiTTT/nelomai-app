@@ -50,7 +50,8 @@ internal class IdleConnectionIntentProjection(
 
     fun publish(envelope: AndroidRecoveryEnvelope) {
         val intent = envelope.intent
-        if (intent.desiredActive || envelope.leaseTransaction != null || envelope.redundantTransaction != null ||
+        if (intent.desiredActive || envelope.pendingQuickStart != null ||
+            envelope.leaseTransaction != null || envelope.redundantTransaction != null ||
             intent.retry != AndroidRetryState() || intent.bootCount != boot()) {
             invalidate()
             return

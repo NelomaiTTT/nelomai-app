@@ -77,6 +77,28 @@ class BackgroundQuickV2Test {
     }
 
     @Test
+    fun appliedReplayReturnsBothIssuedConfigsWithoutContactingCandidates() {
+        val selected = template(true)
+        val pending = pending(selected)
+        val transport = RecordingBackgroundTransport(payload())
+        val credential = BackgroundCredential(selected.deviceId, "https://panel.invalid", "synthetic", 1_900_000_000)
+        val result = BackgroundOperationClient(transport).startExact(credential, selected, pending,
+            alreadyIssued = true, probeCache = BackgroundCandidateProbeCache(),
+            networkIdentity = { error("unexpected candidate selection") })
+
+        assertEquals(listOf("background/connections/start"), transport.endpoints)
+        val request = requireNotNull(transport.payloads.single())
+        assertEquals(pending.startOperationId, request.getString("operation_id"))
+        assertEquals(pending.replay.requestFingerprint, request.getString("request_fingerprint"))
+        assertTrue(request.getBoolean("require_measured_selection"))
+        assertEquals(0, request.getJSONArray("probes").length())
+        assertEquals(SESSION, result.redundantTransaction?.sessionId)
+        val configs = requireNotNull(result.redundantTransport).configurations
+        assertEquals("primary-secret", String(configs.getValue(PRIMARY)))
+        assertEquals("standby-secret", String(configs.getValue(STANDBY)))
+    }
+
+    @Test
     fun firstResponseKeepsConfigurationsInMemoryForImmediateStart() {
         val template = template(true).copy(quickPlanRevision = "local-plan-1")
         val result = backgroundExactStartResult(payload(), template, pending(template))

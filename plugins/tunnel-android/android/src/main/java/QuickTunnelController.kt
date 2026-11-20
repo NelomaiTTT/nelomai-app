@@ -37,9 +37,12 @@ internal object QuickDesiredActiveProjection {
 }
 
 internal fun quickDesiredActiveSnapshot(
-    store: AndroidRecoveryStore,
-): RecoveryStoreResult<Boolean> = when (val result = QuickDesiredActiveProjection.read(store)) {
-    is RecoveryStoreResult.Success -> RecoveryStoreResult.Success(result.value.desiredActive)
+    result: RecoveryStoreResult<AndroidRecoveryEnvelope>,
+    includePendingStart: Boolean = false,
+): RecoveryStoreResult<Boolean> = when (result) {
+    is RecoveryStoreResult.Success -> RecoveryStoreResult.Success(
+        result.value.intent.desiredActive || (includePendingStart && result.value.pendingQuickStart != null),
+    )
     is RecoveryStoreResult.Failure -> result
 }
 
@@ -50,6 +53,7 @@ object QuickTunnelController {
     private const val STATE_CHANGED = "changed"
     private const val STATE_CHANGE_REVISION = "change-revision"
     private const val STATE_VALUE = "state"
+    private const val REJECTED_TILE_TAP = "rejected-tile-tap"
     private const val STATE_UPDATED_AT_MILLIS = "state-updated-at-millis"
     private const val DESIRED_ACTIVE = "desired-active"
     private const val RECOVERY_PROJECTION_MIGRATED = "recovery-projection-migrated"
@@ -65,16 +69,59 @@ object QuickTunnelController {
         val persistedState = SessionState.values().firstOrNull {
             it.wireName == preferences.getString(STATE_VALUE, SessionState.STOPPED.wireName)
         } ?: SessionState.STOPPED
+        val updatedAt = preferences.getLong(STATE_UPDATED_AT_MILLIS, 0)
+        val stoppedByAndroid = isPausedByAndroid(context, persistedState, updatedAt)
         val resolvedState = resolveState(
             runtimeState,
             persistedState,
-            preferences.getLong(STATE_UPDATED_AT_MILLIS, 0),
+            updatedAt,
             System.currentTimeMillis(),
+            stoppedByAndroid,
         )
-        if (resolvedState != persistedState) {
+        // A system Stop pauses the tile projection. Keep the saved state and
+        // resume plan until an explicit Start publishes a fresh state.
+        if (resolvedState != persistedState && !stoppedByAndroid) {
             updateState(context, resolvedState)
         }
         return resolvedState.wireName
+    }
+
+    internal fun isPausedByAndroid(context: Context): Boolean =
+        stateInterruptedByAndroid(context) != null
+
+    internal fun stateInterruptedByAndroid(context: Context): SessionState? {
+        val preferences = preferences(context)
+        val storedState = SessionState.values().firstOrNull {
+            it.wireName == preferences.getString(STATE_VALUE, null)
+        } ?: SessionState.STOPPED
+        val updatedAt = preferences.getLong(STATE_UPDATED_AT_MILLIS, 0)
+        return storedState.takeIf { isPausedByAndroid(context, it, updatedAt) }
+    }
+
+    private fun isPausedByAndroid(context: Context, state: SessionState, updatedAt: Long): Boolean {
+        if (TunnelRuntime.state() != SessionState.STOPPED) return false
+        val lastStop = VpnTaskRemovalLiveness.lastSystemStopMillis(context) ?: return false
+        val envelope = when (val record = AndroidRecoveryStores.open(context).read()) {
+            is RecoveryStoreResult.Success -> record.value
+            is RecoveryStoreResult.Failure -> throw TunnelOperationException(record.code)
+        }
+        return interruptedAt(state, updatedAt, envelope, lastStop)
+    }
+
+    internal fun isPausedByAndroid(context: Context, envelope: AndroidRecoveryEnvelope, lastStop: Long): Boolean {
+        if (TunnelRuntime.state() != SessionState.STOPPED) return false
+        val prefs = preferences(context)
+        val state = SessionState.values().firstOrNull { it.wireName == prefs.getString(STATE_VALUE, null) } ?: SessionState.STOPPED
+        return interruptedAt(state, prefs.getLong(STATE_UPDATED_AT_MILLIS, 0), envelope, lastStop)
+    }
+
+    private fun interruptedAt(state: SessionState, updatedAt: Long, envelope: AndroidRecoveryEnvelope, lastStop: Long): Boolean {
+        if (envelope.intent.desiredActive) {
+            // Older records have only the projected timestamp. If both timestamps
+            // are missing, an explicit Android Stop takes precedence over restoration.
+            return lastStop >= (envelope.armedAtMillis ?: updatedAt)
+        }
+        return state != SessionState.STOPPED && updatedAt > 0 && lastStop >= updatedAt
     }
 
     @JvmStatic
@@ -169,9 +216,12 @@ object QuickTunnelController {
     internal fun desiredActive(context: Context): Boolean =
         desiredActiveSnapshot(context) ?: false
 
-    internal fun desiredActiveSnapshot(context: Context): Boolean? {
-        if (!migrateLegacyDesiredActive(context)) return null
-        return when (val result = quickDesiredActiveSnapshot(AndroidRecoveryStores.open(context))) {
+    internal fun readRecovery(context: Context): RecoveryStoreResult<AndroidRecoveryEnvelope> =
+        if (migrateLegacyDesiredActive(context)) AndroidRecoveryStores.open(context).read()
+        else RecoveryStoreResult.Failure("quick_state_migration_failed")
+
+    internal fun desiredActiveSnapshot(context: Context, includePendingStart: Boolean = false): Boolean? {
+        return when (val result = quickDesiredActiveSnapshot(readRecovery(context), includePendingStart)) {
             is RecoveryStoreResult.Success -> result.value
             is RecoveryStoreResult.Failure -> {
                 TunnelLog.warning("quick_state.recovery_read_failed", result.code)
@@ -255,8 +305,10 @@ object QuickTunnelController {
         persistedState: SessionState,
         updatedAtMillis: Long,
         nowMillis: Long,
+        stoppedByAndroid: Boolean = false,
     ): SessionState {
         if (runtimeState != SessionState.STOPPED) return runtimeState
+        if (stoppedByAndroid) return SessionState.STOPPED
         if (persistedState !in setOf(SessionState.STARTING, SessionState.STOPPING)) {
             return persistedState
         }
@@ -271,6 +323,14 @@ object QuickTunnelController {
             persistedState
         }
     }
+
+    // The normal disposition is removal from the encrypted journal. If that
+    // write fails, retain the exact rejected tap across a service/process restart.
+    internal fun rememberRejectedTap(context: Context, request: AndroidPendingQuickStart): Boolean =
+        preferences(context).edit().putString(REJECTED_TILE_TAP, "${request.requestedAtMillis}:${request.runtime}").commit()
+
+    internal fun wasRejectedTap(context: Context, request: AndroidPendingQuickStart): Boolean =
+        preferences(context).getString(REJECTED_TILE_TAP, null) == "${request.requestedAtMillis}:${request.runtime}"
 
     private fun preferences(context: Context) =
         context.applicationContext.getSharedPreferences(AndroidRuntimeNamespace.record(STATE_PREFERENCES), Context.MODE_PRIVATE)

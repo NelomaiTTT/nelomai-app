@@ -29,6 +29,7 @@ class LatestRuntimeActivity : TauriActivity() {
   override fun onWebViewCreate(webView: android.webkit.WebView) {
     super.onWebViewCreate(webView)
     ru.nelomai.runtime.v1.SupportDiagnosticsEntry.install(this, webView)
+    webView.addJavascriptInterface(VpnNotificationSettings(this, webView), "NelomaiVpnNotificationSettings")
     startupWebView = webView
     if (runtimeResumed) wakeStartup()
   }

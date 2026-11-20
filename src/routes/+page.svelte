@@ -94,6 +94,7 @@
     updateStatusNeedsPolling,
   } from "$lib/update-diagnostics";
 
+  let vpnNotificationSettings = $state<{ open(): void } | null>(null);
   let view = $state<AppView>("loading");
   let phase = $state<Phase>("signed_out");
   let runtimeStateUnavailable = false;
@@ -239,6 +240,10 @@
   };
 
   onMount(() => {
+    const bridge = (window as Window & {
+      NelomaiVpnNotificationSettings?: { open(): void };
+    }).NelomaiVpnNotificationSettings;
+    if (typeof bridge?.open === "function") vpnNotificationSettings = bridge;
     updateUiVisible=document.visibilityState === "visible";
     let disposed = false;
     void nativeClient.recordStartupStage("frontend_mounted");
@@ -2087,6 +2092,12 @@
               onselect={selectRuntime}
               onrestart={restartRuntime}
             />
+          {/if}
+          {#if vpnNotificationSettings}
+            <button class="secondary-button" type="button" onclick={() => vpnNotificationSettings?.open()}>
+              Уведомление VPN
+            </button>
+            <small>В настройках Android можно скрыть уведомление из шторки.</small>
           {/if}
           {#if appPreferences?.closeToTraySupported}
             <label class="update-preference">

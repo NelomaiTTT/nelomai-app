@@ -57,11 +57,11 @@ class QuickTunnelControllerTest {
         val backend = QuickFakeEncryptedRecordBackend()
         val store = AndroidRecoveryStore(backend, BootIdentityProvider { 9 })
 
-        val stopped = quickDesiredActiveSnapshot(store)
+        val stopped = quickDesiredActiveSnapshot(store.read())
         assertTrue(stopped is RecoveryStoreResult.Success)
         assertFalse((stopped as RecoveryStoreResult.Success).value)
         backend.failReads = true
-        assertTrue(quickDesiredActiveSnapshot(store) is RecoveryStoreResult.Failure)
+        assertTrue(quickDesiredActiveSnapshot(store.read()) is RecoveryStoreResult.Failure)
     }
 
     @Test

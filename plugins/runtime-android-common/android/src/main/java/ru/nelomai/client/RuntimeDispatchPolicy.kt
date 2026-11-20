@@ -39,6 +39,11 @@ object RuntimeDispatchPolicy {
     fun mayToggle(active: RuntimeSelectionV1, durableDesiredActive: Boolean): Boolean =
         valid(active) && (durableDesiredActive || mayStart(active))
 
+    fun sameTileOwner(expected: RuntimeSelectionV1, active: RuntimeSelectionV1): Boolean =
+        expected.containerVersion == active.containerVersion && expected.sessionGeneration == active.sessionGeneration &&
+            (mayRetainVpnOwner(expected, active) || (mayStop(expected, active) &&
+                expected.vpnAuthorization?.scope == active.vpnAuthorization?.scope))
+
     fun mayStop(loaded: RuntimeSelectionV1, active: RuntimeSelectionV1): Boolean =
         valid(active) && loaded.slot == active.slot && loaded.runtimeVersion == active.runtimeVersion &&
             loaded.incarnation == active.incarnation
@@ -72,6 +77,11 @@ object RuntimeDispatchPolicy {
         return if (scope != null) scope == currentScope
         else admitted.incarnation == active.incarnation
     }
+
+    /** A durable latest request can survive broker death only with proof of the same account/session. */
+    fun mayRecoverLatestVpn(expected: RuntimeSelectionV1, active: RuntimeSelectionV1): Boolean =
+        mayStartVpn(expected) && mayStartVpn(active) && expected.vpnAuthorization?.scope != null &&
+            vpnLogoutEpoch(expected) == null && vpnLogoutEpoch(active) == null && mayRetainVpnOwner(expected, active)
 
     fun vpnLogoutEpoch(active: RuntimeSelectionV1): Long? = active.vpnAuthorization?.logoutEpoch
 

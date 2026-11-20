@@ -695,6 +695,34 @@ internal class BackgroundOperationClient(
         }
     }
 
+    fun startExact(
+        credential: BackgroundCredential,
+        template: AndroidIntentTemplate,
+        transaction: AndroidLeaseTransaction,
+        alreadyIssued: Boolean,
+        probeCache: BackgroundCandidateProbeCache,
+        networkIdentity: () -> String,
+    ): BackgroundStartResult {
+        val measured = requiresMeasuredCandidateSelection(
+            template.layer,
+            template.ticConnectionMode,
+            template.allowAlternate,
+        )
+        val probes = if (measured && !alreadyIssued) {
+            probeCache.measure(
+                template.layer,
+                template.egressMode,
+                networkIdentity(),
+                serverCandidates(credential, template.layer, template.egressMode),
+            )
+        } else {
+            emptyList()
+        }
+        val request = backgroundExactStartPayload(template, transaction, probes)
+        val payload = transport.execute(credential, "POST", "background/connections/start", request)
+        return backgroundExactStartResult(payload, template, transaction)
+    }
+
     fun serverCandidates(
         credential: BackgroundCredential,
         layer: String,
@@ -1236,35 +1264,6 @@ internal object BackgroundConnectionClient {
             throw BackgroundConnectionException("invalid_background_configuration")
         }
         return BackgroundStartResult(configuration, connection, options)
-    }
-
-    fun startExact(
-        credential: BackgroundCredential,
-        template: AndroidIntentTemplate,
-        transaction: AndroidLeaseTransaction,
-        probeCache: BackgroundCandidateProbeCache,
-        networkIdentity: String,
-        cancellation: CompletableFuture<Unit>,
-    ): BackgroundStartResult {
-        val startTransport = BackgroundHttpApiTransport(cancellation)
-        val measured = requiresMeasuredCandidateSelection(
-            template.layer,
-            template.ticConnectionMode,
-            template.allowAlternate,
-        )
-        val probes = if (measured) {
-            probeCache.measure(
-                template.layer,
-                template.egressMode,
-                networkIdentity,
-                BackgroundOperationClient(startTransport).serverCandidates(credential, template.layer, template.egressMode),
-            )
-        } else {
-            emptyList()
-        }
-        val request = backgroundExactStartPayload(template, transaction, probes)
-        val payload = startTransport.execute(credential, "POST", "background/connections/start", request)
-        return backgroundExactStartResult(payload, template, transaction)
     }
 
     fun stop(

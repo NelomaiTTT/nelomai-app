@@ -26,6 +26,69 @@ import org.robolectric.util.ReflectionHelpers
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34], manifest = Config.NONE)
 class RuntimeSelectionBindingTest {
+    @Test fun transientObserverFailureRetriesOnTheSameBroker() =
+        verifyObserverRecovery(android.os.TransactionTooLargeException())
+
+    @Test fun failedObserverTransactionOnALiveBrokerPreservesSelection() =
+        verifyObserverRecovery(DeadObjectException())
+
+    private fun verifyObserverRecovery(firstFailure: android.os.RemoteException) {
+        lateinit var connection: ServiceConnection
+        val context = object : ContextWrapper(RuntimeEnvironment.getApplication()) {
+            override fun bindService(intent: Intent, callback: ServiceConnection, flags: Int): Boolean {
+                connection = callback
+                return true
+            }
+            override fun unbindService(connection: ServiceConnection) = Unit
+        }
+        val selected = RuntimeSelectionV1("latest", "0.3.15", "0.3.15", 1, null, "broker")
+        val token = Binder()
+        var attempts = 0
+        var observed: android.os.IBinder? = null
+        val broker = object : Binder() {
+            override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+                data.enforceInterface(RuntimeOwnerProtocol.DESCRIPTOR)
+                requireNotNull(reply)
+                when (code) {
+                    RuntimeOwnerProtocol.WATCH_VPN_PROCESS -> {
+                        if (++attempts == 1) throw firstFailure
+                        observed = data.readStrongBinder()
+                        reply.writeNoException()
+                    }
+                    RuntimeOwnerProtocol.SELECTION -> {
+                        reply.writeNoException()
+                        reply.writeString(RuntimeSelectionStore.encode(selected))
+                    }
+                    else -> return false
+                }
+                return true
+            }
+        }
+        RuntimeSelectionStore(context, token).use { store ->
+            val values = mutableListOf<Result<RuntimeSelectionV1>>()
+            repeat(3) { i ->
+                store.read { values += it }
+                if (i == 0) connection.onServiceConnected(ComponentName(context, "broker"), broker)
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+                while (values.size <= i && System.nanoTime() < deadline) {
+                    shadowOf(Looper.getMainLooper()).idle()
+                    Thread.yield()
+                }
+                assertEquals("selection must complete on this Binder", i + 1, values.size)
+                assertEquals(selected, values[i].getOrThrow())
+            }
+            assertSame(token, observed)
+            assertEquals("retry until registered, then stop", 2, attempts)
+        }
+    }
+
+    @Test fun existingKotlinCallersCanOpenTheStoreWithDefaultBindingOptions() {
+        val ctor = RuntimeSelectionStore::class.java.getConstructor(Context::class.java,
+            Boolean::class.javaPrimitiveType, Boolean::class.javaPrimitiveType, Int::class.javaPrimitiveType,
+            Class.forName("kotlin.jvm.internal.DefaultConstructorMarker"))
+        (ctor.newInstance(RuntimeEnvironment.getApplication(), false, false, 6, null) as RuntimeSelectionStore).close()
+    }
+
     @Test fun stalledVpnReadTimesOutWithoutBlockingMainOrAcceptingLateSelection() {
         lateinit var connection: ServiceConnection
         val context = object : ContextWrapper(RuntimeEnvironment.getApplication()) {
@@ -113,6 +176,113 @@ class RuntimeSelectionBindingTest {
             assertNull(result)
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
             assertEquals("runtime_owner_unavailable", result?.exceptionOrNull()?.message)
+        }
+    }
+
+    @Test fun cachedUiReadRecoversFromOneFailureWithoutAnAndroidDisconnect() = checkUiSelectionReconnect(false)
+    @Test fun observerRecoversWhenTheIdleReplacementFailsItsFirstSelection() = checkUiSelectionReconnect(true)
+
+    private fun checkUiSelectionReconnect(observerOnly: Boolean) {
+        val connections = mutableListOf<ServiceConnection>()
+        val context = object : ContextWrapper(RuntimeEnvironment.getApplication()) {
+            override fun bindService(intent: Intent, connection: ServiceConnection, flags: Int): Boolean {
+                connections += connection
+                return true
+            }
+            override fun unbindService(connection: ServiceConnection) = Unit
+        }
+        val selected = RuntimeSelectionV1("latest", "0.3.15", "0.3.15", 7, null, "broker")
+        var failOnce = false
+        val owner = object : Binder() {
+            override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+                if (failOnce) {
+                    failOnce = false
+                    throw DeadObjectException()
+                }
+                requireNotNull(reply).writeNoException()
+                reply.writeString(RuntimeSelectionStore.encode(selected))
+                return true
+            }
+        }
+        val results = mutableListOf<RuntimeSelectionV1>()
+        val observed = mutableListOf<RuntimeSelectionV1>()
+        RuntimeSelectionStore(context).use { store ->
+            if (observerOnly) store.observeOwnerConnections { observed += it }
+            store.read { results += it.getOrThrow() }
+            val first = connections.single()
+            first.onServiceConnected(null, owner)
+            failOnce = true
+            if (observerOnly) {
+                first.onServiceDisconnected(null)
+                first.onServiceConnected(null, owner)
+            } else {
+                store.read { results += it.getOrThrow() }
+            }
+            assertFalse(failOnce)
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
+            assertEquals(2, connections.size)
+            first.onBindingDied(null)
+            connections.last().onServiceConnected(null, owner)
+            assertEquals(if (observerOnly) listOf(selected) else listOf(selected, selected), results)
+            assertEquals(if (observerOnly) listOf(selected, selected) else emptyList(), observed)
+        }
+    }
+
+    @Test fun vpnRetriesOneFailedSelectionOnALiveBroker() = verifyVpnSelectionRebind(recovered = true)
+
+    @Test fun repeatedSelectionFailureKeepsTheOriginalDeadline() = verifyVpnSelectionRebind(recovered = false)
+
+    private fun verifyVpnSelectionRebind(recovered: Boolean) {
+        val connections = mutableListOf<ServiceConnection>()
+        val context = object : ContextWrapper(RuntimeEnvironment.getApplication()) {
+            override fun bindService(intent: Intent, connection: ServiceConnection, flags: Int): Boolean {
+                connections += connection
+                return true
+            }
+            override fun unbindService(connection: ServiceConnection) = Unit
+        }
+        val selected = RuntimeSelectionV1("latest", "0.3.15", "0.3.15", 7, null, "broker")
+        val reads = AtomicInteger()
+        val owner = object : Binder() {
+            override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+                if (reads.incrementAndGet() == 1 || !recovered) throw DeadObjectException()
+                requireNotNull(reply).writeNoException()
+                reply.writeString(RuntimeSelectionStore.encode(selected))
+                return true
+            }
+        }
+        val main = shadowOf(Looper.getMainLooper())
+        val results = mutableListOf<Result<RuntimeSelectionV1>>()
+        fun await(predicate: () -> Boolean) {
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+            while (!predicate() && System.nanoTime() < deadline) {
+                main.idle()
+                Thread.yield()
+            }
+            assertTrue(predicate())
+        }
+        RuntimeSelectionStore(context, readOffMain = true).use { store ->
+            store.read { results += it }
+            val first = connections.single()
+            main.idleFor(Duration.ofSeconds(8))
+            first.onServiceConnected(null, owner)
+            await { reads.get() == 1 && !ReflectionHelpers.getField<Boolean>(store, "reading") }
+            main.idleFor(Duration.ofSeconds(1))
+            assertEquals(2, connections.size)
+            val second = connections.last()
+            assertNotSame(first, second)
+            second.onServiceConnected(null, owner)
+            first.onBindingDied(null)
+            await { reads.get() == 2 && !ReflectionHelpers.getField<Boolean>(store, "reading") }
+            if (recovered) {
+                assertEquals(selected, results.single().getOrThrow())
+            } else {
+                assertTrue(results.isEmpty())
+            }
+            main.idleFor(Duration.ofSeconds(1))
+            if (!recovered) assertEquals("runtime_owner_unavailable", results.single().exceptionOrNull()?.message)
+            assertEquals(2, connections.size)
+            assertEquals(1, results.size)
         }
     }
 

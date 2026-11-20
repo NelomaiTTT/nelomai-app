@@ -15,6 +15,52 @@ import java.util.concurrent.atomic.AtomicInteger
 
 class BackgroundConnectionClientTest {
     @Test
+    fun issuedConfigurationReplaySkipsCandidateLookupAndKeepsTheRequestIdentity() {
+        val template = AndroidIntentTemplate(DEVICE_ID, "account", "stray", "dynamic", "standalone", "ipv4", true)
+        val transaction = AndroidLeaseTransaction(1, 1, LeasePhase.START_PENDING, null, null,
+            AndroidStartReplay(OPERATION_ID, 1, FINGERPRINT))
+        val issued = JSONObject().put("configuration", "issued-config").put("connection", JSONObject()
+            .put("lease_id", "issued-lease").put("layer", "stray").put("tic_connection_mode", "dynamic")
+            .put("route_mode", "standalone"))
+        val transport = RecordingBackgroundTransport(issued)
+        val response = BackgroundOperationClient(transport).startExact(credential(), template, transaction,
+            alreadyIssued = true, probeCache = BackgroundCandidateProbeCache(),
+            networkIdentity = { error("candidate selection in an issued operation") })
+
+        assertEquals("issued-config", String(response.configuration))
+        assertEquals(listOf("background/connections/start"), transport.endpoints)
+        val payload = requireNotNull(transport.payloads.single())
+        assertEquals(OPERATION_ID, payload.getString("operation_id"))
+        assertEquals(FINGERPRINT, payload.getString("request_fingerprint"))
+        assertTrue(payload.getBoolean("require_measured_selection"))
+        assertEquals(0, payload.getJSONArray("probes").length())
+    }
+
+    @Test
+    fun unissuedDynamicStartStillRequiresAReachableCandidate() {
+        val template = AndroidIntentTemplate(DEVICE_ID, "account", "stray", "dynamic", "standalone", "ipv4", true)
+        val transaction = AndroidLeaseTransaction(1, 1, LeasePhase.START_PENDING, null, null,
+            AndroidStartReplay(OPERATION_ID, 1, FINGERPRINT))
+        val candidate = JSONObject().put("candidate_id", "candidate-a").put("layer", "stray")
+            .put("region_label", "A").put("probe_url", "https://candidate.invalid/health")
+            .put("expires_at", "2030-01-01T00:00:00Z")
+        val transport = RecordingBackgroundTransport(JSONObject().put("candidates", JSONArray().put(candidate)))
+        val probeCalls = AtomicInteger()
+        val probes = BackgroundCandidateProbeCache(probe = { server, _ ->
+            probeCalls.incrementAndGet()
+            BackgroundProbeResult(server.candidateId, null, "timeout", "2026-11-20T00:00:00Z")
+        })
+
+        val failure = runCatching {
+            BackgroundOperationClient(transport).startExact(credential(), template, transaction,
+                alreadyIssued = false, probeCache = probes, networkIdentity = { "wifi" })
+        }.exceptionOrNull()
+        assertEquals("server_probes_unavailable", (failure as? BackgroundConnectionException)?.code)
+        assertEquals(1, probeCalls.get())
+        assertEquals(listOf("background/server-candidates?layer=stray&egress_mode=ipv4"), transport.endpoints)
+    }
+
+    @Test
     fun redundantRecoveryHealthProbesEnforceTheSharedWireContract() {
         fun probe() = JSONObject().apply {
             put("kind", "dns_a")
@@ -1820,7 +1866,7 @@ private fun CredentialStoreResult<BackgroundCredentialEnvelope>.successProvision
     return (this as CredentialStoreResult.Success).value
 }
 
-private class RecordingBackgroundTransport(
+internal class RecordingBackgroundTransport(
     vararg responses: JSONObject,
 ) : BackgroundApiTransport {
     private val queued = ArrayDeque(responses.toList())

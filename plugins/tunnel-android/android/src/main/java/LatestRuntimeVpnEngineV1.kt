@@ -25,10 +25,13 @@ internal fun requiresVpnStartAdmission(context: android.content.Context, intent:
         // A stopped durable intent may still own lease/logout cleanup. Such
         // recovery must remain available before VPN permission is granted.
         NelomaiVpnService.ACTION_ENSURE_RUNNING ->
+            QuickTunnelController.desiredActiveSnapshot(context, includePendingStart = true) != false
+        NelomaiVpnService.ACTION_TASK_REMOVAL_LIVENESS ->
             QuickTunnelController.desiredActiveSnapshot(context) != false
         NelomaiVpnService.ACTION_QUICK_TOGGLE ->
             !intent.getBooleanExtra(ru.nelomai.runtime.v1.RuntimeServiceIntents.EXTRA_QUICK_STOP_ONLY, false) &&
-                !QuickTunnelController.desiredActive(context)
+                (intent.getBooleanExtra(NelomaiVpnService.EXTRA_START_AFTER_INTERRUPTED_STOP, false) ||
+                    !QuickTunnelController.desiredActive(context))
         NelomaiVpnService.ACTION_CANCEL_CLIENT_START, NelomaiVpnService.ACTION_CLIENT_STOP,
         NelomaiVpnService.ACTION_CANCEL_OWNED_REDUNDANT_POLICY,
         NelomaiVpnService.ACTION_CLIENT_STATUS, NelomaiVpnService.ACTION_CLIENT_METRICS,
@@ -42,8 +45,11 @@ internal fun requiresVpnStartAdmission(context: android.content.Context, intent:
         else -> true
     }
 
-class LatestRuntimeQuickActionsV1 : ru.nelomai.runtime.v1.RuntimeQuickActionsV1 {
-    override fun desiredActive(context: android.content.Context): Boolean = QuickTunnelController.desiredActive(context)
+class LatestRuntimeQuickActionsV1 : ru.nelomai.runtime.v1.RuntimeQuickActionsV1, ru.nelomai.runtime.v1.RuntimeQuickStartV1 {
+    override fun prepareStart(context: android.content.Context, owner: String): Runnable? =
+        NelomaiVpnService.prepareTileStart(context, owner)
+    override fun desiredActive(context: android.content.Context): Boolean =
+        QuickTunnelController.desiredActive(context) && !QuickTunnelController.isPausedByAndroid(context)
     override fun state(context: android.content.Context): String = QuickTunnelController.state(context)
     override fun toggle(context: android.content.Context): Boolean = QuickTunnelController.requestToggle(context)
 }

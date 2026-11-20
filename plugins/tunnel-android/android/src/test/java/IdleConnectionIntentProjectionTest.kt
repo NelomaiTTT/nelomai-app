@@ -4,6 +4,19 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class IdleConnectionIntentProjectionTest {
+    @Test fun acceptedTileStartWaitingForHistoryIsCancellableFromTheApp() {
+        val idle = AndroidRecoveryEnvelope.empty(7)
+        val queued = idle.copy(pendingQuickStart = AndroidPendingQuickStart(100, "scoped-owner"))
+        val projection = IdleConnectionIntentProjection(Memory()) { 7 }
+        projection.publish(idle)
+        assertNotNull(projection.read())
+        projection.publish(queued)
+        assertNull(projection.read())
+        assertEquals("recovering", connectionIntentServiceStatus(queued).status)
+        projection.publish(idle)
+        assertEquals("none", projection.read()?.status)
+    }
+
     private class Memory : EncryptedRecordBackend {
         var bytes: ByteArray? = null
         var failWrite = false
