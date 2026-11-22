@@ -355,8 +355,15 @@ def package_android(staged, output, public_key, readelf, apkanalyzer, common_hos
     if stable is not None:
         stable_aar = runtime / "engines/stable" / stable["manifest"]["runtime_version"] / "runtime/runtime.aar"
         arguments.append("-PnelomaiStableRuntimeAar=" + str(stable_aar))
-    subprocess.run([str(gradle), ":app:assembleArm64" + variant, "--no-daemon", *( ["--offline"] if offline else []), *arguments,
-        "-PnelomaiRuntimeInputs=" + str(inputs), "-x", ":app:rustBuildArm64" + variant],
+    tasks = [":app:assembleArm64" + variant]
+    skipped_rust = ["-x", ":app:rustBuildArm64" + variant]
+    if variant == "Release" and stable is not None and stable["manifest"]["runtime_version"] == gates.STABLE_VERSION:
+        # Exercise the real stable tile producer once the verified AAR is on the classpath.
+        tasks[:0] = [":app:testArm64DebugUnitTest", "--tests",
+                     "ru.nelomai.client.QuickTileLoggingTest.pinnedStableStateChangesReachTheOpenShadeWithoutAnotherListeningCallback"]
+        skipped_rust += ["-x", ":app:rustBuildArm64Debug"]
+    subprocess.run([str(gradle), *tasks, "--no-daemon", *(["--offline"] if offline else []), *arguments,
+        "-PnelomaiRuntimeInputs=" + str(inputs), *skipped_rust],
         cwd=android, env=environment, check=True)
     package = output / f"nelomai-acceptance-{manifest['container_version']}-android-aarch64.apk"
     # Candidate release packaging is keyless. apksigner consumes this exact

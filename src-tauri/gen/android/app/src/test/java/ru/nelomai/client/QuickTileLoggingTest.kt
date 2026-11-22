@@ -11,6 +11,7 @@ import android.service.quicksettings.TileService
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -459,6 +460,8 @@ class QuickTileLoggingTest {
     }
 
     @Test fun pinnedStableStateChangesReachTheOpenShadeWithoutAnotherListeningCallback() {
+        assumeTrue("Requires the linked stable runtime AAR",
+            java.lang.Boolean.getBoolean("nelomai.test.hasStableRuntimeAar"))
         val stable = selection.copy(slot = "stable", runtimeVersion = "0.2.21")
         TileSelectionShadow.result = Result.success(stable)
         val controller = Robolectric.buildService(NelomaiQuickTileService::class.java).create()

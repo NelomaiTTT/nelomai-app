@@ -127,6 +127,9 @@ android {
         buildConfig = true
     }
     testOptions.unitTests.isIncludeAndroidResources = true
+    testOptions.unitTests.all {
+        it.systemProperty("nelomai.test.hasStableRuntimeAar", stableRuntimeAar != null)
+    }
     sourceSets.getByName("test") {
         java.srcDir("../../../../scripts/android/test-fixtures")
         resources.srcDir("../../../../crates/client-api/src/panel_dns_testdata")
