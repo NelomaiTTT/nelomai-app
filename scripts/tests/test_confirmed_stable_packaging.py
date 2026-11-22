@@ -19,7 +19,7 @@ class ConfirmedStablePackagingTest(ArtifactFixture):
         _, stable, digest = self.inputs()
         downloader = module("download-confirmed-stable")
         real_run = subprocess.run
-        archive_run_id = "42123287698"
+        archive_run_id = downloader.STABLE_ARCHIVE_RUN_ID
         archive_source = "b" * 40
         fail_download = False
         run = dict(id=int(archive_run_id), head_sha=archive_source,
