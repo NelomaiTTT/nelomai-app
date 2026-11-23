@@ -424,10 +424,22 @@ impl PrivateOwnerCommands for HostCommands {
                 if Instant::now() >= recovery_deadline {
                     return Err(PrivateError::RecoveryRequired);
                 }
-                timeout_at(
-                    recovery_deadline,
-                    self.coordinator.recover_refresh_before_start(),
-                )
+                timeout_at(recovery_deadline, async {
+                    #[cfg(target_os = "android")]
+                    if self.coordinator.startup_transition_pending()? {
+                        broker
+                            .recover_interrupted_native_auth(
+                                bridge.native.background.as_ref(),
+                                recovery_deadline,
+                            )
+                            .await
+                            .map_err(crate::SwitchError::from)
+                    } else {
+                        Ok(())
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    self.coordinator.recover_refresh_before_start().await
+                })
                 .await
                 .map_err(|_| PrivateError::RefreshPending)?
                 .map_err(|error| match error {

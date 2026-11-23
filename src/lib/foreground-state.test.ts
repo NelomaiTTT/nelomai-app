@@ -73,7 +73,7 @@ function fixture() {
   const context = {
     busy: false, bootstrapPending: false, restoringLogout: false, runtimeStateSync: initialRuntimeStateSync(), bootstrap: { binding: {} },
     phase: "ready", connection: null, runtimeWarning: "tunnel_runtime_stopped" as string | null,
-    runtimeChannelClosed: false, runtimeSelectionBusy: false, runtimeStateUnavailable: false,
+    runtimeChannelClosed: false, runtimeSelectionBusy: false, runtimeStateUnavailable: false, startupConnection: false,
     startupRetry: { cancel: () => {}, checkpoint: () => () => true },
     splitTunnelOpen: false, splitTunnelState: null,
     splitTunnelBusy: false, splitTunnelLoaded: false, splitTunnelApplications: [],

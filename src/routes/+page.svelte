@@ -155,6 +155,12 @@
   let restoringLogout = false;
   let bootstrapPending = $state(false);
   let refreshPending = $state(false);
+  // Keep the logical startup view for retry and sign-out handling. The
+  // connection panel is presentation only until the native bootstrap settles.
+  const startupConnection = $derived(
+    !runtimeChannelClosed && isAndroidRuntime() &&
+      (view === "loading" || (view === "unavailable" && (startupPending || bootstrapPending))),
+  );
   const startupRetry = new StartupRetry();
   let runtimeStateSync = $state(initialRuntimeStateSync());
   let splitTunnelState = $state<SplitTunnelState | null>(null);
@@ -860,7 +866,7 @@
   }
 
   async function toggleConnection(forceStop = false) {
-    if (runtimeChannelClosed && !forceStop) return;
+    if (startupConnection || (runtimeChannelClosed && !forceStop)) return;
     if (localStopPendingCleanup && !forceStop) return;
     if (
       !forceStop &&
@@ -1581,9 +1587,10 @@
       <span>Nelomai</span>
     </a>
     <div class="header-actions">
-      <span class="status" data-phase={!runtimeChannelClosed && (startupPending || (bootstrapPending && view === "unavailable")) ? "preparing" : phase}>
+      <span class="status" data-phase={startupConnection || (!runtimeChannelClosed && (startupPending || (bootstrapPending && view === "unavailable"))) ? "preparing" : phase}>
         <span aria-hidden="true"></span>
-        {!runtimeChannelClosed && (startupPending || (bootstrapPending && view === "unavailable"))
+        {startupConnection ? "Проверяем сессию"
+          : !runtimeChannelClosed && (startupPending || (bootstrapPending && view === "unavailable"))
           ? (refreshPending ? "Восстановление соединения" : "Подготовка приложения")
           : localStopPendingCleanup ? "Туннель выключен" : phase === "connected" ? connectionPresentation.statusText : phaseLabels[phase]}
       </span>
@@ -1680,7 +1687,7 @@
   {/if}
 
   <section class="workspace" aria-live="polite">
-    {#if view === "loading"}
+    {#if view === "loading" && !startupConnection}
       <div class="center-state">
         <div class="loader" aria-hidden="true"></div>
         <h1>{startupSlow ? "Запуск занимает больше времени" : "Открываем приложение"}</h1>
@@ -1778,13 +1785,14 @@
           </div>
         {/if}
       </div>
-    {:else if view === "connection"}
+    {:else if view === "connection" || startupConnection}
       <div class="connection-layout">
         <section class="panel connection-panel">
           <div>
-            <p class="eyebrow">Подключение</p>
+            {#if !startupConnection}<p class="eyebrow">Подключение</p>{/if}
             <h1>
-              {localStopPendingCleanup
+              {startupConnection ? "Подключение"
+                : localStopPendingCleanup
                 ? "Туннель выключен"
                 : visibleConnectionIntent === "recovering"
                 ? "Восстанавливаем подключение"
@@ -1800,17 +1808,17 @@
             </h1>
           </div>
 
-          {#if bootstrap?.device.platform === "android" && dns46DotHostname(bootstrap.capabilities)}
+          {#if !startupConnection && bootstrap?.device.platform === "android" && dns46DotHostname(bootstrap.capabilities)}
             <p class="hint">Private DNS Nelomai: <strong>{dns46DotHostname(bootstrap.capabilities)}</strong>.
               В настройках Android откройте «Частный DNS», выберите имя хоста и укажите этот адрес.</p>
           {/if}
 
           <button
-            class:stop={connectionAction === "stop" && !localStopPendingCleanup}
+            class:stop={!startupConnection && connectionAction === "stop" && !localStopPendingCleanup}
             class="connect-button"
             type="button"
             onclick={() => toggleConnection()}
-            disabled={localStopPendingCleanup || !canBeginConnectionAction(
+            disabled={startupConnection || localStopPendingCleanup || !canBeginConnectionAction(
               connectionActionState,
               busy,
               connectionAction === "stop" || connectionActionState.startBusy,
@@ -1821,7 +1829,8 @@
               (connectionAction !== "stop" && runtimeStartBlocked(runtimeStatus))}
           >
             <span>
-              {localStopPendingCleanup ? "Выключен"
+              {startupConnection ? "Старт"
+                : localStopPendingCleanup ? "Выключен"
                 : connectionActionState.cancelBusy ||
                   (phase === "stopping" && connectionIntentStatus === "none")
                   ? "Выключаем"
@@ -1833,7 +1842,9 @@
                   : "Старт"}
             </span>
             <small>
-              {localStopPendingCleanup
+              {startupConnection
+                ? "Станет доступен после проверки"
+                : localStopPendingCleanup
                 ? "Завершаем очистку на сервере"
                 : busy
                 ? phaseLabels[phase]
@@ -1845,7 +1856,12 @@
             </small>
           </button>
 
-          {#if localStopPendingCleanup}
+          {#if startupConnection && startupPending && !bootstrapPending}
+            <button class="secondary-button" type="button" onclick={() => restore()} disabled={busy}>
+              Повторить
+            </button>
+          {/if}
+          {#if !startupConnection && localStopPendingCleanup}
             <p role="status">
               VPN на устройстве выключен. Очистка на сервере выполняется в фоне.
               {#if connectionIntentStatus === "recovering"}
@@ -1856,7 +1872,7 @@
             </p>
           {/if}
 
-          {#if connectionHasSecondaryStop || (localStopPendingCleanup && connectionIntentStatus === "recovering")}
+          {#if !startupConnection && (connectionHasSecondaryStop || (localStopPendingCleanup && connectionIntentStatus === "recovering"))}
             <button
               class="secondary-button blocked-stop-button"
               type="button"
@@ -1867,7 +1883,7 @@
             </button>
           {/if}
 
-          {#if connectionRecoveryCopy}
+          {#if !startupConnection && connectionRecoveryCopy}
             <p class:warning-message={visibleConnectionIntent === "blocked_terminal"}>
               {connectionRecoveryCopy}
               {#if visibleConnectionIntent === "recovering" && nextRetryAtUnix !== null}
@@ -1876,13 +1892,13 @@
             </p>
           {/if}
 
-          {#if phase === "connected" && reserveState !== null}
+          {#if !startupConnection && phase === "connected" && reserveState !== null}
             <p class="reserve-status" aria-live="polite">
               {connectionPresentation.statusText}
             </p>
           {/if}
 
-          {#if phase === "connected"}
+          {#if !startupConnection && phase === "connected"}
             <dl class="connection-metrics" aria-label="Показатели подключения">
               <div>
                 <dt>Трафик сессии</dt>
@@ -1910,13 +1926,13 @@
             </dl>
           {/if}
 
-          {#if error}<p class="error-message">{error}</p>{/if}
-          {#if runtimeWarning}
+          {#if !startupConnection && error}<p class="error-message">{error}</p>{/if}
+          {#if !startupConnection && runtimeWarning}
             <p class="warning-message">
               {splitTunnelWarningMessage(runtimeWarning)}
             </p>
           {/if}
-          {#if splitTunnelBlocksStart &&
+          {#if !startupConnection && splitTunnelBlocksStart &&
             phase !== "connecting" &&
             phase !== "connected" &&
             phase !== "stopping"}
@@ -1926,6 +1942,7 @@
           {/if}
         </section>
 
+        {#if !startupConnection}
         <aside class="panel settings-panel">
           <div>
             <p class="eyebrow">Маршрут</p>
@@ -2144,6 +2161,7 @@
             <p class="installed-version">Версия приложения {runtimeStatus.containerVersion}</p>
           {/if}
         </aside>
+        {/if}
       </div>
     {:else if view === "access_expired"}
       <div class="panel message-panel">

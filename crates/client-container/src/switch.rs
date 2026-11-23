@@ -984,6 +984,20 @@ impl SwitchCoordinator {
         Ok(completed_target.as_ref() != Some(&target))
     }
 
+    #[cfg(target_os = "android")]
+    pub(crate) fn startup_transition_pending(&self) -> Result<bool, SwitchError> {
+        let journal = self.snapshot()?;
+        Ok(journal
+            .as_ref()
+            .is_some_and(|journal| journal.phase != SwitchPhase::Complete)
+            || self.initial_transition_required(journal.as_ref())?
+            || matches!(
+                crate::update_start_recovery(self)?,
+                crate::UpdateStartRecovery::Installed { .. }
+                    | crate::UpdateStartRecovery::Cancel { .. }
+            ))
+    }
+
     /// Non-recovering admission check used only under the lifecycle writer
     /// gate. A request must acquire that gate before publishing Requested, so
     /// the journal cannot cross from ready to pending until this start exits.

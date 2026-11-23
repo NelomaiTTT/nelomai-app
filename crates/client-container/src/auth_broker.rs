@@ -116,6 +116,15 @@ pub enum NativeAuthFailure {
     OutcomeUnknown,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeRecoveryReply {
+    Native,
+    #[cfg(any(target_os = "android", test))]
+    FencedReplay,
+    #[cfg(any(target_os = "android", test))]
+    FencePending,
+}
+
 #[derive(thiserror::Error)]
 pub enum BrokerError {
     #[error("authentication operation cancelled")]
@@ -3356,6 +3365,173 @@ impl AuthBroker {
         Ok(())
     }
 
+    #[cfg(any(target_os = "android", test))]
+    fn pending_legacy_refresh(meta: &BrokerMetadataV1) -> Option<&BrokerRequestV1> {
+        meta.pending_request
+            .as_ref()
+            .filter(|ticket| ticket.kind == BrokerRequestKind::Refresh && ticket.refresh.is_none())
+    }
+
+    /// Settle an interrupted Android refresh or native operation while the owner still
+    /// holds the source credentials. Admission must wait for a confirmed pair.
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) async fn recover_interrupted_native_auth(
+        &self,
+        native: &dyn crate::ipc::PrivateBackgroundDispatcher,
+        deadline: Instant,
+    ) -> Result<(), BrokerError> {
+        use nelomai_client_api::{RecoverableRefreshRequest, RefreshModeV1};
+
+        // An ordinary RuntimeReady must not wait behind background issuance.
+        {
+            let _state = self.state.lock().await;
+            let auth = self.load()?;
+            if !auth.broker.as_ref().is_some_and(|meta| {
+                meta.pending_recovery.is_some() || Self::pending_legacy_refresh(meta).is_some()
+            }) {
+                return Ok(());
+            }
+        }
+        timeout_at(deadline, async {
+            let _issuance = self.issuance.lock().await;
+            let mut fallback_allowed = true;
+            loop {
+                let (ticket, request) = {
+                    let _state = self.state.lock().await;
+                    let mut auth = self.load()?;
+                    let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
+                    let ticket = match meta.pending_recovery.as_ref() {
+                        Some(ticket) => ticket.clone(),
+                        None => {
+                            let Some(legacy) = Self::pending_legacy_refresh(meta) else {
+                                return Ok(());
+                            };
+                            // Keep the exact proof of a Refresh already bound
+                            // to a persisted transition.
+                            if Self::ensure_transition_issuance_allowed(&auth, None).is_err() {
+                                return Ok(());
+                            }
+                            if !Self::owns_ticket(&auth, legacy) {
+                                return Err(BrokerError::Cancelled);
+                            }
+                            Self::check_deadline(Some(deadline))?;
+                            self.begin_native_locked(&mut auth)?
+                        }
+                    };
+                    Self::active(&auth)?;
+                    Self::ensure_transition_issuance_allowed(&auth, None)?;
+                    let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
+                    Self::check_native_ticket(&auth, meta, &ticket)?;
+                    // A native Recover can have followed a lost legacy refresh.
+                    // Never take over another operation with its own replay key.
+                    if meta.pending_request.as_ref().is_some_and(|pending| {
+                        pending.kind != BrokerRequestKind::Refresh || pending.refresh.is_some()
+                    }) {
+                        return Err(BrokerError::RecoveryRequired);
+                    }
+                    let request = RecoverableRefreshRequest {
+                        contract_version: 1,
+                        operation_id: ticket.operation_id.clone(),
+                        device_id: ticket
+                            .device_id
+                            .clone()
+                            .ok_or(BrokerError::RecoveryRequired)?,
+                        source_identity: ticket.identity.clone(),
+                        refresh_token: auth.refresh_token.ok_or(BrokerError::RecoveryRequired)?,
+                        install_secret: auth.install_secret,
+                        mode: if meta.pending_request.is_some() {
+                            RefreshModeV1::RecoverLegacyPending
+                        } else {
+                            RefreshModeV1::Refresh
+                        },
+                    };
+                    (ticket, request)
+                };
+
+                // The durable native ticket is the idempotency key. A lost reply
+                // keeps the original proof and request, including across restarts.
+                match self.api.refresh_for_runtime_switch(&request).await {
+                    Ok(response) => {
+                        return self
+                            .accept_background_recovery_inner(
+                                &ticket,
+                                response,
+                                Some(deadline),
+                                NativeRecoveryReply::FencedReplay,
+                            )
+                            .await
+                            .map(|_| ())
+                    }
+                    Err(ClientApiError::Api {
+                        status, ref code, ..
+                    }) if matches!(
+                        (status.as_u16(), code.as_str()),
+                        (401, "invalid_refresh_recovery") | (409, "refresh_result_stale")
+                    ) =>
+                    {
+                        if !fallback_allowed {
+                            return Err(BrokerError::RefreshPending);
+                        }
+                        fallback_allowed = false;
+                        // The native request could have already rotated the pair.
+                        // A fresh attempt supersedes the old callback at both owners.
+                        let native_request = {
+                            let _state = self.state.lock().await;
+                            let mut auth = self.load()?;
+                            Self::check_deadline(Some(deadline))?;
+                            let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
+                            Self::check_native_ticket(&auth, meta, &ticket)?;
+                            let access = Self::snapshot(&auth)?;
+                            let next = self.begin_native_locked(&mut auth)?;
+                            NativeAuthRequest {
+                                ticket: next,
+                                access,
+                                install_secret: auth.install_secret,
+                                expires_at_unix_ms: Self::native_expiry(deadline)?,
+                                provision_predecessor: None,
+                            }
+                        };
+                        let next = native_request.ticket.clone();
+                        let response = match native
+                            .dispatch(native_request, crate::ipc::BackgroundAction::Recover)
+                            .await
+                        {
+                            Ok(Some(response)) => response,
+                            Err(NativeAuthFailure::AccessUnavailable) => {
+                                return Err(BrokerError::AccessUnavailable)
+                            }
+                            _ => return Err(BrokerError::RecoveryRequired),
+                        };
+                        match self
+                            .accept_background_recovery_inner(
+                                &next,
+                                response,
+                                Some(deadline),
+                                NativeRecoveryReply::FencePending,
+                            )
+                            .await
+                        {
+                            // Native Recover may supply the live credentials but
+                            // only the switch endpoint can protect them from a late Recover.
+                            Err(BrokerError::RefreshPending) => {}
+                            Err(error) => return Err(error),
+                            Ok(_) => return Err(BrokerError::RecoveryRequired),
+                        }
+                    }
+                    Err(ClientApiError::Api { status, .. })
+                        if status.is_client_error()
+                            && !matches!(status.as_u16(), 404 | 408 | 429) =>
+                    {
+                        return Err(BrokerError::RefreshRejected);
+                    }
+                    Err(_) => return Err(BrokerError::RefreshPending),
+                }
+            }
+        })
+        .await
+        .map_err(|_| BrokerError::RefreshPending)?
+    }
+
     /// Owner-only: issue provenance before invoking a platform recovery. The
     /// ticket must never be reconstructed from caller-provided identity fields.
     pub async fn begin_background_recovery(&self) -> Result<RecoveryTicketV1, BrokerError> {
@@ -3436,15 +3612,6 @@ impl AuthBroker {
         Fut: std::future::Future<Output = Result<Option<TokenResponse>, NativeAuthFailure>>,
     {
         Self::check_deadline(Some(deadline))?;
-        let expires_at_unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| BrokerError::RecoveryRequired)?
-            .as_millis()
-            .saturating_add(
-                deadline
-                    .saturating_duration_since(tokio::time::Instant::now())
-                    .as_millis(),
-            );
         tokio::time::timeout_at(deadline, async {
             let fence = self.capture_login_fence().await?;
             let _issuance = self.issuance.lock().await;
@@ -3479,8 +3646,7 @@ impl AuthBroker {
                     access,
                     provision_predecessor,
                     install_secret: auth.install_secret,
-                    expires_at_unix_ms: u64::try_from(expires_at_unix_ms)
-                        .map_err(|_| BrokerError::RecoveryRequired)?,
+                    expires_at_unix_ms: Self::native_expiry(deadline)?,
                 }
             };
             let ticket = request.ticket.clone();
@@ -3492,8 +3658,13 @@ impl AuthBroker {
             Self::check_deadline(Some(deadline))?;
             match response {
                 Ok(Some(response)) if recover => {
-                    self.accept_background_recovery_inner(&ticket, response, Some(deadline))
-                        .await
+                    self.accept_background_recovery_inner(
+                        &ticket,
+                        response,
+                        Some(deadline),
+                        NativeRecoveryReply::Native,
+                    )
+                    .await
                 }
                 other => {
                     let _state = self.state.lock().await;
@@ -3540,8 +3711,21 @@ impl AuthBroker {
         ticket: &RecoveryTicketV1,
         response: TokenResponse,
     ) -> Result<AccessSnapshot, BrokerError> {
-        self.accept_background_recovery_inner(ticket, response, None)
+        self.accept_background_recovery_inner(ticket, response, None, NativeRecoveryReply::Native)
             .await
+    }
+
+    fn native_expiry(deadline: Instant) -> Result<u64, BrokerError> {
+        let expires_at_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| BrokerError::RecoveryRequired)?
+            .as_millis()
+            .saturating_add(
+                deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .as_millis(),
+            );
+        u64::try_from(expires_at_unix_ms).map_err(|_| BrokerError::RecoveryRequired)
     }
 
     fn check_deadline(deadline: Option<tokio::time::Instant>) -> Result<(), BrokerError> {
@@ -3552,17 +3736,11 @@ impl AuthBroker {
         }
     }
 
-    async fn accept_background_recovery_inner(
-        &self,
+    fn check_native_ticket(
+        auth: &AuthStoreV1,
+        meta: &BrokerMetadataV1,
         ticket: &RecoveryTicketV1,
-        response: TokenResponse,
-        deadline: Option<tokio::time::Instant>,
-    ) -> Result<AccessSnapshot, BrokerError> {
-        let _state = self.state.lock().await;
-        Self::check_deadline(deadline)?;
-        let mut auth = self.load()?;
-        Self::active(&auth)?;
-        let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
+    ) -> Result<(), BrokerError> {
         if meta.pending_recovery.as_ref() != Some(ticket)
             || meta.next_attempt != ticket.attempt
             || meta.family != ticket.family
@@ -3573,12 +3751,29 @@ impl AuthBroker {
         {
             return Err(BrokerError::Cancelled);
         }
+        Ok(())
+    }
+
+    async fn accept_background_recovery_inner(
+        &self,
+        ticket: &RecoveryTicketV1,
+        response: TokenResponse,
+        deadline: Option<tokio::time::Instant>,
+        reply: NativeRecoveryReply,
+    ) -> Result<AccessSnapshot, BrokerError> {
+        let _state = self.state.lock().await;
+        Self::check_deadline(deadline)?;
+        let mut auth = self.load()?;
+        Self::active(&auth)?;
+        let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
+        Self::check_native_ticket(&auth, meta, ticket)?;
         if response.device.confirmed_identity()? != ticket.identity
             || Some(response.device.id.as_str()) != ticket.device_id.as_deref()
             || response.token_type != "Bearer"
             || response.access_token.is_empty()
             || response.refresh_token.is_empty()
-            || response.access_expires_in == 0
+            || (reply == NativeRecoveryReply::Native && response.access_expires_in == 0)
+            || (reply != NativeRecoveryReply::Native && response.refresh_expires_in == 0)
         {
             return Err(BrokerError::IdentityMismatch);
         }
@@ -3586,6 +3781,16 @@ impl AuthBroker {
         auth.refresh_token = Some(response.refresh_token);
         let meta = auth.broker.as_mut().ok_or(BrokerError::RecoveryRequired)?;
         meta.pending_request = None;
+        let fence_pending = match reply {
+            #[cfg(any(target_os = "android", test))]
+            NativeRecoveryReply::FencePending => true,
+            _ => false,
+        };
+        if fence_pending || response.access_expires_in == 0 {
+            // Persist the successor proof and its new replay key atomically.
+            self.begin_native_locked(&mut auth)?;
+            return Err(BrokerError::RefreshPending);
+        }
         meta.pending_recovery = None;
         self.store.save(&auth)?;
         Self::snapshot(&auth)

@@ -555,6 +555,18 @@ impl fmt::Debug for RecoverableRefreshRequest {
     }
 }
 impl ClientApi {
+    pub async fn refresh_for_runtime_switch(
+        &self,
+        request: &RecoverableRefreshRequest,
+    ) -> Result<TokenResponse, ClientApiError> {
+        self.send_json(
+            self.http
+                .post(self.endpoint("auth/refresh-recoverable/runtime-switch")?)
+                .json(request),
+        )
+        .await
+    }
+
     pub async fn refresh_recoverable(
         &self,
         request: &RecoverableRefreshRequest,
