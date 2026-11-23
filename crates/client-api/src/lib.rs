@@ -567,6 +567,28 @@ impl ClientApi {
         .await
     }
 
+    pub async fn recover_legacy_refresh_for_reconcile(
+        &self,
+        request: &RecoverableRefreshRequest,
+        reconcile_operation_id: &str,
+    ) -> Result<TokenResponse, ClientApiError> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            #[serde(flatten)]
+            refresh: &'a RecoverableRefreshRequest,
+            reconcile_operation_id: &'a str,
+        }
+        self.send_json(
+            self.http
+                .post(self.endpoint("auth/refresh-recoverable/runtime-switch")?)
+                .json(&Wire {
+                    refresh: request,
+                    reconcile_operation_id,
+                }),
+        )
+        .await
+    }
+
     pub async fn refresh_recoverable(
         &self,
         request: &RecoverableRefreshRequest,
