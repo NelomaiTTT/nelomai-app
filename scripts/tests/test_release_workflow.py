@@ -23,7 +23,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
         commands = (ROOT / "src-tauri/src/commands.rs").read_text()
         checker.assert_windows_defender_preflight_routing(intent, commands)
         mutations = (
-            (intent.replace("&initial_preflight, reserve_requested)", "&initial_preflight, false)"), commands),
+            (intent.replace("&initial_preflight,\n                    reserve_requested,",
+                            "&initial_preflight,\n                    false,"), commands),
             (intent.replace("state.reserve_requested,", "false,"), commands),
             (intent.replace("&& !desktop_reserve_eligible(options, reserve_requested)", ""), commands),
             (intent.replace("&& !desktop_reserve_eligible(options, reserve_requested)",
@@ -635,11 +636,11 @@ class ReleaseWorkflowTest(unittest.TestCase):
     def test_linux_diagnostic_source_gate_tracks_current_version(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/checks.yml').read_text())
         commands = '\n'.join(step.get('run', '') for step in workflow['jobs']['linux-package-diagnostic']['steps'])
-        self.assertIn('--version 0.4.4 --mode build_only', commands)
+        self.assertIn('--version 0.4.5 --mode build_only', commands)
 
     def test_032_signing_downloads_pinned_stable_before_signing_containers(self):
         workflow = self.workflow()
-        self.assertEqual(workflow[True]["workflow_dispatch"]["inputs"]["version"]["default"], "0.4.4")
+        self.assertEqual(workflow[True]["workflow_dispatch"]["inputs"]["version"]["default"], "0.4.5")
         commands = "\n".join(step.get("run", "") for step in workflow["jobs"]["sign"]["steps"])
         self.assertLess(commands.index("scripts/download-confirmed-stable.py"),
                         commands.index("scripts/sign-runtime-candidate.py"))

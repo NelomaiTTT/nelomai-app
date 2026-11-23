@@ -38,7 +38,8 @@ def assert_windows_defender_preflight_routing(intent: str, commands: str) -> Non
     saved = commands.split("pubasyncfnapp_start_saved_stray(", 1)[1].split("#[tauri::command]", 1)[0]
     if not (
         "state.initial_preflight.clone(),state.reserve_requested," in attempt
-        and ".run_initial_desktop_preflight(&options,&initial_preflight,reserve_requested)" in attempt
+        and ".run_initial_desktop_preflight(&options,&initial_preflight,reserve_requested,"
+            "start_admission,)" in attempt
         and "preflight:&InitialDesktopPreflight,reserve_requested:bool," in preflight
         and preflight.count("ensure_defender_ready_for_awg(") == 1
         and "#[cfg(windows)]ifoptions.layer==nelomai_contracts::Layer::Stray"
@@ -190,7 +191,7 @@ def assert_windows_release_member_file_gate(workflow: dict) -> None:
     test "$SOURCE_SHA" = "$GITHUB_SHA"
     test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
     test -z "$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
-    test "$RELEASE_VERSION" = 0.4.4
+    test "$RELEASE_VERSION" = 0.4.5
     python - <<'PY'
     import os
     lines = [line.strip() for line in os.environ["RELEASE_NOTES"].splitlines() if line.strip()]
@@ -207,8 +208,8 @@ def assert_windows_release_member_file_gate(workflow: dict) -> None:
   name: "Exact source before generated inputs"
   run: |
     test "$GITHUB_SHA" = "$SOURCE_SHA"
-    test "$RELEASE_VERSION" = 0.4.4
-    python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.4 --mode "$RELEASE_MODE"
+    test "$RELEASE_VERSION" = 0.4.5
+    python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.4.5 --mode "$RELEASE_MODE"
 - name: "macOS runtime and Keychain rollback regressions"
   if: "matrix.platform == 'macos'"
   run: "python3 scripts/test-macos-rollback.py"

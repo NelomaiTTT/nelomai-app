@@ -801,7 +801,7 @@ async fn native_macos_start_fits_the_client_ipc_deadline() {
                     NativePairFactory::new(&pair_root, RuntimeSlot::Latest, &binaries).unwrap();
                 let backend =
                     CompositeBackend::new(RuntimeSlot::Latest, platform, factory).unwrap();
-                let mut handler = TunnelRequestHandler::new(backend, "0.4.4");
+                let mut handler = TunnelRequestHandler::new(backend, env!("CARGO_PKG_VERSION"));
                 let policy = ClientPolicy {
                     owner_uid: 0,
                     installed_client_path: std::env::current_exe().unwrap().canonicalize().unwrap(),
