@@ -778,7 +778,7 @@ fn canonical_role_ack_same_generation_is_action_fenced_for_running_and_stopped()
 
 mod live_split_refresh {
     use super::*;
-    use crate::split_tunnel::DomainResolutionMode;
+    use crate::split_tunnel::{DomainResolutionMode, RetainedRefresh};
     use crate::{CoreApi, CoreApiError, CoreError, CoreLocalStop, CoreLogger, RuntimeAuthProvider};
     use async_trait::async_trait;
     use nelomai_client_api::{AccessSnapshot, RuntimeAuthState, RuntimeLogin};
@@ -941,6 +941,12 @@ mod live_split_refresh {
     }
     enum RefreshCase<'a> {
         Live,
+        WakeDuringStatus,
+        #[cfg(target_os = "macos")]
+        QueuedRefresh(QueuedRefreshSource),
+        WakeDuringForcedSync,
+        WakeDuringOfflineSync,
+        WakeDuringSinglePolicyPreparation,
         Restored(&'a str),
         Ambiguous(RefreshReply),
         StalledSettings,
@@ -955,15 +961,35 @@ mod live_split_refresh {
         StartAfterCurrentPolicyApplyFailure,
         DeferredWithFullOutbox,
     }
+    #[cfg(target_os = "macos")]
+    #[derive(Clone, Copy, Debug)]
+    enum QueuedRefreshSource {
+        Timer,
+        Cached,
+        Offline,
+        PairTick,
+    }
+
     struct Tunnel {
         platform: TunnelPlatform,
         snapshot: Mutex<Snapshot>,
         applied: Mutex<Vec<DesktopTunnelOptions>>,
         next_reply: Mutex<RefreshReply>,
+        wake_during_status: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
+        wake_during_capabilities: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
+        #[cfg(target_os = "macos")]
+        refresh_queue: tokio::sync::Mutex<()>,
+        #[cfg(target_os = "macos")]
+        refresh_queued: tokio::sync::Notify,
+        #[cfg(target_os = "macos")]
+        queued_wakes: Mutex<Vec<Option<i64>>>,
     }
     #[async_trait]
     impl TunnelController for Tunnel {
         async fn capabilities(&self) -> Result<TunnelCapabilities, TunnelError> {
+            if let Some(ready) = self.wake_during_capabilities.lock().unwrap().take() {
+                ready.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
             Ok(TunnelCapabilities {
                 platform: self.platform,
                 address_split_tunnel: true,
@@ -979,6 +1005,29 @@ mod live_split_refresh {
         async fn status(&self) -> Result<TunnelStatus, TunnelError> {
             Ok(TunnelStatus::Running)
         }
+        #[cfg(target_os = "macos")]
+        async fn desktop_redundancy_command_guarded(
+            &self,
+            command: Command,
+            mut guard: nelomai_client_tunnel::WakeDispatchGuard,
+        ) -> Result<Snapshot, TunnelError> {
+            assert!(matches!(&command, Command::RefreshSplitTunnel { .. }));
+            self.queued_wakes.lock().unwrap().push(guard.wake_stamp());
+            let stop = guard
+                .take_cancellation()
+                .expect("queued refresh must be cancellable by Stop");
+            self.refresh_queued.notify_one();
+            tokio::select! {
+                _ = stop => return Err(TunnelError::Backend(nelomai_client_tunnel::WAKE_DISPATCH_DEFERRED.into())),
+                _ = self.refresh_queue.lock() => {}
+            }
+            if !guard.is_current() {
+                return Err(TunnelError::Backend(
+                    nelomai_client_tunnel::WAKE_DISPATCH_DEFERRED.into(),
+                ));
+            }
+            self.desktop_redundancy_command(command).await
+        }
         async fn desktop_redundancy_command(
             &self,
             command: Command,
@@ -988,7 +1037,11 @@ mod live_split_refresh {
                 let mut snapshot = self.snapshot.lock().unwrap();
                 let mut reply = RefreshReply::Ack;
                 match wire["action"].as_str().unwrap() {
-                    "status" => (),
+                    "status" => {
+                        if let Some(ready) = self.wake_during_status.lock().unwrap().take() {
+                            ready.store(false, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
                     "refresh_split_tunnel" => {
                         assert_eq!(wire["expected_revision"], snapshot.session.local_revision);
                         assert_eq!(
@@ -1025,6 +1078,30 @@ mod live_split_refresh {
             }
         }
     }
+    #[tokio::test]
+    async fn retained_pair_refresh_deferred_by_wake_can_retry_without_a_domain_delay() {
+        retained_pair_refresh_case(TunnelPlatform::Macos, RefreshCase::WakeDuringStatus).await;
+    }
+
+    #[tokio::test]
+    async fn wake_deferral_does_not_consume_a_forced_split_sync_revision() {
+        retained_pair_refresh_case(TunnelPlatform::Macos, RefreshCase::WakeDuringForcedSync).await;
+    }
+
+    #[tokio::test]
+    async fn wake_during_offline_split_sync_keeps_the_revision_poll_due() {
+        retained_pair_refresh_case(TunnelPlatform::Macos, RefreshCase::WakeDuringOfflineSync).await;
+    }
+
+    #[tokio::test]
+    async fn wake_during_single_policy_preparation_does_not_record_a_dns_failure() {
+        retained_pair_refresh_case(
+            TunnelPlatform::Macos,
+            RefreshCase::WakeDuringSinglePolicyPreparation,
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn expired_domain_refresh_updates_retained_pair_before_revision_gate_without_saved_config(
     ) {
@@ -1250,6 +1327,16 @@ mod live_split_refresh {
         .await;
     }
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn queued_retained_route_refresh_requires_current_wake_and_retries_immediately() {
+        use QueuedRefreshSource::*;
+        for source in [Timer, Cached, Offline, PairTick] {
+            retained_pair_refresh_case(TunnelPlatform::Macos, RefreshCase::QueuedRefresh(source))
+                .await;
+        }
+    }
+
     async fn retained_pair_refresh_case(platform: TunnelPlatform, case: RefreshCase<'_>) {
         let pair = pair();
         let before = both(&pair);
@@ -1317,19 +1404,280 @@ mod live_split_refresh {
             snapshot: Mutex::new(before.clone()),
             applied: Mutex::new(vec![]),
             next_reply: Mutex::new(RefreshReply::Ack),
+            wake_during_status: Mutex::new(None),
+            wake_during_capabilities: Mutex::new(None),
+            #[cfg(target_os = "macos")]
+            refresh_queue: Default::default(),
+            #[cfg(target_os = "macos")]
+            refresh_queued: Default::default(),
+            #[cfg(target_os = "macos")]
+            queued_wakes: Default::default(),
         });
         let api = Arc::new(Api::default());
+        let runtime = Arc::new(Runtime {
+            paths,
+            value: Mutex::new(runtime),
+        });
         let core = Arc::new(crate::ClientCore::with_split_tunnel_store(
             api.clone(),
-            Arc::new(Runtime {
-                paths,
-                value: Mutex::new(runtime),
-            }),
+            runtime.clone(),
             split.clone(),
             Arc::new(Auth(access)),
             CoreLocalStop::new(tunnel.clone()),
             Arc::new(Log),
         ));
+        #[cfg(target_os = "macos")]
+        if let RefreshCase::QueuedRefresh(source) = case {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            let mut current = policy.clone();
+            current.address_rules.clear();
+            current.excluded_ipv4_cidrs = vec!["203.0.113.0/24".into()];
+            current.policy_hash = format!("sha256:{}", "b".repeat(64));
+            current.force_revision += 1;
+            let mut cached = split.load().unwrap();
+            if !matches!(source, QueuedRefreshSource::Timer) {
+                cached.cached_policy = Some(current.clone());
+            }
+            if matches!(
+                source,
+                QueuedRefreshSource::Cached | QueuedRefreshSource::PairTick
+            ) {
+                cached.last_revision_check_unix = Some(now);
+            }
+            split.save(&cached).unwrap();
+            *api.policy.lock().unwrap() = Some(current.clone());
+            api.offline.store(
+                matches!(source, QueuedRefreshSource::Offline),
+                Ordering::SeqCst,
+            );
+            *core.state.lock().await = crate::CoreState {
+                phase: crate::Phase::Connected,
+                connection: Some(pair.connection.clone()),
+            };
+            let ready = Arc::new(AtomicBool::new(true));
+            let run = |at, stamp| {
+                let ready = ready.clone();
+                let core = core.clone();
+                async move {
+                    let check = move || ready.load(Ordering::SeqCst);
+                    if matches!(source, QueuedRefreshSource::PairTick) {
+                        core.desktop_redundancy_tick_guarded(Vec::new(), Some(stamp), check)
+                            .await
+                            .map(|_| ())
+                    } else {
+                        core.synchronize_split_tunnel_for_wake(at, false, Some(stamp), check)
+                            .await
+                            .map(|_| ())
+                    }
+                }
+            };
+            let hold = tunnel.refresh_queue.lock().await;
+            let first = tokio::spawn(run(now, 10));
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                tunnel.refresh_queued.notified(),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{source:?} bypassed guarded native refresh"));
+            if matches!(source, QueuedRefreshSource::Cached) {
+                core.signal_start_cancellation();
+                tokio::time::timeout(std::time::Duration::from_secs(1), first)
+                    .await
+                    .expect("Stop must release the blocked writer before the queue opens")
+                    .unwrap()
+                    .unwrap();
+                drop(hold);
+            } else {
+                ready.store(false, Ordering::SeqCst);
+                drop(hold);
+                first.await.unwrap().unwrap();
+            }
+            assert!(tunnel.applied.lock().unwrap().is_empty(), "{source:?}");
+            assert!(
+                core.desktop_domain_refresh.lock().await.is_none(),
+                "{source:?} consumed retry window"
+            );
+            assert_eq!(
+                split.load().unwrap().working_policy_hash,
+                Some(policy.policy_hash)
+            );
+            assert!(api.apply_results.lock().unwrap().is_empty());
+            ready.store(true, Ordering::SeqCst);
+            run(now + 1, 11).await.unwrap();
+            let stored = split.load().unwrap();
+            assert_eq!(
+                stored.working_policy_hash,
+                Some(current.policy_hash),
+                "{source:?}"
+            );
+            assert_eq!(tunnel.applied.lock().unwrap().len(), 1, "{source:?}");
+            assert_eq!(*tunnel.queued_wakes.lock().unwrap(), [Some(10), Some(11)]);
+            return;
+        }
+        if matches!(case, RefreshCase::WakeDuringOfflineSync) {
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            api.offline.store(true, Ordering::SeqCst);
+            let ready = Arc::new(AtomicBool::new(true));
+            *tunnel.wake_during_status.lock().unwrap() = Some(ready.clone());
+            let allowed = || ready.load(Ordering::SeqCst);
+            core.synchronize_split_tunnel_guarded(401, false, &allowed)
+                .await
+                .unwrap();
+            assert!(!allowed());
+            assert_eq!(split.load().unwrap().last_revision_check_unix, None);
+            assert!(tunnel.applied.lock().unwrap().is_empty());
+
+            let mut current = policy.clone();
+            current.force_revision += 1;
+            current.address_rules.clear();
+            *api.policy.lock().unwrap() = Some(current.clone());
+            ready.store(true, Ordering::SeqCst);
+            *core.state.lock().await = crate::CoreState {
+                phase: crate::Phase::Connected,
+                connection: Some(pair.connection.clone()),
+            };
+            let cached = core
+                .synchronize_split_tunnel_guarded(402, false, &allowed)
+                .await
+                .unwrap();
+            assert_eq!(cached, crate::SplitTunnelSyncOutcome::CachedOffline);
+            assert_eq!(split.load().unwrap().last_revision_check_unix, Some(402));
+            let cached_refreshes = tunnel.applied.lock().unwrap().len();
+
+            api.offline.store(false, Ordering::SeqCst);
+            core.retry_split_tunnel_revision_guarded(407, &allowed)
+                .await
+                .unwrap();
+            assert_eq!(
+                split.load().unwrap().last_seen_force_revision,
+                current.force_revision
+            );
+            assert_eq!(tunnel.applied.lock().unwrap().len(), cached_refreshes + 1);
+            let results = api.apply_results.lock().unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].force_revision, current.force_revision);
+            return;
+        }
+        if matches!(case, RefreshCase::WakeDuringSinglePolicyPreparation) {
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            runtime.value.lock().unwrap().desktop_redundancy = None;
+            *core.state.lock().await = crate::CoreState {
+                phase: crate::Phase::Connected,
+                connection: Some(pair.connection.clone()),
+            };
+            let mut cached = split.load().unwrap();
+            cached.observed_panel_revision = cached.working_policy_revision.clone();
+            split.save(&cached).unwrap();
+            let mut current = policy.clone();
+            current.force_revision += 1;
+            current.policy_hash = format!("sha256:{}", "b".repeat(64));
+            current.address_rules[0].value = "uncached.invalid".into();
+            *api.policy.lock().unwrap() = Some(current.clone());
+            let ready = Arc::new(AtomicBool::new(true));
+            *tunnel.wake_during_capabilities.lock().unwrap() = Some(ready.clone());
+            let allowed = || ready.load(Ordering::SeqCst);
+            core.synchronize_split_tunnel_guarded(401, false, &allowed)
+                .await
+                .unwrap();
+            assert!(!allowed());
+            let stale = split.load().unwrap();
+            assert_eq!(stale.failed_policy_hash, None);
+            assert_eq!(stale.last_revision_check_unix, None);
+            assert_eq!(stale.last_seen_force_revision, 0);
+
+            ready.store(true, Ordering::SeqCst);
+            core.synchronize_split_tunnel_guarded(402, false, &allowed)
+                .await
+                .unwrap();
+            let genuine_failure = split.load().unwrap();
+            assert_eq!(
+                genuine_failure.failed_policy_hash,
+                Some(current.policy_hash)
+            );
+            assert_eq!(
+                genuine_failure.last_seen_force_revision,
+                current.force_revision
+            );
+            return;
+        }
+        if matches!(case, RefreshCase::WakeDuringForcedSync) {
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            *core.state.lock().await = crate::CoreState {
+                phase: crate::Phase::Connected,
+                connection: Some(pair.connection.clone()),
+            };
+            let mut current = policy.clone();
+            current.address_rules.clear();
+            let mut cached = split.load().unwrap();
+            cached.cached_policy = Some(current.clone());
+            split.save(&cached).unwrap();
+            current.force_revision += 1;
+            *api.policy.lock().unwrap() = Some(current.clone());
+            let ready = Arc::new(AtomicBool::new(true));
+            *tunnel.wake_during_status.lock().unwrap() = Some(ready.clone());
+            let allowed = || ready.load(Ordering::SeqCst);
+            core.synchronize_split_tunnel_guarded(401, false, &allowed)
+                .await
+                .unwrap();
+            assert_eq!(split.load().unwrap().last_seen_force_revision, 0);
+            assert!(api.apply_results.lock().unwrap().is_empty());
+            ready.store(true, Ordering::SeqCst);
+            core.synchronize_split_tunnel_guarded(402, false, &allowed)
+                .await
+                .unwrap();
+            assert_eq!(
+                split.load().unwrap().last_seen_force_revision,
+                current.force_revision
+            );
+            let results = api.apply_results.lock().unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].force_revision, current.force_revision);
+            return;
+        }
+        if matches!(case, RefreshCase::WakeDuringStatus) {
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let ready = Arc::new(AtomicBool::new(true));
+            *tunnel.wake_during_status.lock().unwrap() = Some(ready.clone());
+            let allowed = || ready.load(Ordering::SeqCst);
+            let mut cached = split.load().unwrap();
+            let resolver = |_| async { Some(vec!["203.0.113.9/32".into()]) };
+            assert!(core
+                .refresh_retained_split_tunnel(
+                    &mut cached,
+                    161,
+                    resolver,
+                    RetainedRefresh::Tick(&before, core.start_cancellation_epoch()),
+                    &allowed,
+                    #[cfg(target_os = "macos")]
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_none());
+            assert!(tunnel.applied.lock().unwrap().is_empty());
+
+            ready.store(true, Ordering::SeqCst);
+            assert!(core
+                .refresh_retained_split_tunnel(
+                    &mut cached,
+                    162,
+                    resolver,
+                    RetainedRefresh::Tick(&before, core.start_cancellation_epoch()),
+                    &allowed,
+                    #[cfg(target_os = "macos")]
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_some());
+            assert_eq!(tunnel.applied.lock().unwrap().len(), 1);
+            return;
+        }
         if matches!(case, RefreshCase::StartAfterCurrentPolicyApplyFailure) {
             let revoked = "203.0.113.9/32";
             let mut previous = policy.clone();
@@ -1772,11 +2120,13 @@ mod live_split_refresh {
                     &mut changed,
                     161,
                     |_| async { Some(vec!["203.0.113.9/32".into()]) },
-                    None,
-                    Some((
+                    RetainedRefresh::Apply(
                         DomainResolutionMode::Refresh,
                         core.start_cancellation_epoch(),
-                    )),
+                    ),
+                    &|| true,
+                    #[cfg(target_os = "macos")]
+                    None,
                 ),
             )
             .await;
@@ -1796,11 +2146,13 @@ mod live_split_refresh {
                 &mut original,
                 162,
                 |_| async { panic!("disabled policy must not resolve domains") },
-                None,
-                Some((
+                RetainedRefresh::Apply(
                     DomainResolutionMode::Refresh,
                     core.start_cancellation_epoch(),
-                )),
+                ),
+                &|| true,
+                #[cfg(target_os = "macos")]
+                None,
             )
             .await
             .unwrap();
@@ -1818,11 +2170,13 @@ mod live_split_refresh {
                 &mut original,
                 163,
                 |_| async { panic!("disabled policy must not resolve domains") },
-                None,
-                Some((
+                RetainedRefresh::Apply(
                     DomainResolutionMode::Refresh,
                     core.start_cancellation_epoch(),
-                )),
+                ),
+                &|| true,
+                #[cfg(target_os = "macos")]
+                None,
             )
             .await
             .unwrap();
@@ -1924,11 +2278,13 @@ mod live_split_refresh {
                 &mut cached,
                 163,
                 |_| async { Some(vec!["203.0.113.9/32".into()]) },
-                None,
-                Some((
+                RetainedRefresh::Apply(
                     DomainResolutionMode::Refresh,
                     core.start_cancellation_epoch(),
-                )),
+                ),
+                &|| true,
+                #[cfg(target_os = "macos")]
+                None,
             )
             .await
             .unwrap()

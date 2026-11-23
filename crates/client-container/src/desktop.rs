@@ -14,6 +14,13 @@ mod windows;
 #[cfg(windows)]
 pub use windows::{capture_inherited_channels, verify_protected_path, NativeStream, VerifiedChild};
 
+#[cfg(target_os = "macos")]
+/// Runtime-to-Common UDP stall rebind with a socket-backed lifetime.
+pub const NATIVE_STALL_REBIND: u8 = 3;
+#[cfg(target_os = "macos")]
+/// Runtime-to-Common automatic recovery mutation with caller lifetime, wake and optional lease deadline.
+pub const NATIVE_WAKE_MUTATION: u8 = 4;
+
 /// A fixed one-byte channel tag followed by an existing little-endian frame.
 /// Engine JSON retains its full 1 MiB budget; native control uses 64 KiB. There
 /// is no JSON/base64 envelope that can multiply either allocation budget.
@@ -43,6 +50,10 @@ fn native_limit(tag: u8) -> io::Result<usize> {
     match tag {
         1 => Ok(1024 * 1024),
         2 | 255 => Ok(65536),
+        #[cfg(target_os = "macos")]
+        NATIVE_STALL_REBIND => Ok(65536),
+        #[cfg(target_os = "macos")]
+        NATIVE_WAKE_MUTATION => Ok(1024 * 1024 + size_of::<i64>() + size_of::<u64>()),
         _ => Err(blocked()),
     }
 }

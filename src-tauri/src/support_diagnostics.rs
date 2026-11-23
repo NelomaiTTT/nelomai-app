@@ -695,6 +695,7 @@ pub(super) fn safe_event(value: Value) -> Option<Map<String, Value>> {
             | "desktop.redundancy.role_report_succeeded"
             | "desktop.redundancy.role_report_failed"
             | "desktop.redundancy.role_confirmed"
+            | "desktop.redundancy.candidate_expired"
             | "control.transport.failed"
             | "runtime.status"
             | "tunnel.recovery.power_gate"
@@ -894,6 +895,10 @@ pub(super) fn safe_event(value: Value) -> Option<Map<String, Value>> {
                         | "tunnel_handshake_timeout"
                         | "sleep_or_dark_wake"
                         | "wake_grace"
+                        | "wake_network_pending"
+                        | "stage_unconfirmed"
+                        | "lease_window_elapsed"
+                        | "readiness_unconfirmed"
                         | "update_install_preparing"
                         | "uid_mismatch"
                         | "path_mismatch"
@@ -1227,6 +1232,8 @@ mod tests {
                 "{\"kind\":\"connection.handshake_failed\",\"code\":\"tunnel_handshake_timeout\"}\n",
                 "{\"kind\":\"connection.local_start_failed\",\"code\":\"private native error\"}\n",
                 "{\"kind\":\"desktop.redundancy.role_report_failed\",\"code\":\"temporary_network_error\"}\n",
+                "{\"kind\":\"desktop.redundancy.candidate_expired\",\"code\":\"readiness_unconfirmed\"}\n",
+                "{\"kind\":\"tunnel.recovery.power_gate\",\"code\":\"wake_network_pending\"}\n",
                 "{\"kind\":\"startup.runtime_recovery_required\",\"code\":\"runtime_admission_timeout\"}\n",
                 "{\"kind\":\"startup.runtime_recovery_required\",\"code\":\"runtime_admission_service_unavailable\"}\n",
                 "{\"kind\":\"startup.runtime_recovery_required\",\"code\":\"auth_refresh_rejected\"}\n",
@@ -1256,6 +1263,11 @@ mod tests {
                 "desktop.redundancy.role_report_failed",
                 "temporary_network_error",
             ),
+            (
+                "desktop.redundancy.candidate_expired",
+                "readiness_unconfirmed",
+            ),
+            ("tunnel.recovery.power_gate", "wake_network_pending"),
             (
                 "startup.runtime_recovery_required",
                 "runtime_admission_timeout",

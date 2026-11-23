@@ -393,7 +393,16 @@ pub enum ApplicationError {
     #[error(transparent)]
     Api(#[from] CoreApiError),
     #[error(transparent)]
-    Core(#[from] CoreError),
+    Core(CoreError),
+}
+
+impl From<CoreError> for ApplicationError {
+    fn from(error: CoreError) -> Self {
+        match error {
+            CoreError::RecoveryDeferred => Self::RecoveryDeferred,
+            other => Self::Core(other),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -448,6 +457,13 @@ pub struct ClientApplication<A, S, T, L> {
     probe_gate: AsyncMutex<()>,
     pending_stop_wake: Notify,
     probe_cache: StdMutex<ProbeCache>,
+}
+
+#[cfg(target_os = "macos")]
+impl<S, T, L> ClientApplication<ClientApi, S, T, L> {
+    pub async fn probe_wake_control_network(&self) -> bool {
+        self.api.probe_wake_control_network().await
+    }
 }
 
 impl<A, S, T, L> ClientApplication<A, S, T, L>
@@ -593,6 +609,48 @@ where
             .map_err(Into::into)
     }
 
+    #[cfg(target_os = "macos")]
+    pub async fn synchronize_split_tunnel_guarded(
+        &self,
+        now_unix: i64,
+        retry_revision: bool,
+        allowed: &(impl Fn() -> bool + Sync),
+    ) -> Result<SplitTunnelSyncOutcome, ApplicationError> {
+        if retry_revision {
+            return Box::pin(
+                self.core
+                    .retry_split_tunnel_revision_guarded(now_unix, allowed),
+            )
+            .await
+            .map_err(Into::into);
+        }
+        Box::pin(
+            self.core
+                .synchronize_split_tunnel_guarded(now_unix, false, allowed),
+        )
+        .await
+        .map_err(Into::into)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn synchronize_split_tunnel_for_wake(
+        &self,
+        now_unix: i64,
+        retry_revision: bool,
+        wake_stamp: Option<i64>,
+        allowed: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Result<SplitTunnelSyncOutcome, ApplicationError> {
+        let preflight = self.start_preflight.clone();
+        Box::pin(self.core.synchronize_split_tunnel_for_wake(
+            now_unix,
+            retry_revision,
+            wake_stamp,
+            move || allowed() && preflight.check_start_barrier().is_ok(),
+        ))
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn save_split_tunnel_settings(
         &self,
         request: &SplitTunnelSettingsUpdate,
@@ -644,10 +702,26 @@ where
     pub async fn poll_physical_network_guarded(
         &self,
         now_unix: i64,
-        allowed: impl Fn() -> bool + Send,
+        allowed: impl Fn() -> bool + Send + Sync,
     ) -> Result<PhysicalNetworkPollOutcome, ApplicationError> {
         self.core
             .poll_physical_network_guarded(now_unix, allowed)
+            .await
+            .map_err(Into::into)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn poll_physical_network_for_wake(
+        &self,
+        now_unix: i64,
+        wake_stamp: Option<i64>,
+        allowed: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Result<PhysicalNetworkPollOutcome, ApplicationError> {
+        let preflight = self.start_preflight.clone();
+        self.core
+            .poll_physical_network_for_wake(now_unix, wake_stamp, move || {
+                allowed() && preflight.check_start_barrier().is_ok()
+            })
             .await
             .map_err(Into::into)
     }
@@ -702,14 +776,32 @@ where
         &self,
         request: BindPeerRequest,
     ) -> Result<PeerBindingResponse, ApplicationError> {
+        self.bind_peer_guarded(request, &|| true).await
+    }
+
+    pub async fn bind_peer_guarded(
+        &self,
+        request: BindPeerRequest,
+        admission: &dyn nelomai_client_core::StartAdmission,
+    ) -> Result<PeerBindingResponse, ApplicationError> {
+        let allowed = || admission.allows_start();
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
-        self.core.prepare_binding_change().await?;
+        if !allowed() {
+            return Err(ApplicationError::RecoveryDeferred);
+        }
+        self.core.prepare_binding_change_guarded(admission).await?;
         let access_token = self.access_token().await?;
         let _probe_guard = self.probe_gate.lock().await;
+        if !allowed() {
+            return Err(ApplicationError::RecoveryDeferred);
+        }
         let response = match self.api.bind_peer(&access_token, &request).await {
             Ok(response) => response,
-            Err(CoreApiError::Unauthorized) => {
+            Err(CoreApiError::Unauthorized) if allowed() => {
                 let access_token = self.core.refresh_access_token(&access_token).await?;
+                if !allowed() {
+                    return Err(ApplicationError::RecoveryDeferred);
+                }
                 self.api.bind_peer(&access_token, &request).await?
             }
             Err(error) => return Err(error.into()),
@@ -950,12 +1042,27 @@ where
         &self,
         snapshot: &nelomai_client_tunnel::redundancy::protocol::Snapshot,
     ) -> Result<bool, ApplicationError> {
+        self.prepare_desktop_recovery_guarded(snapshot, None, || true)
+            .await
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn prepare_desktop_recovery_guarded(
+        &self,
+        snapshot: &nelomai_client_tunnel::redundancy::protocol::Snapshot,
+        wake_stamp: Option<i64>,
+        allowed: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Result<bool, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
-        let result = self.core.prepare_desktop_recovery(snapshot).await;
-        if matches!(result, Ok(true)) || self.core.has_pending_stop_cleanup().unwrap_or(false) {
+        let result = self
+            .core
+            .prepare_desktop_recovery_guarded(snapshot, wake_stamp, allowed)
+            .await;
+        if matches!(result, Ok(Some(true))) || self.core.has_pending_stop_cleanup().unwrap_or(false)
+        {
             self.pending_stop_wake.notify_one();
         }
-        result.map_err(Into::into)
+        result?.ok_or(ApplicationError::RecoveryDeferred)
     }
 
     /// One coordination step, not a native health loop. Refresh the scoped cache
@@ -966,18 +1073,45 @@ where
         now_unix: i64,
     ) -> Result<Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>, ApplicationError>
     {
-        let used = match self.core.desktop_redundancy_probe_context().await? {
+        self.desktop_redundancy_tick_guarded(now_unix, None, || true)
+            .await
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn desktop_redundancy_tick_guarded(
+        &self,
+        now_unix: i64,
+        wake_stamp: Option<i64>,
+        allowed: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Result<Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>, ApplicationError>
+    {
+        if !allowed() {
+            return Ok(None);
+        }
+        let probe_context = self.core.desktop_redundancy_probe_context().await;
+        if !allowed() {
+            return Ok(None);
+        }
+        let used = match probe_context? {
             Some((layer, egress_mode)) => {
-                Some(self.refresh_probes(layer, egress_mode, now_unix).await?)
+                let probes = self
+                    .refresh_probes_guarded(layer, egress_mode, now_unix, &allowed)
+                    .await;
+                if !allowed() {
+                    return Ok(None);
+                }
+                Some(probes?)
             }
             None => None,
         };
         let result = self
             .core
-            .desktop_redundancy_tick(
+            .desktop_redundancy_tick_guarded(
                 used.as_ref()
                     .map(|used| used.probes.clone())
                     .unwrap_or_default(),
+                wake_stamp,
+                allowed,
             )
             .await;
         if matches!(&result, Err(CoreError::Api(CoreApiError::Rejected { code, .. })) if code == "standby_unavailable")
@@ -1006,8 +1140,68 @@ where
         lease_id: &str,
         recovery: StalledDataPlaneRecovery,
     ) -> Result<StalledDataPlaneRecoveryOutcome, ApplicationError> {
+        self.recover_stalled_data_plane_guarded(lease_id, recovery, &|| true)
+            .await
+    }
+
+    pub async fn recover_stalled_data_plane_guarded(
+        &self,
+        lease_id: &str,
+        recovery: StalledDataPlaneRecovery,
+        allowed: &(impl Fn() -> bool + Sync),
+    ) -> Result<StalledDataPlaneRecoveryOutcome, ApplicationError> {
         self.core
-            .recover_stalled_data_plane(lease_id, recovery)
+            .recover_stalled_data_plane_guarded(lease_id, recovery, allowed)
+            .await
+            .map_err(Into::into)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn recover_stalled_data_plane_guarded_for_wake(
+        &self,
+        lease_id: &str,
+        recovery: StalledDataPlaneRecovery,
+        wake_stamp: Option<i64>,
+        allowed: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Result<StalledDataPlaneRecoveryOutcome, ApplicationError> {
+        let preflight = self.start_preflight.clone();
+        self.core
+            .recover_stalled_data_plane_guarded_for_wake(
+                lease_id,
+                recovery,
+                wake_stamp,
+                move || allowed() && preflight.check_start_barrier().is_ok(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn resume_stalled_data_plane_restart_guarded(
+        &self,
+        lease_id: &str,
+        allowed: &(impl Fn() -> bool + Sync),
+    ) -> Result<Option<nelomai_client_core::StalledDataPlaneRestartOutcome>, ApplicationError> {
+        self.core
+            .resume_stalled_data_plane_restart_guarded(lease_id, &|| {
+                allowed() && self.start_preflight.check_start_barrier().is_ok()
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn resume_stalled_data_plane_restart_guarded_for_wake(
+        &self,
+        lease_id: &str,
+        wake_stamp: Option<i64>,
+        allowed: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Result<Option<nelomai_client_core::StalledDataPlaneRestartOutcome>, ApplicationError> {
+        let preflight = self.start_preflight.clone();
+        self.core
+            .resume_stalled_data_plane_restart_guarded_for_wake(lease_id, wake_stamp, move || {
+                allowed() && preflight.check_start_barrier().is_ok()
+            })
             .await
             .map_err(Into::into)
     }
@@ -1018,17 +1212,34 @@ where
 
     #[cfg(not(target_os = "android"))]
     pub async fn reconcile_pending_operation_for_retry(&self) -> Result<(), ApplicationError> {
+        self.reconcile_pending_operation_for_retry_guarded(&|| true)
+            .await
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn reconcile_pending_operation_for_retry_guarded(
+        &self,
+        allowed: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         self.core
-            .reconcile_pending_operation_for_retry()
+            .reconcile_pending_operation_for_retry_guarded(allowed)
             .await
             .map_err(Into::into)
     }
 
     // Keep large Core futures off callers' inline state (notably Tauri JNI IPC).
     pub async fn bootstrap(&self, now_unix: i64) -> Result<Bootstrap, ApplicationError> {
+        self.bootstrap_guarded(now_unix, &|| true).await
+    }
+
+    pub async fn bootstrap_guarded(
+        &self,
+        now_unix: i64,
+        allowed: &(impl Fn() -> bool + Sync),
+    ) -> Result<Bootstrap, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
-        Box::pin(self.core.bootstrap(now_unix))
+        Box::pin(self.core.bootstrap_guarded(now_unix, allowed))
             .await
             .map_err(Into::into)
     }
@@ -1060,6 +1271,19 @@ where
         self.core.start_cancellation_epoch()
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn macos_stall_epoch(&self) -> Option<nelomai_client_core::MacosStallEpoch> {
+        self.core.macos_stall_epoch()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn macos_stall_epoch_is_current(
+        &self,
+        epoch: nelomai_client_core::MacosStallEpoch,
+    ) -> bool {
+        self.core.macos_stall_epoch_is_current(epoch)
+    }
+
     pub fn check_start_cancellation(
         &self,
         epoch: StartCancellationEpoch,
@@ -1083,7 +1307,7 @@ where
         now_unix: i64,
         cancel_epoch: StartCancellationEpoch,
     ) -> Result<Connection, ApplicationError> {
-        self.start_with_contract(options, now_unix, cancel_epoch, None)
+        self.start_with_contract(options, now_unix, cancel_epoch, None, &|| true)
             .await
     }
 
@@ -1095,7 +1319,13 @@ where
     ) -> Result<Connection, ApplicationError> {
         let cancel_epoch = self.core.begin_start_attempt();
         let result = self
-            .start_with_contract(options, now_unix, cancel_epoch, Some(reserve_enabled))
+            .start_with_contract(
+                options,
+                now_unix,
+                cancel_epoch,
+                Some(reserve_enabled),
+                &|| true,
+            )
             .await;
         self.core.finish_start_attempt();
         result
@@ -1107,13 +1337,18 @@ where
         now_unix: i64,
         cancel_epoch: StartCancellationEpoch,
         reserve_enabled: Option<bool>,
+        admission: &dyn nelomai_client_core::StartAdmission,
     ) -> Result<Connection, ApplicationError> {
+        let allowed = || admission.allows_start();
         self.start_preflight.before_tunnel_start().await?;
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         self.start_preflight.check_start_barrier()?;
+        if !allowed() {
+            return Err(ApplicationError::RecoveryDeferred);
+        }
         options = options.normalized_for_layer();
         self.core
-            .prepare_explicit_start(&options, cancel_epoch)
+            .prepare_explicit_start_guarded(&options, cancel_epoch, &allowed)
             .await?;
         options.probes = if options.layer == Layer::Tic
             && options.tic_connection_mode == TicConnectionMode::Personal
@@ -1121,7 +1356,7 @@ where
             Vec::new()
         } else {
             match self
-                .refresh_probes(options.layer, options.egress_mode, now_unix)
+                .refresh_probes_guarded(options.layer, options.egress_mode, now_unix, &allowed)
                 .await
             {
                 Ok(results) => results.probes,
@@ -1144,11 +1379,46 @@ where
             }
             None => {
                 self.core
-                    .start_with_cancellation_epoch(options, now_unix, cancel_epoch)
+                    .start_with_cancellation_epoch_guarded(
+                        options,
+                        now_unix,
+                        cancel_epoch,
+                        admission,
+                    )
                     .await
             }
         }
         .map_err(Into::into)
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn start_legacy_intent_guarded(
+        &self,
+        mut options: ConnectOptions,
+        now_unix: i64,
+        cancel_epoch: StartCancellationEpoch,
+        skip_probe_refresh: bool,
+        admission: &dyn nelomai_client_core::StartAdmission,
+    ) -> Result<Connection, ApplicationError> {
+        self.core.begin_start_attempt();
+        let result = async {
+            if !skip_probe_refresh {
+                return self
+                    .start_with_contract(options, now_unix, cancel_epoch, None, admission)
+                    .await;
+            }
+            self.start_preflight.before_tunnel_start().await?;
+            let _lifecycle_guard = self.lifecycle_gate.lock().await;
+            self.start_preflight.check_start_barrier()?;
+            options.probes.clear();
+            self.core
+                .start_with_cancellation_epoch_guarded(options, now_unix, cancel_epoch, admission)
+                .await
+                .map_err(Into::into)
+        }
+        .await;
+        self.core.finish_start_attempt();
+        result
     }
 
     pub async fn start_without_probe_refresh(
@@ -1205,7 +1475,7 @@ where
             now_unix,
             reserve,
             cancel_epoch,
-            allowed,
+            &allowed,
         )
         .await
     }
@@ -1217,14 +1487,18 @@ where
         now_unix: i64,
         reserve: bool,
         cancel_epoch: StartCancellationEpoch,
-        allowed: impl Fn() -> bool + Send + Sync,
+        admission: &dyn nelomai_client_core::StartAdmission,
     ) -> Result<Connection, ApplicationError> {
+        let allowed = || admission.allows_start();
         self.core.check_start_cancellation(cancel_epoch)?;
         self.start_preflight.before_tunnel_start().await?;
         self.core.check_start_cancellation(cancel_epoch)?;
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         self.core.check_start_cancellation(cancel_epoch)?;
         self.start_preflight.check_start_barrier()?;
+        if !allowed() {
+            return Err(ApplicationError::RecoveryDeferred);
+        }
         self.core.begin_start_attempt();
         options = options.normalized_for_layer();
         options.probes = if options.layer == Layer::Tic
@@ -1233,7 +1507,7 @@ where
             Vec::new()
         } else {
             match self
-                .refresh_probes(options.layer, options.egress_mode, now_unix)
+                .refresh_probes_guarded(options.layer, options.egress_mode, now_unix, &allowed)
                 .await
             {
                 Ok(results) => results.probes,
@@ -1245,11 +1519,12 @@ where
         };
         let result = if allowed() {
             self.core
-                .desktop_connection_intent_attempt_with_cancellation_epoch(
+                .desktop_connection_intent_attempt_guarded(
                     options.clone(),
                     now_unix,
                     reserve && options.tic_connection_mode == TicConnectionMode::Dynamic,
                     cancel_epoch,
+                    admission,
                 )
                 .await
                 .map_err(Into::into)
@@ -1282,14 +1557,33 @@ where
     #[cfg(not(target_os = "android"))]
     pub async fn replace_stalled_connection_guarded(
         &self,
-        mut options: ConnectOptions,
+        options: ConnectOptions,
         now_unix: i64,
         allowed: impl Fn() -> bool + Send + Sync,
     ) -> Result<Connection, ApplicationError> {
+        let epoch = self.core.start_cancellation_epoch();
+        self.replace_stalled_connection_at_epoch(options, now_unix, epoch, &allowed)
+            .await
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn replace_stalled_connection_at_epoch(
+        &self,
+        mut options: ConnectOptions,
+        now_unix: i64,
+        cancel_epoch: StartCancellationEpoch,
+        admission: &dyn nelomai_client_core::StartAdmission,
+    ) -> Result<Connection, ApplicationError> {
+        let allowed = || admission.allows_start();
+        self.core.check_start_cancellation(cancel_epoch)?;
         self.start_preflight.before_tunnel_start().await?;
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        self.core.check_start_cancellation(cancel_epoch)?;
         self.start_preflight.check_start_barrier()?;
-        let cancel_epoch = self.core.begin_start_attempt();
+        if !allowed() {
+            return Err(ApplicationError::RecoveryDeferred);
+        }
+        self.core.begin_start_attempt();
         let result = async {
             options = options.normalized_for_layer();
             options.probes = if options.layer == Layer::Tic
@@ -1298,7 +1592,7 @@ where
                 Vec::new()
             } else {
                 let probes = self
-                    .refresh_probes(options.layer, options.egress_mode, now_unix)
+                    .refresh_probes_guarded(options.layer, options.egress_mode, now_unix, &allowed)
                     .await;
                 if !allowed() {
                     return Err(ApplicationError::RecoveryDeferred);
@@ -1309,7 +1603,7 @@ where
                 return Err(ApplicationError::RecoveryDeferred);
             }
             self.core
-                .replace_stalled_connection_with_cancellation_epoch(options, now_unix, cancel_epoch)
+                .replace_stalled_connection_guarded(options, now_unix, cancel_epoch, admission)
                 .await
                 .map_err(Into::into)
         }
@@ -1337,16 +1631,38 @@ where
         egress_mode: EgressMode,
         now_unix: i64,
     ) -> Result<ProbeResults, ApplicationError> {
+        self.refresh_probes_guarded(layer, egress_mode, now_unix, &|| true)
+            .await
+    }
+
+    async fn refresh_probes_guarded(
+        &self,
+        layer: Layer,
+        egress_mode: EgressMode,
+        now_unix: i64,
+        allowed: &(impl Fn() -> bool + Sync),
+    ) -> Result<ProbeResults, ApplicationError> {
+        if !allowed() {
+            return Err(ApplicationError::RecoveryDeferred);
+        }
         if let Some(results) = self.fresh_probes(layer, egress_mode, now_unix) {
             return Ok(results);
         }
 
         let _guard = self.probe_gate.lock().await;
+        if !allowed() {
+            return Err(ApplicationError::RecoveryDeferred);
+        }
         if let Some(results) = self.fresh_probes(layer, egress_mode, now_unix) {
             return Ok(results);
         }
 
-        let candidates = self.load_server_candidates(layer, egress_mode).await?;
+        let candidates = self
+            .load_server_candidates(layer, egress_mode, allowed)
+            .await?;
+        if !allowed() {
+            return Err(ApplicationError::RecoveryDeferred);
+        }
         let measured_at = timestamp(now_unix)?;
         let candidates = candidates
             .candidates
@@ -1368,6 +1684,9 @@ where
             let api = self.api.clone();
             let measured_at = measured_at.clone();
             async move {
+                if !allowed() {
+                    return None;
+                }
                 let outcome = api.probe_candidate_latency_ms(&candidate.probe_url).await;
                 let (latency_ms, failure_code) = match outcome {
                     Ok(latency_ms)
@@ -1378,7 +1697,7 @@ where
                     Ok(_) => (None, Some(ProbeFailureCode::Unknown)),
                     Err(code) => (None, Some(code)),
                 };
-                (
+                Some((
                     ProbeResult {
                         candidate_id: candidate.candidate_id,
                         latency_ms,
@@ -1386,12 +1705,16 @@ where
                         measured_at,
                     },
                     expires_at,
-                )
+                ))
             }
         }))
         .buffer_unordered(MAX_CONCURRENT_PROBES)
+        .filter_map(std::future::ready)
         .collect::<Vec<_>>()
         .await;
+        if !allowed() {
+            return Err(ApplicationError::RecoveryDeferred);
+        }
         let valid_until_unix = measured
             .iter()
             .map(|(_, expires_at)| *expires_at)
@@ -1427,7 +1750,7 @@ where
         #[cfg(not(target_os = "android"))]
         {
             let result = Box::pin(self.core.stop_locally()).await;
-            if result.is_ok() {
+            if result.is_ok() || self.core.has_pending_stop_cleanup().unwrap_or(false) {
                 // Retain one permit if the scheduler is busy or has not started yet.
                 self.pending_stop_wake.notify_one();
             }
@@ -1453,7 +1776,7 @@ where
         &self,
     ) -> Result<Option<PendingStopCompletion>, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
-        self.retry_pending_stop_locked(true).await
+        self.retry_pending_stop_locked(true, None, || true).await
     }
 
     /// Take the desktop intent snapshot under the same gate as native cleanup.
@@ -1463,15 +1786,30 @@ where
         &self,
         observe: impl std::future::Future<Output = Option<Context>>,
     ) -> Result<Option<(Context, PendingStopCompletion)>, ApplicationError> {
+        self.retry_pending_stop_observed_guarded(observe, None, || true)
+            .await
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn retry_pending_stop_observed_guarded<Context>(
+        &self,
+        observe: impl std::future::Future<Output = Option<Context>>,
+        wake_stamp: Option<i64>,
+        inferred_stop_allowed: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Result<Option<(Context, PendingStopCompletion)>, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         let context = observe.await;
-        let completion = self.retry_pending_stop_locked(context.is_some()).await?;
+        let completion = self
+            .retry_pending_stop_locked(context.is_some(), wake_stamp, inferred_stop_allowed)
+            .await?;
         Ok(context.zip(completion))
     }
 
     async fn retry_pending_stop_locked(
         &self,
         infer_stop: bool,
+        wake_stamp: Option<i64>,
+        inferred_stop_allowed: impl Fn() -> bool + Send + Sync + 'static,
     ) -> Result<Option<PendingStopCompletion>, ApplicationError> {
         let cancel_epoch = self.core.start_cancellation_epoch();
         let pending_cleanup = self.core.has_pending_stop_cleanup()?;
@@ -1491,7 +1829,11 @@ where
             return Ok(None);
         }
         let pair = self.core.desktop_cleanup_scope();
-        let Some(connection) = self.core.retry_pending_stop_cleanup().await? else {
+        let Some(connection) = self
+            .core
+            .retry_pending_stop_cleanup_guarded(wake_stamp, inferred_stop_allowed)
+            .await?
+        else {
             return Ok(None);
         };
         // Both a terminal Stop and an explicit accepted background-cleanup
@@ -1526,9 +1868,15 @@ where
         let cancelled_pending_start = self.core.signal_start_cancellation();
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         let state = self.core.state().await;
-        if shutdown_requires_core_stop(state.phase, cancelled_pending_start)
-            || self.core.has_pending_stop_cleanup()?
-        {
+        let pending = self.core.has_pending_stop_cleanup();
+        #[cfg(not(target_os = "android"))]
+        if state.connection.is_none() && matches!(pending, Ok(true)) {
+            // Canonical cleanup of an already retired lease has no connection to return.
+            return Box::pin(self.core.retry_pending_stop_cleanup())
+                .await
+                .map_err(Into::into);
+        }
+        if shutdown_requires_core_stop(state.phase, cancelled_pending_start) || pending? {
             return Box::pin(self.core.stop())
                 .await
                 .map(Some)
@@ -1583,16 +1931,23 @@ where
         &self,
         layer: Layer,
         egress_mode: EgressMode,
+        allowed: &(impl Fn() -> bool + Sync),
     ) -> Result<ServerCandidatesResponse, ApplicationError> {
         let access_token = self.access_token().await?;
+        if !allowed() {
+            return Err(ApplicationError::RecoveryDeferred);
+        }
         match self
             .api
             .server_candidates(&access_token, layer, egress_mode)
             .await
         {
             Ok(response) => Ok(response),
-            Err(CoreApiError::Unauthorized) => {
+            Err(CoreApiError::Unauthorized) if allowed() => {
                 let access_token = self.core.refresh_access_token(&access_token).await?;
+                if !allowed() {
+                    return Err(ApplicationError::RecoveryDeferred);
+                }
                 self.api
                     .server_candidates(&access_token, layer, egress_mode)
                     .await

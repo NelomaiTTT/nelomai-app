@@ -22,6 +22,8 @@ use nelomai_client_tunnel::{
     DesktopTunnelOptions, TunnelCapabilities, TunnelController, TunnelError, TunnelMetrics,
     TunnelPlatform, TunnelStartRequest, TunnelStatus,
 };
+#[cfg(target_os = "macos")]
+use nelomai_client_tunnel::{StallRebindGuard, WakeDispatchGuard, WAKE_DISPATCH_DEFERRED};
 pub use nelomai_contracts::dispatcher;
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
@@ -109,6 +111,28 @@ pub enum ServiceTunnelState {
     Failed,
 }
 
+/// Read-only evidence for a probe on an ordinary macOS tunnel. The socket
+/// identity distinguishes a restarted worker even when macOS reuses utunN.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MacosProbePath {
+    pub interface: String,
+    pub index: u32,
+    pub socket_device: u64,
+    pub socket_inode: u64,
+    pub sent_ip_packets: u64,
+    pub received_ip_packets: u64,
+}
+
+impl MacosProbePath {
+    pub fn same_tunnel(&self, other: &Self) -> bool {
+        self.interface == other.interface
+            && self.index == other.index
+            && self.socket_device == other.socket_device
+            && self.socket_inode == other.socket_inode
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Response {
@@ -122,6 +146,8 @@ pub struct Response {
     pub physical_network_fingerprint: Option<String>,
     #[serde(default)]
     pub metrics: Option<TunnelMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos_probe_path: Option<MacosProbePath>,
     #[serde(default)]
     pub diagnostics: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -139,6 +165,7 @@ impl Response {
             desktop_redundancy_v1: false,
             physical_network_fingerprint: None,
             metrics: None,
+            macos_probe_path: None,
             diagnostics: None,
             redundancy: None,
             error_code: None,
@@ -154,6 +181,7 @@ impl Response {
             desktop_redundancy_v1: false,
             physical_network_fingerprint: None,
             metrics: None,
+            macos_probe_path: None,
             diagnostics: None,
             redundancy: None,
             error_code: Some(error_code.into()),
@@ -199,6 +227,28 @@ pub enum Request {
 }
 
 impl Request {
+    #[cfg(target_os = "macos")]
+    pub fn allows_wake_dispatch(&self) -> bool {
+        matches!(
+            self,
+            Self::Start { .. }
+                | Self::StopIfUnowned { .. }
+                | Self::Redundant {
+                    request: Command::Start { .. }
+                        | Command::Attach { .. }
+                        | Command::StageCandidate { .. }
+                        | Command::RetireInactive { .. }
+                        | Command::RemoveStandby { .. }
+                        | Command::CommitCandidate { .. }
+                        | Command::ConfirmRole { .. }
+                        | Command::RefreshSplitTunnel { .. }
+                        | Command::PrepareStop { .. }
+                        | Command::PrepareRecoveryStop { .. },
+                    ..
+                }
+        )
+    }
+
     pub fn start(configuration: String) -> Self {
         Self::start_with_options(configuration, DesktopTunnelOptions::default())
     }
@@ -576,6 +626,9 @@ pub enum ServiceError {
     UnsupportedProtocol,
     #[error("WireGuard configuration is invalid")]
     InvalidConfiguration,
+    #[cfg(target_os = "macos")]
+    #[error("macOS recovery command was deferred before helper dispatch")]
+    WakeDispatchDeferred,
     #[error("tunnel helper is unavailable: {0}")]
     Backend(String),
 }
@@ -590,6 +643,8 @@ impl ServiceError {
             Self::DispatcherTimeout | Self::DispatcherBusy => "service_unavailable",
             Self::UnsupportedProtocol => "unsupported_protocol",
             Self::InvalidConfiguration => "invalid_configuration",
+            #[cfg(target_os = "macos")]
+            Self::WakeDispatchDeferred => WAKE_DISPATCH_DEFERRED,
             Self::Backend(code) => stable_route_error_code(code).unwrap_or("service_unavailable"),
         }
     }
@@ -716,6 +771,10 @@ pub trait ServiceTunnelBackend {
     fn metrics(&self, _probe: bool) -> Result<TunnelMetrics, ServiceError> {
         Err(ServiceError::Backend("metrics_unavailable".to_string()))
     }
+    #[cfg(target_os = "macos")]
+    fn macos_probe_path(&self) -> Option<MacosProbePath> {
+        None
+    }
     fn diagnostics(&self) -> Result<String, ServiceError> {
         Err(ServiceError::Backend("diagnostics_unavailable".to_string()))
     }
@@ -837,6 +896,10 @@ impl<B: ServiceTunnelBackend> TunnelRequestHandler<B> {
             Request::Metrics { probe, .. } => self.backend.metrics(probe).map(|metrics| {
                 let mut response = Response::success(None);
                 response.metrics = Some(metrics);
+                #[cfg(target_os = "macos")]
+                if probe {
+                    response.macos_probe_path = self.backend.macos_probe_path();
+                }
                 response
             }),
             Request::Diagnostics { .. } => self.backend.diagnostics().map(|diagnostics| {
@@ -907,10 +970,69 @@ fn engine_service_error(error: ServiceError) -> std::io::Error {
 #[async_trait]
 pub trait ServiceTransport: Send + Sync {
     async fn exchange(&self, request: Request) -> Result<Response, ServiceError>;
+
+    #[cfg(target_os = "macos")]
+    async fn exchange_wake_mutation(
+        &self,
+        request: Request,
+        guard: WakeDispatchGuard,
+    ) -> Result<Response, ServiceError> {
+        if !request.allows_wake_dispatch() {
+            return Err(ServiceError::InvalidRequest);
+        }
+        if !guard.is_current() {
+            return Err(ServiceError::WakeDispatchDeferred);
+        }
+        self.exchange(request).await
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn exchange_stall_rebind(
+        &self,
+        guard: StallRebindGuard,
+    ) -> Result<Response, ServiceError> {
+        if !guard.is_current() {
+            return Err(ServiceError::Backend("udp_rebind_cancelled".into()));
+        }
+        self.exchange(Request::rebind_udp()).await
+    }
 }
 
 pub struct UnixTunnelController<T> {
     transport: T,
+}
+
+impl<T: ServiceTransport> UnixTunnelController<T> {
+    async fn exchange_pair_command(
+        &self,
+        command: Command,
+        #[cfg(target_os = "macos")] guard: Option<WakeDispatchGuard>,
+    ) -> Result<Snapshot, TunnelError> {
+        command
+            .validate(command.scope().runtime)
+            .map_err(|_| TunnelError::Backend("invalid_redundant_command".into()))?;
+        let scope = command.scope().clone();
+        let request = Request::Redundant {
+            protocol_version: PROTOCOL_VERSION,
+            request: command,
+        };
+        #[cfg(target_os = "macos")]
+        let response = match guard {
+            Some(guard) => self.transport.exchange_wake_mutation(request, guard).await,
+            None => self.transport.exchange(request).await,
+        };
+        #[cfg(not(target_os = "macos"))]
+        let response = self.transport.exchange(request).await;
+        let response = response.map_err(to_tunnel_error)?;
+        validate_response(&response)?;
+        let snapshot = response
+            .redundancy
+            .ok_or_else(|| TunnelError::Backend("missing_redundancy_snapshot".into()))?;
+        if snapshot.session.scope != scope {
+            return Err(TunnelError::Backend("redundancy_scope_mismatch".into()));
+        }
+        Ok(snapshot)
+    }
 }
 
 impl<T> UnixTunnelController<T> {
@@ -950,6 +1072,16 @@ impl<T: ServiceTransport> UnixTunnelController<T> {
         Ok(response.redundancy)
     }
 
+    async fn rebind_single_udp(&self) -> Result<bool, TunnelError> {
+        let response = self
+            .transport
+            .exchange(Request::rebind_udp())
+            .await
+            .map_err(to_tunnel_error)?;
+        require_state(response, ServiceTunnelState::Running)?;
+        Ok(true)
+    }
+
     pub async fn service_version(&self) -> Result<String, TunnelError> {
         let response = self
             .transport
@@ -960,6 +1092,22 @@ impl<T: ServiceTransport> UnixTunnelController<T> {
         response
             .service_version
             .ok_or_else(|| TunnelError::Backend("missing_service_version".to_string()))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn macos_probe_metrics(
+        &self,
+    ) -> Result<(TunnelMetrics, Option<MacosProbePath>), TunnelError> {
+        let response = self
+            .transport
+            .exchange(Request::metrics(true))
+            .await
+            .map_err(to_tunnel_error)?;
+        validate_response(&response)?;
+        let metrics = response
+            .metrics
+            .ok_or_else(|| TunnelError::Backend("missing_tunnel_metrics".into()))?;
+        Ok((metrics, response.macos_probe_path))
     }
 
     pub async fn diagnostics(&self) -> Result<String, TunnelError> {
@@ -1001,45 +1149,41 @@ impl<T: ServiceTransport> TunnelController for UnixTunnelController<T> {
     }
 
     async fn desktop_redundancy_command(&self, command: Command) -> Result<Snapshot, TunnelError> {
-        command
-            .validate(command.scope().runtime)
-            .map_err(|_| TunnelError::Backend("invalid_redundant_command".into()))?;
-        let scope = command.scope().clone();
-        let response = self
-            .transport
-            .exchange(Request::Redundant {
-                protocol_version: PROTOCOL_VERSION,
-                request: command,
-            })
-            .await
-            .map_err(to_tunnel_error)?;
-        validate_response(&response)?;
-        let snapshot = response
-            .redundancy
-            .ok_or_else(|| TunnelError::Backend("missing_redundancy_snapshot".into()))?;
-        if snapshot.session.scope != scope {
-            return Err(TunnelError::Backend("redundancy_scope_mismatch".into()));
-        }
-        Ok(snapshot)
+        self.exchange_pair_command(
+            command,
+            #[cfg(target_os = "macos")]
+            None,
+        )
+        .await
     }
 
-    async fn start(&self, mut request: TunnelStartRequest) -> Result<(), TunnelError> {
-        request
-            .options
-            .validate()
-            .map_err(|error| TunnelError::InvalidOptions {
-                code: error.stable_code(),
-            })?;
-        request
-            .configuration
-            .override_dns(&request.options.dns_servers)
-            .map_err(|error| TunnelError::Backend(error.to_string()))?;
+    #[cfg(target_os = "macos")]
+    async fn desktop_redundancy_command_guarded(
+        &self,
+        command: Command,
+        guard: WakeDispatchGuard,
+    ) -> Result<Snapshot, TunnelError> {
+        self.exchange_pair_command(command, Some(guard)).await
+    }
+
+    async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError> {
         let response = self
             .transport
-            .exchange(Request::start_with_options(
-                request.configuration.expose().to_string(),
-                DesktopTunnelOptions::from_tunnel_options(&request.options),
-            ))
+            .exchange(prepare_start_request(request)?)
+            .await
+            .map_err(to_tunnel_error)?;
+        require_state(response, ServiceTunnelState::Running)
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn start_guarded(
+        &self,
+        request: TunnelStartRequest,
+        guard: WakeDispatchGuard,
+    ) -> Result<(), TunnelError> {
+        let response = self
+            .transport
+            .exchange_wake_mutation(prepare_start_request(request)?, guard)
             .await
             .map_err(to_tunnel_error)?;
         require_state(response, ServiceTunnelState::Running)
@@ -1072,6 +1216,16 @@ impl<T: ServiceTransport> TunnelController for UnixTunnelController<T> {
         let response = self
             .transport
             .exchange(Request::stop_if_unowned())
+            .await
+            .map_err(to_tunnel_error)?;
+        require_state(response, ServiceTunnelState::Stopped)
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn stop_if_unowned_guarded(&self, guard: WakeDispatchGuard) -> Result<(), TunnelError> {
+        let response = self
+            .transport
+            .exchange_wake_mutation(Request::stop_if_unowned(), guard)
             .await
             .map_err(to_tunnel_error)?;
         require_state(response, ServiceTunnelState::Stopped)
@@ -1141,9 +1295,15 @@ impl<T: ServiceTransport> TunnelController for UnixTunnelController<T> {
                 Err(TunnelError::Backend("redundancy_rebind_incomplete".into()))
             };
         }
+        self.rebind_single_udp().await
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn rebind_udp_for_stall(&self, guard: StallRebindGuard) -> Result<bool, TunnelError> {
+        // The helper rejects ordinary rebind while the native pair owns routes.
         let response = self
             .transport
-            .exchange(Request::rebind_udp())
+            .exchange_stall_rebind(guard)
             .await
             .map_err(to_tunnel_error)?;
         require_state(response, ServiceTunnelState::Running)?;
@@ -1162,6 +1322,23 @@ impl<T: ServiceTransport> TunnelController for UnixTunnelController<T> {
             application_split_tunnel: false,
         })
     }
+}
+
+fn prepare_start_request(mut request: TunnelStartRequest) -> Result<Request, TunnelError> {
+    request
+        .options
+        .validate()
+        .map_err(|error| TunnelError::InvalidOptions {
+            code: error.stable_code(),
+        })?;
+    request
+        .configuration
+        .override_dns(&request.options.dns_servers)
+        .map_err(|error| TunnelError::Backend(error.to_string()))?;
+    Ok(Request::start_with_options(
+        request.configuration.expose().to_string(),
+        DesktopTunnelOptions::from_tunnel_options(&request.options),
+    ))
 }
 
 fn require_state(response: Response, expected: ServiceTunnelState) -> Result<(), TunnelError> {

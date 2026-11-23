@@ -3035,6 +3035,12 @@ struct CoordinatorTunnel {
     keep_running_on_stop_failure: AtomicBool,
     preserve_restart_intent: AtomicBool,
     independent_native_owner: AtomicBool,
+    #[cfg(target_os = "macos")]
+    native_restart_stop_queue: tokio::sync::Mutex<()>,
+    #[cfg(target_os = "macos")]
+    native_restart_stop_entered: Notify,
+    #[cfg(target_os = "macos")]
+    native_wake_stamp: Mutex<Option<i64>>,
     block_restart_stop: AtomicBool,
     restart_stop_entered: Notify,
     restart_stop_release: Notify,
@@ -3089,6 +3095,31 @@ impl TunnelController for CoordinatorTunnel {
             self.restart_release.notified().await;
         }
         self.start(request).await
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn stop_if_unowned_guarded(
+        &self,
+        mut guard: nelomai_client_tunnel::WakeDispatchGuard,
+    ) -> Result<(), TunnelError> {
+        let allowed = guard
+            .take_cancellation()
+            .expect("queued Stop must be revocable before dispatch");
+        self.native_restart_stop_entered.notify_one();
+        tokio::select! {
+            _ = allowed => return Err(TunnelError::Backend(nelomai_client_tunnel::WAKE_DISPATCH_DEFERRED.into())),
+            _ = self.native_restart_stop_queue.lock() => {}
+        }
+        let current = *self.native_wake_stamp.lock().unwrap();
+        if !guard.is_current() || (current.is_some() && current != guard.wake_stamp()) {
+            return Err(TunnelError::Backend(
+                nelomai_client_tunnel::WAKE_DISPATCH_DEFERRED.into(),
+            ));
+        }
+        if self.independent_native_owner.load(Ordering::SeqCst) {
+            return Err(TunnelError::Backend("runtime_v2_owned".into()));
+        }
+        self.stop_for_restart().await
     }
 
     async fn stop_for_restart(&self) -> Result<(), TunnelError> {
@@ -3974,16 +4005,19 @@ async fn network_recovery_rejects_changed_session_and_closes_dispatched_native_s
 async fn rejected_recovery_distinguishes_native_handoff_from_failed_cleanup() {
     for native_handoff in [false, true] {
         let (fixture, original) = metadata_recovery_fixture().await;
+        let old_scope_is_current = Arc::new(AtomicBool::new(true));
         fixture.tunnel.block_restart.store(true, Ordering::SeqCst);
         let recovery = tokio::spawn({
             let fixture = fixture.clone();
             let lease_id = original.lease_id.clone();
+            let old_scope_is_current = old_scope_is_current.clone();
             async move {
                 fixture
                     .core
-                    .recover_stalled_data_plane(
+                    .recover_stalled_data_plane_guarded(
                         &lease_id,
                         StalledDataPlaneRecovery::RestartLocalTunnel,
+                        &|| old_scope_is_current.load(Ordering::SeqCst),
                     )
                     .await
             }
@@ -4008,6 +4042,7 @@ async fn rejected_recovery_distinguishes_native_handoff_from_failed_cleanup() {
             .tunnel
             .keep_running_on_stop_failure
             .store(true, Ordering::SeqCst);
+        old_scope_is_current.store(false, Ordering::SeqCst);
         fixture.tunnel.block_restart.store(false, Ordering::SeqCst);
         fixture.tunnel.restart_release.notify_one();
         let result = recovery.await.unwrap();
@@ -6607,4 +6642,478 @@ async fn ordinary_save_requires_reconnect_confirmation_when_cache_is_superseded(
     let after = fixture.tunnel.starts.load(Ordering::SeqCst);
     assert!(after > before);
     assert!(warned, "ordinary settings Save restarts the active tunnel without the expected confirmation: starts {before} -> {after}");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn route_resync_and_physical_restart_defer_start_after_power_scope_expires() {
+    for (policy_change, user_stop, failed_stop) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (false, false, true),
+        (true, false, true),
+    ] {
+        let fixture = coordinator_fixture(capabilities(TunnelPlatform::Macos, None, true, false));
+        fixture
+            .api
+            .set_policy(policy(SplitTunnelMode::ExcludeSelected));
+        fixture
+            .core
+            .synchronize_split_tunnel(1_000, false)
+            .await
+            .unwrap();
+        fixture.tunnel.set_fingerprints(["network-a"]);
+        fixture
+            .core
+            .start(ConnectOptions::android_default(), 1_010)
+            .await
+            .unwrap();
+        if policy_change {
+            let mut changed = policy(SplitTunnelMode::ExcludeSelected);
+            changed.revision = 9;
+            changed.policy_hash = format!("sha256:{}", "b".repeat(64));
+            changed.excluded_ipv4_cidrs = vec!["198.51.100.0/24".into()];
+            fixture.api.set_policy(changed);
+            fixture.api.set_revision(9, 2);
+        } else {
+            fixture.tunnel.set_fingerprints(["network-b", "network-b"]);
+            assert_eq!(
+                fixture.core.poll_physical_network(1_100).await.unwrap(),
+                PhysicalNetworkPollOutcome::ChangePending,
+            );
+        }
+        fixture
+            .tunnel
+            .block_restart_stop
+            .store(true, Ordering::SeqCst);
+        if failed_stop {
+            fixture.tunnel.fail_next_stops.store(1, Ordering::SeqCst);
+            fixture
+                .tunnel
+                .block_next_status
+                .store(true, Ordering::SeqCst);
+        }
+        let allowed = AtomicBool::new(true);
+        let check = || allowed.load(Ordering::SeqCst);
+        let (outcome, ()) = tokio::join!(
+            async {
+                if policy_change {
+                    fixture
+                        .core
+                        .synchronize_split_tunnel_guarded(1_600, false, &check)
+                        .await
+                        .map(|_| ())
+                } else {
+                    fixture
+                        .core
+                        .poll_physical_network_guarded(1_130, check)
+                        .await
+                        .map(|_| ())
+                }
+            },
+            async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    if failed_stop {
+                        &fixture.tunnel.status_entered
+                    } else {
+                        &fixture.tunnel.restart_stop_entered
+                    }
+                    .notified(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    fixture.tunnel.status().await.unwrap(),
+                    TunnelStatus::Stopped
+                );
+                allowed.store(false, Ordering::SeqCst);
+                if failed_stop {
+                    fixture.tunnel.status_release.notify_one();
+                } else {
+                    fixture.tunnel.restart_stop_release.notify_one();
+                }
+            }
+        );
+        outcome.unwrap();
+        assert_eq!(
+            fixture.tunnel.restart_starts.load(Ordering::SeqCst),
+            0,
+            "policy change {policy_change}"
+        );
+        assert_eq!(fixture.core.state().await.phase, Phase::Stopping);
+        assert_eq!(
+            fixture
+                .split_store
+                .load()
+                .unwrap()
+                .applied_physical_network_fingerprint,
+            None
+        );
+        if user_stop {
+            fixture.api.stop_succeeds.store(true, Ordering::SeqCst);
+            fixture.core.stop().await.unwrap();
+            fixture.core.poll_physical_network(1_631).await.unwrap();
+            assert_eq!(fixture.tunnel.restart_starts.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                fixture.tunnel.status().await.unwrap(),
+                TunnelStatus::Stopped
+            );
+            continue;
+        }
+        fixture
+            .tunnel
+            .set_fingerprints(["network-c", "network-c", "network-c"]);
+        fixture
+            .tunnel
+            .block_restart_stop
+            .store(false, Ordering::SeqCst);
+        assert_eq!(
+            fixture.core.poll_physical_network(1_631).await.unwrap(),
+            PhysicalNetworkPollOutcome::Reconnected
+        );
+        assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+        assert_eq!(fixture.tunnel.restart_starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture
+                .split_store
+                .load()
+                .unwrap()
+                .applied_physical_network_fingerprint
+                .as_deref(),
+            Some("network-c")
+        );
+        if policy_change {
+            assert_eq!(
+                fixture
+                    .tunnel
+                    .options
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .excluded_ipv4_cidrs,
+                vec!["198.51.100.0/24"]
+            );
+            fixture
+                .core
+                .synchronize_split_tunnel(1_650, false)
+                .await
+                .unwrap();
+            assert_eq!(
+                fixture.split_store.load().unwrap().working_policy_hash,
+                Some(format!("sha256:{}", "b".repeat(64)))
+            );
+            assert_eq!(fixture.tunnel.restart_starts.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn wake_during_policy_fingerprint_defers_route_confirmation_without_replaying_start() {
+    let fixture = coordinator_fixture(capabilities(TunnelPlatform::Macos, None, true, false));
+    fixture
+        .api
+        .set_policy(policy(SplitTunnelMode::ExcludeSelected));
+    fixture
+        .core
+        .synchronize_split_tunnel(1_000, false)
+        .await
+        .unwrap();
+    fixture.tunnel.set_fingerprints(["network-a"]);
+    fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_010)
+        .await
+        .unwrap();
+    let mut changed = policy(SplitTunnelMode::ExcludeSelected);
+    changed.revision = 9;
+    changed.policy_hash = format!("sha256:{}", "b".repeat(64));
+    changed.excluded_ipv4_cidrs = vec!["198.51.100.0/24".into()];
+    fixture.api.set_policy(changed);
+    fixture.api.set_revision(9, 2);
+    let before = fixture.tunnel.fingerprint_calls.load(Ordering::SeqCst);
+    fixture
+        .tunnel
+        .block_fingerprint
+        .store(true, Ordering::SeqCst);
+    let allowed = Arc::new(AtomicBool::new(true));
+    let scope = allowed.clone();
+    let (result, ()) = tokio::join!(
+        fixture
+            .core
+            .synchronize_split_tunnel_for_wake(1_600, false, Some(10), move || scope
+                .load(Ordering::SeqCst)),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while fixture.tunnel.fingerprint_calls.load(Ordering::SeqCst) == before {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            allowed.store(false, Ordering::SeqCst);
+            fixture
+                .tunnel
+                .block_fingerprint
+                .store(false, Ordering::SeqCst);
+            fixture.tunnel.fingerprint_release.notify_one();
+        }
+    );
+    result.unwrap();
+    assert_eq!(fixture.core.state().await.phase, Phase::Stopping);
+    let stored = fixture.split_store.load().unwrap();
+    assert_eq!(stored.working_policy_hash, None);
+    assert_eq!(stored.applied_physical_network_fingerprint, None);
+    assert_eq!(
+        fixture
+            .core
+            .poll_physical_network_for_wake(1_630, Some(11), || true)
+            .await
+            .unwrap(),
+        PhysicalNetworkPollOutcome::Reconnected
+    );
+    assert_eq!(fixture.tunnel.restart_starts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+    assert_eq!(
+        fixture
+            .split_store
+            .load()
+            .unwrap()
+            .applied_physical_network_fingerprint,
+        None
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn interrupted_policy_rollback_retires_revoked_routes_and_keeps_failure_cooldown() {
+    let fixture = coordinator_fixture(capabilities(TunnelPlatform::Macos, None, true, false));
+    fixture
+        .api
+        .set_policy(policy(SplitTunnelMode::ExcludeSelected));
+    fixture
+        .core
+        .synchronize_split_tunnel(1_000, false)
+        .await
+        .unwrap();
+    fixture.tunnel.set_fingerprints(["network-a"]);
+    fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_010)
+        .await
+        .unwrap();
+    let mut changed = policy(SplitTunnelMode::ExcludeSelected);
+    changed.revision = 9;
+    changed.policy_hash = format!("sha256:{}", "b".repeat(64));
+    changed.excluded_ipv4_cidrs = vec!["198.51.100.0/24".into()];
+    let changed_hash = changed.policy_hash.clone();
+    fixture.api.set_policy(changed);
+    fixture.api.set_revision(9, 2);
+    fixture.tunnel.fail_next_starts.store(1, Ordering::SeqCst);
+    fixture.tunnel.block_restart.store(true, Ordering::SeqCst);
+    let allowed = Arc::new(AtomicBool::new(true));
+    let scope = allowed.clone();
+    let (result, ()) = tokio::join!(
+        fixture
+            .core
+            .synchronize_split_tunnel_for_wake(1_600, false, Some(10), move || scope
+                .load(Ordering::SeqCst)),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while fixture.tunnel.restart_starts.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            allowed.store(false, Ordering::SeqCst);
+            fixture.tunnel.block_restart.store(false, Ordering::SeqCst);
+            fixture.tunnel.restart_release.notify_one();
+        }
+    );
+    result.unwrap();
+    assert_eq!(fixture.tunnel.restart_starts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.core.state().await.phase, Phase::Stopping);
+    assert_eq!(
+        fixture
+            .core
+            .poll_physical_network_for_wake(1_630, Some(11), || true)
+            .await
+            .unwrap(),
+        PhysicalNetworkPollOutcome::Reconnected
+    );
+    assert_eq!(fixture.tunnel.restart_starts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fixture
+            .tunnel
+            .options
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .policy_hash,
+        None
+    );
+    let state = fixture.split_store.load().unwrap();
+    assert_eq!(state.failed_policy_hash, Some(changed_hash));
+    assert_eq!(state.failed_policy_retry_after_unix, Some(5_230));
+    let report = state.pending_apply_results.last().unwrap();
+    assert_eq!(report.status, SplitTunnelApplyStatus::Failed);
+    assert_eq!(
+        report.error_code.as_deref(),
+        Some("split_tunnel_default_routes_restored")
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn expired_queued_singleton_stop_keeps_running_lease_and_retries_the_original_repair() {
+    #[derive(Clone, Copy, Debug)]
+    enum Repair {
+        Routes,
+        Policy,
+        DataPlane,
+        Cancel,
+    }
+    for repair in [
+        Repair::Routes,
+        Repair::Policy,
+        Repair::DataPlane,
+        Repair::Cancel,
+    ] {
+        let fixture = Arc::new(coordinator_fixture(capabilities(
+            TunnelPlatform::Macos,
+            None,
+            true,
+            false,
+        )));
+        let original = policy(SplitTunnelMode::ExcludeSelected);
+        fixture.api.set_policy(original.clone());
+        fixture
+            .core
+            .synchronize_split_tunnel(1_000, false)
+            .await
+            .unwrap();
+        fixture.tunnel.set_fingerprints(["network-a"]);
+        let connection = fixture
+            .core
+            .start(ConnectOptions::android_default(), 1_010)
+            .await
+            .unwrap();
+        let mut changed = original.clone();
+        changed.revision = 9;
+        changed.policy_hash = format!("sha256:{}", "b".repeat(64));
+        changed.excluded_ipv4_cidrs = vec!["198.51.100.0/24".into()];
+        if matches!(repair, Repair::Policy) {
+            fixture.api.set_policy(changed.clone());
+            fixture.api.set_revision(9, 2);
+        }
+        if matches!(repair, Repair::Routes) {
+            fixture.tunnel.set_fingerprints(["network-b"]);
+            assert_eq!(
+                fixture.core.poll_physical_network(1_590).await.unwrap(),
+                PhysicalNetworkPollOutcome::ChangePending
+            );
+        }
+        let run = |now, stamp| {
+            let fixture = fixture.clone();
+            let lease_id = connection.lease_id.clone();
+            async move {
+                match repair {
+                    Repair::Routes => fixture
+                        .core
+                        .poll_physical_network_for_wake(now, Some(stamp), || true)
+                        .await
+                        .map(|outcome| outcome == PhysicalNetworkPollOutcome::Reconnected),
+                    Repair::Policy => fixture
+                        .core
+                        .synchronize_split_tunnel_for_wake(now, false, Some(stamp), || true)
+                        .await
+                        .map(|outcome| {
+                            outcome == SplitTunnelSyncOutcome::Updated { reconnected: true }
+                        }),
+                    Repair::DataPlane | Repair::Cancel => fixture
+                        .core
+                        .recover_stalled_data_plane_guarded_for_wake(
+                            &lease_id,
+                            StalledDataPlaneRecovery::RestartLocalTunnel,
+                            Some(stamp),
+                            || true,
+                        )
+                        .await
+                        .map(|outcome| outcome == StalledDataPlaneRecoveryOutcome::Reconnected),
+                }
+            }
+        };
+        let hold = fixture.tunnel.native_restart_stop_queue.lock().await;
+        *fixture.tunnel.native_wake_stamp.lock().unwrap() = Some(10);
+        let first = tokio::spawn(run(1_620, 10));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fixture.tunnel.native_restart_stop_entered.notified(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{repair:?} bypassed guarded singleton Stop"));
+        assert_eq!(
+            fixture.tunnel.status().await.unwrap(),
+            TunnelStatus::Running
+        );
+        let waiting = fixture.core.state().await;
+        assert_eq!(waiting.phase, Phase::Connected);
+        assert_eq!(waiting.connection.as_ref(), Some(&connection));
+        assert_eq!(fixture.core.active_recovery_options().await, None);
+        *fixture.tunnel.native_wake_stamp.lock().unwrap() = Some(11);
+        if matches!(repair, Repair::Cancel) {
+            fixture.core.signal_start_cancellation();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), first)
+                .await
+                .expect("retired epoch must release Stop while the queue is still held")
+                .unwrap();
+            assert!(matches!(result, Ok(false) | Err(CoreError::StartCancelled)));
+            drop(hold);
+        } else {
+            drop(hold);
+            assert!(!first.await.unwrap().unwrap(), "{repair:?}");
+        }
+        assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.tunnel.restart_starts.load(Ordering::SeqCst), 0);
+        let observed = fixture.core.state().await;
+        assert_eq!(observed.phase, Phase::Connected);
+        assert_eq!(observed.connection, Some(connection.clone()));
+        assert_eq!(fixture.core.active_recovery_options().await, None);
+        let stored = fixture.split_store.load().unwrap();
+        assert_eq!(stored.working_policy_hash, Some(original.policy_hash));
+        assert_eq!(
+            stored.applied_physical_network_fingerprint.as_deref(),
+            Some("network-a")
+        );
+        if matches!(repair, Repair::DataPlane) {
+            // The old routes are still natively attested: reapplying the same
+            // policy must not replace the untouched instance.
+            fixture
+                .core
+                .synchronize_split_tunnel(1_620, true)
+                .await
+                .unwrap();
+            assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.tunnel.restart_starts.load(Ordering::SeqCst), 0);
+        }
+        if matches!(repair, Repair::Cancel) {
+            continue;
+        }
+        assert!(
+            run(1_621, 11).await.unwrap(),
+            "{repair:?} did not retry on the fresh wake"
+        );
+        assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.tunnel.restart_starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture.tunnel.status().await.unwrap(),
+            TunnelStatus::Running
+        );
+    }
 }

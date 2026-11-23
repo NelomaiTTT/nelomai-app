@@ -591,13 +591,17 @@ impl AppDiagnostics {
         connection_id: &str,
         sample: &TunnelMetrics,
         previous: Option<&TunnelMetrics>,
+        ip_packet_deltas: Option<(u64, u64)>,
     ) -> Option<TunnelMetricsObservation> {
         #[cfg(desktop)]
         {
-            match self
-                .network_incidents
-                .observe(connection_id, sample, previous, now_unix())
-            {
+            match self.network_incidents.observe_with_ip_activity(
+                connection_id,
+                sample,
+                previous,
+                now_unix(),
+                ip_packet_deltas,
+            ) {
                 Ok(result) => {
                     if let Some(error_kind) = result.persistence_error_kind {
                         self.record_named(
@@ -630,8 +634,39 @@ impl AppDiagnostics {
         }
         #[cfg(not(desktop))]
         {
-            let _ = (connection_id, sample, previous);
+            let _ = (connection_id, sample, previous, ip_packet_deltas);
             None
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn restart_tunnel_ip_observation(&self, connection_id: &str) {
+        if let Err(error) = self.network_incidents.restart_ip_observation(connection_id) {
+            self.record_named(
+                "diagnostics.network_incident_reset_failed",
+                Some(connection_id),
+                None,
+                Some(&error.kind().to_string()),
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn confirm_tunnel_ip_recovery(&self, connection_id: &str, observed_at: i64) {
+        let error = match self
+            .network_incidents
+            .confirm_ip_recovery(connection_id, observed_at)
+        {
+            Ok(result) => result.persistence_error_kind,
+            Err(error) => Some(error.kind()),
+        };
+        if let Some(error) = error {
+            self.record_named(
+                "diagnostics.network_incident_write_failed",
+                Some(connection_id),
+                None,
+                Some(&error.to_string()),
+            );
         }
     }
 

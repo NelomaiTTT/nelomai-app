@@ -250,6 +250,29 @@ async fn legacy_cleanup_stop_never_acquires_authority_over_current_pair() {
     ));
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn stall_rebind_dispatches_one_ordinary_request_and_never_rebinds_a_pair() {
+    use nelomai_client_tunnel::StallRebindGuard;
+    use std::time::{Duration, Instant};
+
+    for (response, expected_ok) in [
+        (Response::success(Some(ServiceTunnelState::Running)), true),
+        (Response::failure("redundancy_session_owned"), false),
+    ] {
+        let controller = controller([response]);
+        let guard = StallRebindGuard::new(Instant::now() + Duration::from_secs(3), || true);
+        assert_eq!(
+            controller.rebind_udp_for_stall(guard).await.is_ok(),
+            expected_ok
+        );
+        assert!(matches!(
+            controller.transport().requests.lock().unwrap().as_slice(),
+            [Request::RebindUdp { .. }]
+        ));
+    }
+}
+
 #[tokio::test]
 async fn generic_rebind_uses_fresh_scoped_network_change_and_retains_legacy_path() {
     let mut running = snapshot();

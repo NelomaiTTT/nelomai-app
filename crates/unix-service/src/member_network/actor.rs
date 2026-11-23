@@ -400,6 +400,13 @@ impl<B: ServiceTunnelBackend, F: PairFactory> ServiceTunnelBackend for Composite
         }
         self.single.metrics(probe)
     }
+    #[cfg(target_os = "macos")]
+    fn macos_probe_path(&self) -> Option<crate::MacosProbePath> {
+        if self.pair.is_some() {
+            return None;
+        }
+        self.single.macos_probe_path()
+    }
     fn diagnostics(&self) -> Result<String, ServiceError> {
         if let Some(report) = &self.diagnostic {
             return serde_json::to_string(report).map_err(|_| failed());

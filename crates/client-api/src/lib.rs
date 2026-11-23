@@ -1142,6 +1142,16 @@ impl ClientApi {
         self.http.reset()
     }
 
+    /// A bounded check of the desktop control path, without reading auth or
+    /// using the tunnel's data-plane probe client.
+    #[cfg(any(target_os = "macos", all(test, any(target_os = "linux", windows))))]
+    pub async fn probe_wake_control_network(&self) -> bool {
+        let Some(control) = &self.http.control else {
+            return false;
+        };
+        control.probe_wake_health().await
+    }
+
     /// Public release metadata is independent of login, refresh and runtime admission.
     pub async fn release_history(
         &self,

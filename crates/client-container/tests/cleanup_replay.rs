@@ -173,6 +173,7 @@ impl Fixture {
 }
 fn pending(lease: &str) -> StoredPendingCompensationStop {
     StoredPendingCompensationStop {
+        inferred_release: false,
         operation_id: "test-operation".into(),
         lease_id: lease.into(),
         accept_warm: false,

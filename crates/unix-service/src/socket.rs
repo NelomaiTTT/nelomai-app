@@ -4,6 +4,8 @@ use crate::{
     ServiceTunnelBackend, TunnelRequestHandler, MAX_FRAME_SIZE,
 };
 use async_trait::async_trait;
+#[cfg(target_os = "macos")]
+use nelomai_client_tunnel::{StallRebindGuard, WakeDispatchGuard};
 use nelomai_contracts::dispatcher::{BrokerPolicy, ProcessDispatcher};
 use std::fs;
 use std::io::{self, Read, Write};
@@ -111,7 +113,12 @@ impl UnixSocketTransport {
         &self.path
     }
 
-    fn exchange_blocking(&self, request: Request) -> Result<Response, ServiceError> {
+    fn exchange_blocking(
+        &self,
+        request: Request,
+        check_dispatch: impl Fn() -> Result<(), ServiceError>,
+    ) -> Result<Response, ServiceError> {
+        check_dispatch()?;
         if let Some(binding) = &self.common {
             return binding
                 .with_identity(
@@ -122,17 +129,40 @@ impl UnixSocketTransport {
                             | Request::Status { .. }
                             | Request::Version { .. }
                     ),
-                    |expected| Ok(self.exchange_bound(request, expected)),
+                    |expected| Ok(self.exchange_bound(request, expected, &check_dispatch)),
                 )
                 .map_err(|_| ServiceError::UnauthorizedClient)?;
         }
-        self.exchange_bound(request, None)
+        self.exchange_bound(request, None, &check_dispatch)
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn exchange_guarded(
+        &self,
+        request: Request,
+        can_dispatch: impl Fn() -> bool + Send + 'static,
+        cancelled: ServiceError,
+    ) -> Result<Response, ServiceError> {
+        let transport = self.clone();
+        let (worker, _lifetime) = tokio::sync::oneshot::channel::<()>();
+        tokio::task::spawn_blocking(move || {
+            transport.exchange_blocking(request, || {
+                if can_dispatch() && !worker.is_closed() {
+                    Ok(())
+                } else {
+                    Err(cancelled.clone())
+                }
+            })
+        })
+        .await
+        .map_err(|_| ServiceError::Backend("helper_task_failed".into()))?
     }
 
     fn exchange_bound(
         &self,
         mut request: Request,
         expected: Option<&nelomai_contracts::dispatcher::EngineIdentity>,
+        check_dispatch: &impl Fn() -> Result<(), ServiceError>,
     ) -> Result<Response, ServiceError> {
         if request.protocol_version() != crate::PROTOCOL_VERSION {
             return Err(ServiceError::UnsupportedProtocol);
@@ -206,10 +236,15 @@ impl UnixSocketTransport {
                     }
                 }
             } else {
-                let started = dispatcher_exchange(&d::DispatcherRequest::Start {
-                    contract_version: 1,
-                    identity: identity.clone(),
-                })?;
+                check_dispatch()?;
+                let started = dispatcher_exchange_at_guarded(
+                    dispatcher_path,
+                    &d::DispatcherRequest::Start {
+                        contract_version: 1,
+                        identity: identity.clone(),
+                    },
+                    check_dispatch,
+                )?;
                 if !started.ok
                     || !started.running
                     || started.contract_version != 1
@@ -225,9 +260,13 @@ impl UnixSocketTransport {
         if matches!(request, Request::StopIfUnowned { .. }) {
             request = Request::stop();
         }
+        check_dispatch()?;
         let mut stream = UnixStream::connect(&self.path).map_err(transport_error)?;
         configure_stream(&stream)?;
         let frame = encode_request(&request)?;
+        // A cancellation may have arrived while connecting to the private
+        // engine. A request that has already started writing can finish.
+        check_dispatch()?;
         stream.write_all(&frame).map_err(transport_error)?;
         let response = read_frame(&mut stream)?;
         decode_response(&response)
@@ -244,11 +283,21 @@ fn dispatcher_exchange_at(
     path: &Path,
     request: &nelomai_contracts::dispatcher::DispatcherRequest,
 ) -> Result<nelomai_contracts::dispatcher::DispatcherResponse, ServiceError> {
+    dispatcher_exchange_at_guarded(path, request, || Ok(()))
+}
+
+fn dispatcher_exchange_at_guarded(
+    path: &Path,
+    request: &nelomai_contracts::dispatcher::DispatcherRequest,
+    check_dispatch: impl FnOnce() -> Result<(), ServiceError>,
+) -> Result<nelomai_contracts::dispatcher::DispatcherResponse, ServiceError> {
     use nelomai_contracts::dispatcher as d;
     let mut stream = UnixStream::connect(path).map_err(dispatcher_transport_error)?;
     configure_stream(&stream)?;
+    let frame = d::encode_frame(request).map_err(transport_error)?;
+    check_dispatch()?;
     stream
-        .write_all(&d::encode_frame(request).map_err(transport_error)?)
+        .write_all(&frame)
         .map_err(dispatcher_transport_error)?;
     let frame =
         d::read_frame(&mut stream, d::MAX_DISPATCHER_FRAME).map_err(dispatcher_transport_error)?;
@@ -271,9 +320,39 @@ fn dispatcher_exchange_at(
 impl ServiceTransport for UnixSocketTransport {
     async fn exchange(&self, request: Request) -> Result<Response, ServiceError> {
         let transport = self.clone();
-        tokio::task::spawn_blocking(move || transport.exchange_blocking(request))
+        tokio::task::spawn_blocking(move || transport.exchange_blocking(request, || Ok(())))
             .await
             .map_err(|_| ServiceError::Backend("helper_task_failed".to_string()))?
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn exchange_wake_mutation(
+        &self,
+        request: Request,
+        guard: WakeDispatchGuard,
+    ) -> Result<Response, ServiceError> {
+        if !request.allows_wake_dispatch() {
+            return Err(ServiceError::InvalidRequest);
+        }
+        self.exchange_guarded(
+            request,
+            move || guard.is_current(),
+            ServiceError::WakeDispatchDeferred,
+        )
+        .await
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn exchange_stall_rebind(
+        &self,
+        guard: StallRebindGuard,
+    ) -> Result<Response, ServiceError> {
+        self.exchange_guarded(
+            Request::rebind_udp(),
+            move || guard.is_current(),
+            ServiceError::Backend("udp_rebind_cancelled".into()),
+        )
+        .await
     }
 }
 

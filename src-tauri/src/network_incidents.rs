@@ -4,7 +4,7 @@ use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
@@ -14,6 +14,7 @@ const MAX_DETAILED_INCIDENTS: usize = 3;
 const MINIMUM_SESSION_AGE_SECONDS: i64 = 10;
 const STALL_SECONDS: i64 = 5;
 const MINIMUM_CANDIDATE_SENT_BYTES: u64 = 1_024;
+const MINIMUM_CANDIDATE_SENT_IP_PACKETS: u64 = 3;
 const MINIMUM_CANDIDATE_ACTIVE_SAMPLES: u8 = 2;
 const CANDIDATE_INACTIVITY_SECONDS: i64 = 10;
 const MAXIMUM_LEGACY_ADDITIONAL_INCIDENTS: u64 = 100_000;
@@ -32,9 +33,16 @@ fn is_false(value: &bool) -> bool {
 pub(crate) struct NetworkIncidentRecorder {
     path: PathBuf,
     detector: Mutex<Detector>,
+    pending_recoveries: Mutex<VecDeque<IncidentRecovery>>,
     archive_gate: Mutex<()>,
     current_device_id: Mutex<Option<String>>,
     startup_warning: Option<String>,
+}
+
+struct IncidentRecovery {
+    lease_id: String,
+    incident_id: String,
+    recovered_at: i64,
 }
 
 pub(crate) struct NetworkIncidentSnapshot {
@@ -60,11 +68,21 @@ struct Detector {
     connection_id: Option<String>,
     started_at_unix: i64,
     candidate_started_at_unix: Option<i64>,
-    candidate_sent_bytes: u64,
+    candidate_sent: u64,
     candidate_active_samples: u8,
     candidate_last_activity_at_unix: Option<i64>,
-    open_incident_at_unix: Option<i64>,
+    open_incident_id: Option<String>,
+    open_incident_needs_evidence: bool,
     samples: VecDeque<NetworkIncidentSample>,
+}
+
+impl Detector {
+    fn clear_candidate(&mut self) {
+        self.candidate_started_at_unix = None;
+        self.candidate_sent = 0;
+        self.candidate_active_samples = 0;
+        self.candidate_last_activity_at_unix = None;
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -153,6 +171,7 @@ impl NetworkIncidentRecorder {
         Ok(Self {
             path,
             detector: Mutex::new(Detector::default()),
+            pending_recoveries: Mutex::new(VecDeque::new()),
             archive_gate: Mutex::new(()),
             current_device_id: Mutex::new(None),
             startup_warning,
@@ -202,12 +221,38 @@ impl NetworkIncidentRecorder {
         Ok(())
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn restart_ip_observation(&self, connection_id: &str) -> io::Result<()> {
+        let mut detector = self
+            .detector
+            .lock()
+            .map_err(|_| io::Error::other("network incident detector lock poisoned"))?;
+        if detector.connection_id.as_deref() == Some(connection_id) {
+            detector.clear_candidate();
+            detector.samples.clear();
+            detector.open_incident_needs_evidence = detector.open_incident_id.is_some();
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn observe(
         &self,
         connection_id: &str,
         sample: &TunnelMetrics,
         previous: Option<&TunnelMetrics>,
         now_unix: i64,
+    ) -> io::Result<NetworkIncidentObservationResult> {
+        self.observe_with_ip_activity(connection_id, sample, previous, now_unix, None)
+    }
+
+    pub(crate) fn observe_with_ip_activity(
+        &self,
+        connection_id: &str,
+        sample: &TunnelMetrics,
+        previous: Option<&TunnelMetrics>,
+        now_unix: i64,
+        ip_packet_deltas: Option<(u64, u64)>,
     ) -> io::Result<NetworkIncidentObservationResult> {
         let mut detector = self
             .detector
@@ -243,48 +288,27 @@ impl NetworkIncidentRecorder {
             detector.samples.pop_front();
         }
 
-        if received_delta > 0 {
-            detector.candidate_started_at_unix = None;
-            detector.candidate_sent_bytes = 0;
-            detector.candidate_active_samples = 0;
-            detector.candidate_last_activity_at_unix = None;
-            if let Some(detected_at) = detector.open_incident_at_unix.take() {
-                drop(detector);
-                let result = self.record_recovery(connection_id, detected_at, now_unix);
-                if result.is_err() {
-                    if let Ok(mut detector) = self.detector.lock() {
-                        if detector.connection_id.as_deref() == Some(connection_id)
-                            && detector.open_incident_at_unix.is_none()
-                        {
-                            detector.open_incident_at_unix = Some(detected_at);
-                        }
-                    }
-                }
-                return Ok(NetworkIncidentObservationResult {
-                    observation: NetworkIncidentObservation::Recovered,
-                    persistence_error_kind: result.err().map(|error| error.kind()),
-                });
-            }
-            return Ok(NetworkIncidentObservationResult {
-                observation: NetworkIncidentObservation::Unchanged,
-                persistence_error_kind: None,
-            });
+        // On macOS, the kernel can round interface byte counters for third-party
+        // processes. Packet deltas distinguish IP traffic from UAPI control
+        // traffic without changing the byte figures shown in the report.
+        let (sent, received, minimum_sent) = match ip_packet_deltas {
+            Some((sent, received)) => (sent, received, MINIMUM_CANDIDATE_SENT_IP_PACKETS),
+            None => (sent_delta, received_delta, MINIMUM_CANDIDATE_SENT_BYTES),
+        };
+        if received > 0 {
+            return Ok(self.finish_recovery(detector, connection_id, now_unix));
         }
-        if sent_delta > 0 {
+        if sent > 0 {
             detector.candidate_started_at_unix.get_or_insert(now_unix);
-            detector.candidate_sent_bytes =
-                detector.candidate_sent_bytes.saturating_add(sent_delta);
+            detector.candidate_sent = detector.candidate_sent.saturating_add(sent);
             detector.candidate_active_samples = detector.candidate_active_samples.saturating_add(1);
             detector.candidate_last_activity_at_unix = Some(now_unix);
-        } else if detector.open_incident_at_unix.is_none()
+        } else if (detector.open_incident_id.is_none() || detector.open_incident_needs_evidence)
             && detector
                 .candidate_last_activity_at_unix
                 .is_some_and(|last| now_unix.saturating_sub(last) > CANDIDATE_INACTIVITY_SECONDS)
         {
-            detector.candidate_started_at_unix = None;
-            detector.candidate_sent_bytes = 0;
-            detector.candidate_active_samples = 0;
-            detector.candidate_last_activity_at_unix = None;
+            detector.clear_candidate();
         }
         let Some(candidate_at) = detector.candidate_started_at_unix else {
             return Ok(NetworkIncidentObservationResult {
@@ -292,10 +316,10 @@ impl NetworkIncidentRecorder {
                 persistence_error_kind: None,
             });
         };
-        if detector.open_incident_at_unix.is_some()
+        if (detector.open_incident_id.is_some() && !detector.open_incident_needs_evidence)
             || now_unix.saturating_sub(detector.started_at_unix) < MINIMUM_SESSION_AGE_SECONDS
             || now_unix.saturating_sub(candidate_at) < STALL_SECONDS
-            || detector.candidate_sent_bytes < MINIMUM_CANDIDATE_SENT_BYTES
+            || detector.candidate_sent < minimum_sent
             || detector.candidate_active_samples < MINIMUM_CANDIDATE_ACTIVE_SAMPLES
         {
             return Ok(NetworkIncidentObservationResult {
@@ -303,17 +327,88 @@ impl NetworkIncidentRecorder {
                 persistence_error_kind: None,
             });
         }
-        detector.open_incident_at_unix = Some(now_unix);
+        if detector.open_incident_needs_evidence {
+            detector.open_incident_needs_evidence = false;
+            return Ok(NetworkIncidentObservationResult {
+                observation: NetworkIncidentObservation::Detected,
+                persistence_error_kind: None,
+            });
+        }
+        let incident_id = Uuid::new_v4().to_string();
+        detector.open_incident_id = Some(incident_id.clone());
         let samples = detector.samples.iter().cloned().collect();
         drop(detector);
         let persistence_error_kind = self
-            .record_detection(connection_id, now_unix, samples)
+            .record_detection(connection_id, incident_id, now_unix, samples)
             .err()
             .map(|error| error.kind());
         Ok(NetworkIncidentObservationResult {
             observation: NetworkIncidentObservation::Detected,
             persistence_error_kind,
         })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn confirm_ip_recovery(
+        &self,
+        connection_id: &str,
+        now_unix: i64,
+    ) -> io::Result<NetworkIncidentObservationResult> {
+        let detector = self
+            .detector
+            .lock()
+            .map_err(|_| io::Error::other("network incident detector lock poisoned"))?;
+        Ok(self.finish_recovery(detector, connection_id, now_unix))
+    }
+
+    fn finish_recovery(
+        &self,
+        mut detector: MutexGuard<'_, Detector>,
+        connection_id: &str,
+        now_unix: i64,
+    ) -> NetworkIncidentObservationResult {
+        if detector.connection_id.as_deref() != Some(connection_id) {
+            return NetworkIncidentObservationResult {
+                observation: NetworkIncidentObservation::Unchanged,
+                persistence_error_kind: None,
+            };
+        }
+        detector.clear_candidate();
+        detector.open_incident_needs_evidence = false;
+        let incident_id = detector.open_incident_id.take();
+        drop(detector);
+        let Some(incident_id) = incident_id else {
+            return NetworkIncidentObservationResult {
+                observation: NetworkIncidentObservation::Unchanged,
+                persistence_error_kind: None,
+            };
+        };
+        // A failure to write diagnostics must not keep the detector armed
+        // against the old outage and prevent detection of the next one.
+        NetworkIncidentObservationResult {
+            observation: NetworkIncidentObservation::Recovered,
+            persistence_error_kind: self
+                .flush_recoveries(Some(IncidentRecovery {
+                    lease_id: connection_id.to_owned(),
+                    incident_id,
+                    recovered_at: now_unix,
+                }))
+                .err()
+                .map(|error| error.kind()),
+        }
+    }
+
+    fn flush_recoveries(&self, recovery: Option<IncidentRecovery>) -> io::Result<()> {
+        let mut pending = self
+            .pending_recoveries
+            .lock()
+            .map_err(|_| io::Error::other("network incident recovery lock poisoned"))?;
+        pending.extend(recovery);
+        while let Some(entry) = pending.front() {
+            self.record_recovery(&entry.lease_id, &entry.incident_id, entry.recovered_at)?;
+            pending.pop_front();
+        }
+        Ok(())
     }
 
     pub(crate) fn snapshot(
@@ -323,6 +418,7 @@ impl NetworkIncidentRecorder {
         started_at_unix: Option<i64>,
         ended_at_unix: Option<i64>,
     ) -> io::Result<Option<NetworkIncidentSnapshot>> {
+        self.flush_recoveries(None)?;
         let _archive_guard = self.lock_archive()?;
         let archive = read_archive(&self.path)?;
         let mut selected = archive;
@@ -420,6 +516,7 @@ impl NetworkIncidentRecorder {
     fn record_detection(
         &self,
         connection_id: &str,
+        incident_id: String,
         detected_at_unix: i64,
         samples: Vec<NetworkIncidentSample>,
     ) -> io::Result<()> {
@@ -429,7 +526,7 @@ impl NetworkIncidentRecorder {
         let session = archive_session(&mut archive, connection_id, device_id.as_deref());
         if session.detailed.len() < MAX_DETAILED_INCIDENTS {
             session.detailed.push(NetworkIncident {
-                id: Uuid::new_v4().to_string(),
+                id: incident_id,
                 kind: "suspected_data_path_stall".to_string(),
                 detected_at_unix,
                 recovered_at_unix: None,
@@ -439,7 +536,7 @@ impl NetworkIncidentRecorder {
             });
         } else {
             session.additional.push(NetworkIncidentSummary {
-                id: Uuid::new_v4().to_string(),
+                id: incident_id,
                 kind: "suspected_data_path_stall".to_string(),
                 detected_at_unix,
                 recovered_at_unix: None,
@@ -453,7 +550,7 @@ impl NetworkIncidentRecorder {
     fn record_recovery(
         &self,
         connection_id: &str,
-        detected_at_unix: i64,
+        incident_id: &str,
         recovered_at_unix: i64,
     ) -> io::Result<()> {
         let _archive_guard = self.lock_archive()?;
@@ -466,12 +563,16 @@ impl NetworkIncidentRecorder {
                 session
                     .detailed
                     .iter_mut()
-                    .find(|incident| incident.detected_at_unix == detected_at_unix)
+                    .find(|incident| incident.id == incident_id)
             })
         {
             incident.recovered_at_unix = Some(recovered_at_unix);
-            incident.duration_ms =
-                Some(recovered_at_unix.saturating_sub(detected_at_unix).max(0) as u64 * 1_000);
+            incident.duration_ms = Some(
+                recovered_at_unix
+                    .saturating_sub(incident.detected_at_unix)
+                    .max(0) as u64
+                    * 1_000,
+            );
             incident.open = false;
             write_archive(&self.path, &archive)?;
         } else if let Some(incident) = archive
@@ -482,12 +583,16 @@ impl NetworkIncidentRecorder {
                 session
                     .additional
                     .iter_mut()
-                    .find(|incident| incident.detected_at_unix == detected_at_unix)
+                    .find(|incident| incident.id == incident_id)
             })
         {
             incident.recovered_at_unix = Some(recovered_at_unix);
-            incident.duration_ms =
-                Some(recovered_at_unix.saturating_sub(detected_at_unix).max(0) as u64 * 1_000);
+            incident.duration_ms = Some(
+                recovered_at_unix
+                    .saturating_sub(incident.detected_at_unix)
+                    .max(0) as u64
+                    * 1_000,
+            );
             incident.open = false;
             write_archive(&self.path, &archive)?;
         }
@@ -898,6 +1003,118 @@ mod tests {
         assert!(incident["samples"].as_array().unwrap().len() <= MAX_SAMPLES);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn verified_replacement_can_detect_another_outage_on_the_same_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let recorder = NetworkIncidentRecorder::new(directory.path()).unwrap();
+        let sample = TunnelMetrics::default();
+        let detect = |first, last| {
+            let mut detected = false;
+            for second in first..=last {
+                let observation = recorder
+                    .observe_with_ip_activity("lease", &sample, None, second, Some((1, 0)))
+                    .unwrap();
+                detected |= observation.observation == NetworkIncidentObservation::Detected;
+            }
+            detected
+        };
+        assert!(detect(0, 12));
+        assert_eq!(
+            recorder
+                .confirm_ip_recovery("another-lease", 13)
+                .unwrap()
+                .observation,
+            NetworkIncidentObservation::Unchanged
+        );
+        assert_eq!(
+            recorder
+                .confirm_ip_recovery("lease", 13)
+                .unwrap()
+                .observation,
+            NetworkIncidentObservation::Recovered
+        );
+        // The first regular sample of the replacement utun establishes its
+        // baseline and cannot see the earlier successful HTTPS exchange.
+        recorder
+            .observe_with_ip_activity("lease", &sample, None, 14, Some((0, 0)))
+            .unwrap();
+        assert!(detect(15, 24));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn closes_distinct_incidents_with_equal_wall_clock_timestamps() {
+        let directory = tempfile::tempdir().unwrap();
+        let recorder = NetworkIncidentRecorder::new(directory.path()).unwrap();
+        let sample = TunnelMetrics::default();
+        for recovered_at in [11, 12] {
+            for second in 0..10 {
+                recorder
+                    .observe_with_ip_activity("lease", &sample, None, second, Some((1, 0)))
+                    .unwrap();
+            }
+            let detection = recorder
+                .observe_with_ip_activity("lease", &sample, None, 10, Some((1, 0)))
+                .unwrap();
+            assert_eq!(detection.observation, NetworkIncidentObservation::Detected);
+            let recovery = recorder.confirm_ip_recovery("lease", recovered_at).unwrap();
+            assert_eq!(recovery.observation, NetworkIncidentObservation::Recovered);
+        }
+        let snapshot = recorder
+            .snapshot(Some("lease"), None, None, None)
+            .unwrap()
+            .unwrap();
+        let archive: serde_json::Value = serde_json::from_str(&snapshot.payload).unwrap();
+        let incidents = archive["sessions"][0]["detailed"].as_array().unwrap();
+        assert_eq!(incidents.len(), 2);
+        assert_eq!(incidents[0]["recovered_at_unix"], 11);
+        assert_eq!(incidents[1]["recovered_at_unix"], 12);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn verified_recovery_retries_an_archive_write_without_blocking_detection() {
+        let directory = tempfile::tempdir().unwrap();
+        let recorder = NetworkIncidentRecorder::new(directory.path()).unwrap();
+        let path = directory.path().join("network-incidents.json");
+        use std::os::unix::fs::PermissionsExt;
+        let sample = TunnelMetrics::default();
+        let observe = |at| {
+            recorder
+                .observe_with_ip_activity("lease", &sample, None, at, Some((1, 0)))
+                .unwrap()
+                .observation
+        };
+        for second in 0..10 {
+            assert_eq!(observe(second), NetworkIncidentObservation::Unchanged);
+        }
+        assert_eq!(observe(10), NetworkIncidentObservation::Detected);
+        let writable = fs::metadata(directory.path()).unwrap().permissions();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let recovery = recorder.confirm_ip_recovery("lease", 11).unwrap();
+        assert_eq!(recovery.observation, NetworkIncidentObservation::Recovered);
+        assert!(recovery.persistence_error_kind.is_some());
+        assert!(read_archive(&path).is_ok());
+        assert!(recorder.snapshot(Some("lease"), None, None, None).is_err());
+        for second in 12..17 {
+            assert_eq!(observe(second), NetworkIncidentObservation::Unchanged);
+        }
+        fs::set_permissions(directory.path(), writable).unwrap();
+        assert_eq!(observe(17), NetworkIncidentObservation::Detected);
+        let snapshot = recorder
+            .snapshot(Some("lease"), None, None, None)
+            .unwrap()
+            .unwrap();
+        let archive: serde_json::Value = serde_json::from_str(&snapshot.payload).unwrap();
+        let incidents = archive["sessions"][0]["detailed"].as_array().unwrap();
+        assert_eq!(incidents.len(), 2);
+        assert!(incidents.iter().any(|item| item["recovered_at_unix"] == 11));
+        assert!(incidents
+            .iter()
+            .any(|item| item["detected_at_unix"] == 17 && item["open"] == true));
+    }
+
     #[test]
     fn detection_survives_an_archive_write_failure() {
         let directory = tempfile::tempdir().unwrap();
@@ -925,14 +1142,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let recorder = NetworkIncidentRecorder::new(directory.path()).unwrap();
         recorder
-            .record_detection("lease-1", 10, Vec::new())
+            .record_detection("lease-1", "fixture-10".into(), 10, Vec::new())
             .unwrap();
         let materialized = recorder
             .snapshot(Some("lease-1"), None, Some(0), Some(20))
             .unwrap()
             .unwrap();
         recorder
-            .record_detection("lease-1", 20, Vec::new())
+            .record_detection("lease-1", "fixture-20".into(), 20, Vec::new())
             .unwrap();
 
         recorder
@@ -953,14 +1170,16 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let recorder = NetworkIncidentRecorder::new(directory.path()).unwrap();
         recorder
-            .record_detection("lease-1", 10, Vec::new())
+            .record_detection("lease-1", "fixture-10".into(), 10, Vec::new())
             .unwrap();
         let checkpoint = recorder
             .snapshot(Some("lease-1"), None, Some(0), Some(20))
             .unwrap()
             .unwrap();
 
-        recorder.record_recovery("lease-1", 10, 30).unwrap();
+        recorder
+            .record_recovery("lease-1", "fixture-10", 30)
+            .unwrap();
         recorder
             .prune_snapshot("lease-1", &checkpoint, true)
             .unwrap();
@@ -990,10 +1209,19 @@ mod tests {
         let recorder = NetworkIncidentRecorder::new(directory.path()).unwrap();
         for detected_at in [10, 20, 30, 40, 50] {
             recorder
-                .record_detection("lease-1", detected_at, Vec::new())
+                .record_detection(
+                    "lease-1",
+                    format!("fixture-{detected_at}"),
+                    detected_at,
+                    Vec::new(),
+                )
                 .unwrap();
             recorder
-                .record_recovery("lease-1", detected_at, detected_at + 1)
+                .record_recovery(
+                    "lease-1",
+                    &format!("fixture-{detected_at}"),
+                    detected_at + 1,
+                )
                 .unwrap();
         }
 
@@ -1024,7 +1252,12 @@ mod tests {
         let recorder = NetworkIncidentRecorder::new(directory.path()).unwrap();
         for detected_at in 0..500 {
             recorder
-                .record_detection("lease-1", detected_at, Vec::new())
+                .record_detection(
+                    "lease-1",
+                    format!("fixture-{detected_at}"),
+                    detected_at,
+                    Vec::new(),
+                )
                 .unwrap();
         }
 
@@ -1211,11 +1444,11 @@ mod tests {
         let recorder = NetworkIncidentRecorder::new(directory.path()).unwrap();
         recorder.set_current_device("device-1").unwrap();
         recorder
-            .record_detection("lease-1", 10, Vec::new())
+            .record_detection("lease-1", "fixture-10".into(), 10, Vec::new())
             .unwrap();
         recorder.set_current_device("device-2").unwrap();
         recorder
-            .record_detection("lease-2", 20, Vec::new())
+            .record_detection("lease-2", "fixture-20".into(), 20, Vec::new())
             .unwrap();
 
         let payload = recorder

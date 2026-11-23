@@ -1,5 +1,8 @@
+#[cfg(target_os = "macos")]
+use crate::MacosStartWake;
 use crate::{
     ClientCore, CoreApi, CoreApiError, CoreError, CoreLogger, Phase, SplitTunnelWarningKind,
+    StalledDataPlaneRecoveryOutcome, StalledDataPlaneRestartOutcome, StartCancellationEpoch,
 };
 use futures::{stream, StreamExt};
 use nelomai_client_api::AccessSnapshot;
@@ -7,13 +10,18 @@ use nelomai_client_storage::{
     RuntimeStateStore, StoredSplitTunnelDomainResolution, StoredSplitTunnelState,
 };
 use nelomai_client_tunnel::{
-    DesktopTunnelOptions, QuickConnection, TunnelCapabilities, TunnelOptions, TunnelPlatform,
+    DesktopTunnelOptions, QuickConnection, QuickReconnect, TunnelCapabilities, TunnelConfiguration,
+    TunnelOptions, TunnelPlatform, TunnelStartRequest, TunnelStatus, TunnelTransport,
 };
+#[cfg(target_os = "macos")]
+use nelomai_client_tunnel::{TunnelError, WakeDispatchGuard, WAKE_DISPATCH_DEFERRED};
 use nelomai_contracts::{
     Connection, Layer, RouteMode, SplitTunnelAddressRuleKind, SplitTunnelAddressRuleScope,
     SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelMode,
     SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate,
 };
+#[cfg(target_os = "macos")]
+use std::sync::atomic::Ordering;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -58,6 +66,16 @@ pub(crate) struct DesktopDomainRefresh {
     next_attempt: i64,
 }
 
+#[cfg(not(target_os = "android"))]
+pub(super) enum RetainedRefresh<'a> {
+    Tick(
+        &'a nelomai_client_tunnel::redundancy::protocol::Snapshot,
+        StartCancellationEpoch,
+    ),
+    Cached(StartCancellationEpoch),
+    Apply(DomainResolutionMode, StartCancellationEpoch),
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct RunningSplitTunnelOptions {
     pub(crate) options: TunnelOptions,
@@ -66,6 +84,161 @@ pub(crate) struct RunningSplitTunnelOptions {
     available_to: Option<(String, crate::StartCancellationEpoch)>,
     native_confirmed: bool,
     equivalent_policy_hash: Option<String>,
+}
+
+pub(crate) struct StalledLocalRestart {
+    connection: Connection,
+    epoch: StartCancellationEpoch,
+    configuration: TunnelConfiguration,
+    options: TunnelOptions,
+    step: StalledLocalRestartStep,
+    #[cfg(target_os = "macos")]
+    route: Option<DeferredRouteApply>,
+}
+
+#[cfg(target_os = "macos")]
+struct DeferredRouteApply {
+    fallback: Option<TunnelOptions>,
+    policy: Option<DeferredPolicyReport>,
+    resumed_at_unix: i64,
+    // Only a fingerprint sampled in the same wake as the dispatched Start
+    // can attest to the physical routes installed by that Start.
+    fingerprint: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct DeferredPolicyReport {
+    requested_hash: String,
+    applied_options_hash: Option<String>,
+    previous_had_policy: bool,
+    rollback: bool,
+    proposed_domains: Vec<StoredSplitTunnelDomainResolution>,
+    rollback_domains: Vec<StoredSplitTunnelDomainResolution>,
+}
+
+#[cfg(target_os = "macos")]
+impl DeferredRouteApply {
+    fn record(
+        self,
+        state: &mut StoredSplitTunnelState,
+        options: Option<&TunnelOptions>,
+    ) -> Result<Option<&'static str>, CoreError> {
+        retire_route_facts(state);
+        state.applied_physical_network_fingerprint = options.and(self.fingerprint);
+        let installed = options.and_then(|options| options.policy_hash.as_deref());
+        if let Some(policy) = state
+            .cached_policy
+            .iter()
+            .chain(state.previous_working_policy.iter())
+            .find(|policy| {
+                Some(policy.policy_hash.as_str()) == installed
+                    && !policy_is_superseded(state, policy)
+            })
+            .cloned()
+        {
+            record_working_policy(state, &policy);
+        }
+        let Some(report) = self.policy else {
+            return Ok(None);
+        };
+        let Some(policy) = state
+            .cached_policy
+            .as_ref()
+            .filter(|policy| {
+                policy.policy_hash == report.requested_hash && !policy_is_superseded(state, policy)
+            })
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let mut result = applied_policy_result(&policy, self.resumed_at_unix)?;
+        let error = if !report.rollback
+            && options.is_some()
+            && installed == report.applied_options_hash.as_deref()
+        {
+            state.domain_resolutions = report.proposed_domains;
+            record_working_policy(state, &policy);
+            clear_policy_failure(state);
+            None
+        } else {
+            let (status, code) = if options.is_none() {
+                (
+                    SplitTunnelApplyStatus::Failed,
+                    "split_tunnel_rollback_failed",
+                )
+            } else if report.previous_had_policy && installed.is_none() {
+                state.previous_working_policy = None;
+                state.domain_resolutions.clear();
+                (SplitTunnelApplyStatus::Failed, DEFAULT_ROUTES_RESTORED)
+            } else {
+                state.domain_resolutions = report.rollback_domains;
+                (
+                    SplitTunnelApplyStatus::RolledBack,
+                    "split_tunnel_apply_failed",
+                )
+            };
+            mark_policy_failure(state, &policy, self.resumed_at_unix);
+            result.status = status;
+            result.error_code = Some(code.to_owned());
+            Some(code)
+        };
+        state.pending_apply_results.push(result);
+        Ok(error)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RouteRestart<'a> {
+    connection: &'a Connection,
+    epoch: StartCancellationEpoch,
+    configuration: &'a str,
+    guard: &'a tokio::sync::MutexGuard<'a, ()>,
+    #[cfg(target_os = "macos")]
+    policy: Option<&'a DeferredPolicyReport>,
+    #[cfg(target_os = "macos")]
+    now_unix: i64,
+    #[cfg(target_os = "macos")]
+    rollback: bool,
+}
+
+impl RouteRestart<'_> {
+    fn for_rollback(self) -> Self {
+        Self {
+            #[cfg(target_os = "macos")]
+            rollback: true,
+            ..self
+        }
+    }
+}
+
+struct PolicyApplyContext {
+    now_unix: i64,
+    domain_resolution: DomainResolutionMode,
+    cancel_epoch: StartCancellationEpoch,
+}
+
+enum RestartNetwork<'a> {
+    Keep,
+    Observed(Option<&'a str>),
+}
+
+enum StalledLocalRestartStep {
+    Start { retry_allowed: bool },
+    Verify,
+    Failed(CoreError),
+}
+
+impl StalledLocalRestart {
+    pub(crate) fn matches(
+        &self,
+        connection: Option<&Connection>,
+        epoch: StartCancellationEpoch,
+    ) -> bool {
+        self.epoch == epoch
+            && connection
+                .is_some_and(|current| same_local_recovery_execution(current, &self.connection))
+    }
 }
 
 impl RunningSplitTunnelOptions {
@@ -799,8 +972,8 @@ enum ConnectedPolicyApplyOutcome {
     PreparationFailed(String),
     LocalOnly,
     Unchanged,
-    #[cfg(not(target_os = "android"))]
     Deferred,
+    StopDeferred,
     ConfigurationUnavailable,
     AppliedWithoutReconnect,
     Applied,
@@ -811,6 +984,10 @@ enum ConnectedPolicyApplyOutcome {
 }
 
 impl ConnectedPolicyApplyOutcome {
+    fn retry_revision(&self, allowed: &(impl Fn() -> bool + Sync)) -> bool {
+        matches!(self, Self::StopDeferred) || (matches!(self, Self::Deferred) && !allowed())
+    }
+
     fn reconnected(self) -> bool {
         matches!(
             self,
@@ -825,8 +1002,7 @@ impl ConnectedPolicyApplyOutcome {
             | Self::LocalOnly
             | Self::AppliedWithoutReconnect
             | Self::Applied => None,
-            #[cfg(not(target_os = "android"))]
-            Self::Deferred => Some("split_tunnel_apply_deferred"),
+            Self::Deferred | Self::StopDeferred => Some("split_tunnel_apply_deferred"),
             Self::ConfigurationUnavailable => Some("split_tunnel_saved_connection_unavailable"),
             Self::RolledBack => Some("split_tunnel_apply_failed"),
             Self::DefaultRoutesRestored => Some(DEFAULT_ROUTES_RESTORED),
@@ -918,8 +1094,68 @@ where
     pub async fn poll_physical_network_guarded(
         &self,
         now_unix: i64,
-        allowed: impl Fn() -> bool + Send,
+        allowed: impl Fn() -> bool + Send + Sync,
     ) -> Result<PhysicalNetworkPollOutcome, CoreError> {
+        self.poll_physical_network_with_scope(
+            now_unix,
+            &allowed,
+            #[cfg(target_os = "macos")]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn poll_physical_network_for_wake(
+        &self,
+        now_unix: i64,
+        wake_stamp: Option<i64>,
+        allowed: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Result<PhysicalNetworkPollOutcome, CoreError> {
+        let scope = MacosStartWake::new(wake_stamp, allowed);
+        self.poll_physical_network_with_scope(now_unix, &|| (scope.allowed)(), Some(&scope))
+            .await
+    }
+
+    async fn poll_physical_network_with_scope(
+        &self,
+        now_unix: i64,
+        allowed: &(impl Fn() -> bool + Sync),
+        #[cfg(target_os = "macos")] wake_scope: Option<&MacosStartWake>,
+    ) -> Result<PhysicalNetworkPollOutcome, CoreError> {
+        #[cfg(target_os = "macos")]
+        {
+            let lease = self
+                .active_recovery_episode
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|episode| episode.local_restart.as_ref())
+                .filter(|restart| restart.route.is_some())
+                .map(|restart| restart.connection.lease_id.clone());
+            if let Some(lease) = lease {
+                match self
+                    .resume_stalled_data_plane_restart_with_scope(
+                        &lease,
+                        allowed,
+                        wake_scope,
+                        Some(now_unix),
+                    )
+                    .await?
+                {
+                    Some(StalledDataPlaneRestartOutcome::Reconnected) => {
+                        return Ok(PhysicalNetworkPollOutcome::Reconnected)
+                    }
+                    Some(StalledDataPlaneRestartOutcome::Busy) => {
+                        return Ok(PhysicalNetworkPollOutcome::RetryDeferred)
+                    }
+                    Some(StalledDataPlaneRestartOutcome::Failed(_)) => {
+                        return Ok(PhysicalNetworkPollOutcome::ReconnectFailed)
+                    }
+                    _ => {}
+                }
+            }
+        }
         let cancel_epoch = crate::StartCancellationEpoch(
             self.start_cancel_epoch
                 .load(std::sync::atomic::Ordering::SeqCst),
@@ -1046,16 +1282,53 @@ where
         }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         let options = self.automatic_restart_split_tunnel_options(options).await?;
-        self.retire_split_tunnel_confirmation(&connection, cancel_epoch)
+        if !allowed() {
+            return Ok(PhysicalNetworkPollOutcome::RetryDeferred);
+        }
+        let route = RouteRestart {
+            #[cfg(target_os = "macos")]
+            policy: None,
+            #[cfg(target_os = "macos")]
+            now_unix,
+            #[cfg(target_os = "macos")]
+            rollback: false,
+            connection: &connection,
+            epoch: cancel_epoch,
+            configuration: &configuration,
+            guard: &_connection_guard,
+        };
+        #[cfg(target_os = "macos")]
+        let _route_restart = self.begin_route_restart();
+        let Some(stop_result) = self
+            .stop_for_local_restart(
+                &connection,
+                cancel_epoch,
+                allowed,
+                #[cfg(target_os = "macos")]
+                wake_scope,
+            )
+            .await?
+        else {
+            return Ok(PhysicalNetworkPollOutcome::RetryDeferred);
+        };
+        self.ensure_restarted_tunnel_current(cancel_epoch, &connection)
             .await?;
-        let stop_result = self.tunnel.stop_for_restart().await;
-        self.ensure_offline_start_current(cancel_epoch).await?;
         if let Err(error) = stop_result {
-            let tunnel_stopped = self
-                .tunnel
-                .status()
-                .await
-                .is_ok_and(|status| status != nelomai_client_tunnel::TunnelStatus::Running);
+            let status = self.tunnel.status().await;
+            #[cfg(target_os = "macos")]
+            if !allowed() {
+                self.park_route_restart(
+                    route,
+                    &options,
+                    Some(&options),
+                    StalledLocalRestartStep::Start {
+                        retry_allowed: true,
+                    },
+                )
+                .await?;
+                return Ok(PhysicalNetworkPollOutcome::RetryDeferred);
+            }
+            let tunnel_stopped = status.is_ok_and(|status| status != TunnelStatus::Running);
             let should_report = if tunnel_stopped {
                 self.publish_local_recovery_phase(cancel_epoch, Phase::Stopping, &connection)
                     .await?;
@@ -1084,21 +1357,23 @@ where
         }
         self.publish_local_recovery_phase(cancel_epoch, Phase::Connecting, &connection)
             .await?;
-        let start = |configuration: String, options: TunnelOptions| {
-            self.tunnel
-                .start_for_restart(nelomai_client_tunnel::TunnelStartRequest {
-                    configuration: nelomai_client_tunnel::TunnelConfiguration::new(configuration),
-                    options,
-                    quick_reconnect: nelomai_client_tunnel::QuickReconnect::Disabled,
-                    quick_connection: Some(local_restart_connection(&connection)),
-                    redundancy: None,
-                })
+        let start = |fallback| {
+            self.start_route_attempt(
+                route,
+                &options,
+                fallback,
+                allowed,
+                #[cfg(target_os = "macos")]
+                wake_scope,
+            )
         };
-        let first = start(configuration.clone(), options.clone()).await;
-        self.ensure_offline_start_current(cancel_epoch).await?;
+        let Some(first) = start(Some(&options)).await? else {
+            return Ok(PhysicalNetworkPollOutcome::RetryDeferred);
+        };
         if first.is_err() {
-            let second = start(configuration, options.clone()).await;
-            self.ensure_offline_start_current(cancel_epoch).await?;
+            let Some(second) = start(None).await? else {
+                return Ok(PhysicalNetworkPollOutcome::RetryDeferred);
+            };
             if let Err(error) = second {
                 self.publish_local_recovery_phase(cancel_epoch, Phase::Stopping, &connection)
                     .await?;
@@ -1117,21 +1392,12 @@ where
                 return Ok(PhysicalNetworkPollOutcome::ReconnectFailed);
             }
         }
-        self.publish_recovered_split_tunnel_state(
-            cancel_epoch,
-            connection,
-            options,
-            &_connection_guard,
-        )
-        .await?;
-        self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
-            .await;
-        self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
-            .await;
-        self.physical_network_change
-            .lock()
-            .await
-            .mark_applied(fingerprint.clone());
+        if !self
+            .confirm_route_attempt(route, &options, Some(&fingerprint), allowed)
+            .await?
+        {
+            return Ok(PhysicalNetworkPollOutcome::RetryDeferred);
+        }
         if let Ok(mut split_state) = self.split_tunnel_store.load() {
             split_state.applied_physical_network_fingerprint = Some(fingerprint);
             if self.split_tunnel_store.save(&split_state).is_err() {
@@ -1151,6 +1417,10 @@ where
             )
             .await;
         }
+        self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
+            .await;
+        self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
+            .await;
         self.logger.record(crate::CoreLogEvent {
             kind: "split_tunnel.network_reconnected",
             operation_id: None,
@@ -1160,10 +1430,273 @@ where
         Ok(PhysicalNetworkPollOutcome::Reconnected)
     }
 
+    async fn confirm_route_attempt(
+        &self,
+        route: RouteRestart<'_>,
+        options: &TunnelOptions,
+        fingerprint: Option<&str>,
+        allowed: &(impl Fn() -> bool + Sync),
+    ) -> Result<bool, CoreError> {
+        let result = self
+            .publish_recovered_split_tunnel_state(
+                route.epoch,
+                route.connection,
+                (options, RestartNetwork::Observed(fingerprint)),
+                allowed,
+                |_| true,
+                route.guard,
+            )
+            .await;
+        #[cfg(target_os = "macos")]
+        if matches!(result, Err(CoreError::RecoveryDeferred)) {
+            self.park_route_restart(route, options, None, StalledLocalRestartStep::Verify)
+                .await?;
+            return Ok(false);
+        }
+        result?;
+        Ok(true)
+    }
+
+    async fn route_fingerprint(&self, options: &TunnelOptions) -> Option<String> {
+        if physical_network_tracking_active(options) {
+            self.tunnel
+                .physical_network_fingerprint()
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        }
+    }
+
+    async fn start_route_attempt(
+        &self,
+        route: RouteRestart<'_>,
+        options: &TunnelOptions,
+        _fallback: Option<&TunnelOptions>,
+        _allowed: &(impl Fn() -> bool + Sync),
+        #[cfg(target_os = "macos")] wake_scope: Option<&MacosStartWake>,
+    ) -> Result<Option<Result<(), nelomai_client_tunnel::TunnelError>>, CoreError> {
+        self.ensure_start_not_cancelled(route.epoch)?;
+        let request = TunnelStartRequest {
+            configuration: TunnelConfiguration::new(route.configuration.to_owned()),
+            options: options.clone(),
+            quick_reconnect: QuickReconnect::Disabled,
+            quick_connection: Some(local_restart_connection(route.connection)),
+            redundancy: None,
+        };
+        #[cfg(target_os = "macos")]
+        let result = if !_allowed() {
+            Err(TunnelError::Backend(WAKE_DISPATCH_DEFERRED.into()))
+        } else if let Some(scope) = wake_scope {
+            let start = self
+                .tunnel
+                .start_guarded(request, self.stalled_start_guard(route.epoch, Some(scope)));
+            match self
+                .await_with_start_cancellation(Some(route.epoch), start)
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    self.ensure_restarted_tunnel_current(route.epoch, route.connection)
+                        .await?;
+                    return Err(error);
+                }
+            }
+        } else {
+            self.tunnel.start_for_restart(request).await
+        };
+        #[cfg(not(target_os = "macos"))]
+        let result = self.tunnel.start_for_restart(request).await;
+        self.ensure_restarted_tunnel_current(route.epoch, route.connection)
+            .await?;
+        #[cfg(target_os = "macos")]
+        {
+            let deferred = matches!(&result, Err(TunnelError::Backend(code)) if code == WAKE_DISPATCH_DEFERRED);
+            if deferred || !_allowed() {
+                let route = if result.is_err() && !deferred && _fallback.is_some() {
+                    route.for_rollback()
+                } else {
+                    route
+                };
+                let (options, fallback, step) = match (result, _fallback) {
+                    (Ok(()), _) => (options, None, StalledLocalRestartStep::Verify),
+                    (Err(_), fallback) if deferred => (
+                        options,
+                        fallback,
+                        StalledLocalRestartStep::Start {
+                            retry_allowed: fallback.is_some(),
+                        },
+                    ),
+                    (Err(_), Some(fallback)) => (
+                        fallback,
+                        None,
+                        StalledLocalRestartStep::Start {
+                            retry_allowed: false,
+                        },
+                    ),
+                    (Err(error), None) => {
+                        (options, None, StalledLocalRestartStep::Failed(error.into()))
+                    }
+                };
+                self.park_route_restart(route, options, fallback, step)
+                    .await?;
+                return Ok(None);
+            }
+        }
+        Ok(Some(result))
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn park_route_restart(
+        &self,
+        route: RouteRestart<'_>,
+        options: &TunnelOptions,
+        fallback: Option<&TunnelOptions>,
+        step: StalledLocalRestartStep,
+    ) -> Result<(), CoreError> {
+        self.begin_local_restart_episode(route.connection).await;
+        let parked = self
+            .park_stalled_local_restart(
+                StalledLocalRestart {
+                    connection: route.connection.clone(),
+                    epoch: route.epoch,
+                    configuration: TunnelConfiguration::new(route.configuration.to_owned()),
+                    options: options.clone(),
+                    step,
+                    route: Some(DeferredRouteApply {
+                        fallback: fallback.cloned(),
+                        policy: route.policy.map(|report| DeferredPolicyReport {
+                            rollback: route.rollback,
+                            ..report.clone()
+                        }),
+                        resumed_at_unix: route.now_unix,
+                        fingerprint: None,
+                    }),
+                },
+                route.guard,
+            )
+            .await?;
+        if !matches!(parked, StalledDataPlaneRestartOutcome::Busy) {
+            return Err(CoreError::StartCancelled);
+        }
+        self.physical_network_change
+            .lock()
+            .await
+            .require_revalidation();
+        let mut state = self
+            .split_tunnel_store
+            .load()
+            .map_err(|_| CoreError::Storage)?;
+        retire_route_facts(&mut state);
+        self.split_tunnel_store
+            .save(&state)
+            .map_err(|_| CoreError::Storage)
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn record_resumed_route(
+        &self,
+        route: DeferredRouteApply,
+        options: Option<&TunnelOptions>,
+    ) {
+        let result = (|| {
+            let mut state = self
+                .split_tunnel_store
+                .load()
+                .map_err(|_| CoreError::Storage)?;
+            let warning = route.record(&mut state, options)?;
+            self.split_tunnel_store
+                .save(&state)
+                .map_err(|_| CoreError::Storage)?;
+            Ok::<_, CoreError>(warning)
+        })();
+        match result {
+            Ok(Some(warning)) => {
+                self.set_split_tunnel_warning(SplitTunnelWarningKind::Operation, warning)
+                    .await;
+            }
+            Ok(None) => {
+                self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
+                    .await
+            }
+            Err(_) => {
+                self.set_split_tunnel_warning(
+                    SplitTunnelWarningKind::Storage,
+                    "split_tunnel_state_save_failed",
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn begin_local_restart_episode(&self, connection: &Connection) {
+        self.begin_recovery_episode(
+            connection,
+            crate::ConnectOptions {
+                layer: connection.layer,
+                tic_connection_mode: connection.tic_connection_mode,
+                route_mode: connection.route_mode,
+                egress_mode: connection.egress_mode,
+                probes: Vec::new(),
+                allow_alternate: !connection.pinned
+                    && connection.tic_connection_mode
+                        == nelomai_contracts::TicConnectionMode::Dynamic,
+            },
+        )
+        .await;
+    }
+
     pub async fn recover_stalled_data_plane(
         &self,
         lease_id: &str,
         recovery: crate::StalledDataPlaneRecovery,
+    ) -> Result<crate::StalledDataPlaneRecoveryOutcome, CoreError> {
+        self.recover_stalled_data_plane_guarded(lease_id, recovery, &|| true)
+            .await
+    }
+
+    pub async fn recover_stalled_data_plane_guarded(
+        &self,
+        lease_id: &str,
+        recovery: crate::StalledDataPlaneRecovery,
+        allowed: &(impl Fn() -> bool + Sync),
+    ) -> Result<crate::StalledDataPlaneRecoveryOutcome, CoreError> {
+        self.recover_stalled_data_plane_with_scope(
+            lease_id,
+            recovery,
+            allowed,
+            #[cfg(target_os = "macos")]
+            None,
+        )
+        .await
+    }
+
+    /// Retain the wake scope through the native Start dispatch boundary.
+    #[cfg(target_os = "macos")]
+    pub async fn recover_stalled_data_plane_guarded_for_wake(
+        &self,
+        lease_id: &str,
+        recovery: crate::StalledDataPlaneRecovery,
+        wake_stamp: Option<i64>,
+        allowed: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Result<crate::StalledDataPlaneRecoveryOutcome, CoreError> {
+        let scope = MacosStartWake::new(wake_stamp, allowed);
+        self.recover_stalled_data_plane_with_scope(
+            lease_id,
+            recovery,
+            &|| (scope.allowed)(),
+            Some(&scope),
+        )
+        .await
+    }
+
+    async fn recover_stalled_data_plane_with_scope(
+        &self,
+        lease_id: &str,
+        recovery: crate::StalledDataPlaneRecovery,
+        allowed: &(impl Fn() -> bool + Sync),
+        #[cfg(target_os = "macos")] wake_scope: Option<&MacosStartWake>,
     ) -> Result<crate::StalledDataPlaneRecoveryOutcome, CoreError> {
         let cancel_epoch = crate::StartCancellationEpoch(
             self.start_cancel_epoch
@@ -1189,11 +1722,39 @@ where
         let Some(connection) = connection else {
             return Ok(crate::StalledDataPlaneRecoveryOutcome::Skipped);
         };
+        if !allowed() {
+            return Ok(crate::StalledDataPlaneRecoveryOutcome::Busy);
+        }
         if recovery == crate::StalledDataPlaneRecovery::RebindUdp {
-            let rebound =
-                tokio::time::timeout(std::time::Duration::from_secs(3), self.tunnel.rebind_udp())
-                    .await
-                    .map_err(|_| CoreError::Tunnel("udp_rebind_timeout".to_string()))??;
+            #[cfg(target_os = "macos")]
+            {
+                // Explicit Stop invalidates the running recipe before it can
+                // wait for the lifecycle writer. Even an observation taken
+                // after that signal must not rebind the retiring tunnel.
+                let running = self.split_tunnel_options.lock().await;
+                self.ensure_start_not_cancelled(cancel_epoch)?;
+                if !running.is_available_for(lease_id, cancel_epoch) {
+                    return Ok(crate::StalledDataPlaneRecoveryOutcome::Skipped);
+                }
+                if !allowed() {
+                    return Ok(crate::StalledDataPlaneRecoveryOutcome::Busy);
+                }
+            }
+            #[cfg(target_os = "macos")]
+            let rebound = {
+                let result = self
+                    .rebind_udp_with_deadline(cancel_epoch, Duration::from_secs(3), wake_scope)
+                    .await;
+                self.ensure_start_not_cancelled(cancel_epoch)?;
+                if !allowed() {
+                    return Ok(crate::StalledDataPlaneRecoveryOutcome::Busy);
+                }
+                result?
+            };
+            #[cfg(not(target_os = "macos"))]
+            let rebound = tokio::time::timeout(Duration::from_secs(3), self.tunnel.rebind_udp())
+                .await
+                .map_err(|_| CoreError::Tunnel("udp_rebind_timeout".to_string()))??;
             self.ensure_start_not_cancelled(cancel_epoch)?;
             return Ok(if rebound {
                 crate::StalledDataPlaneRecoveryOutcome::Rebound
@@ -1224,93 +1785,631 @@ where
         };
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         let options = self.automatic_restart_split_tunnel_options(options).await?;
-        self.begin_recovery_episode(
-            &connection,
-            crate::ConnectOptions {
-                layer: connection.layer,
-                tic_connection_mode: connection.tic_connection_mode,
-                route_mode: connection.route_mode,
-                egress_mode: connection.egress_mode,
-                probes: Vec::new(),
-                allow_alternate: !connection.pinned
-                    && connection.tic_connection_mode
-                        == nelomai_contracts::TicConnectionMode::Dynamic,
-            },
-        )
-        .await;
-        let transport =
-            nelomai_client_tunnel::TunnelConfiguration::new(configuration.clone()).transport();
-        self.retire_split_tunnel_confirmation(&connection, cancel_epoch)
-            .await?;
-        let stop_result = self.tunnel.stop_for_restart().await;
-        self.ensure_offline_start_current(cancel_epoch).await?;
-        if let Err(error) = stop_result {
-            if !matches!(
-                self.tunnel.status().await,
-                Ok(nelomai_client_tunnel::TunnelStatus::Stopped
-                    | nelomai_client_tunnel::TunnelStatus::Failed)
-            ) {
-                return Err(error.into());
-            }
+        if !allowed() {
+            return Ok(crate::StalledDataPlaneRecoveryOutcome::Busy);
         }
-        self.publish_local_recovery_phase(cancel_epoch, Phase::Connecting, &connection)
-            .await?;
-        let start = || {
-            self.tunnel
-                .start_for_restart(nelomai_client_tunnel::TunnelStartRequest {
-                    configuration: nelomai_client_tunnel::TunnelConfiguration::new(
-                        configuration.clone(),
-                    ),
-                    options: options.clone(),
-                    quick_reconnect: nelomai_client_tunnel::QuickReconnect::Disabled,
-                    quick_connection: Some(local_restart_connection(&connection)),
-                    redundancy: None,
-                })
+        let Some(stop_result) = self
+            .stop_for_local_restart(
+                &connection,
+                cancel_epoch,
+                allowed,
+                #[cfg(target_os = "macos")]
+                wake_scope,
+            )
+            .await?
+        else {
+            return Ok(crate::StalledDataPlaneRecoveryOutcome::Busy);
         };
-        let first_start_result = start().await;
-        self.ensure_offline_start_current(cancel_epoch).await?;
-        let start_result = if first_start_result.is_err() {
-            self.logger.record(crate::CoreLogEvent {
-                kind: "tunnel.stall.local_start_retry",
-                operation_id: None,
-                request_id: None,
-                code: first_start_result.as_ref().err().map(ToString::to_string),
-            });
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            self.ensure_start_not_cancelled(cancel_epoch)?;
-            start().await
-        } else {
-            first_start_result
-        };
-        self.ensure_offline_start_current(cancel_epoch).await?;
-        if let Err(error) = start_result {
-            self.publish_local_recovery_phase(cancel_epoch, Phase::Stopping, &connection)
-                .await?;
-            return Err(error.into());
-        }
-        if transport == nelomai_client_tunnel::TunnelTransport::AmneziaWg3 {
-            if let Err(error) = self
-                .ensure_awg3_handshake(lease_id, None, Some(cancel_epoch))
-                .await
-            {
-                self.ensure_start_not_cancelled(cancel_epoch)?;
-                let cleanup_error = self.tunnel.stop().await.err().map(CoreError::from);
-                self.publish_local_recovery_phase(cancel_epoch, Phase::Stopping, &connection)
-                    .await?;
-                return Err(cleanup_error.unwrap_or(error));
-            }
-        }
-        self.publish_recovered_split_tunnel_state(
-            cancel_epoch,
+        self.ensure_restarted_tunnel_current(cancel_epoch, &connection)
+            .await?;
+        self.begin_local_restart_episode(&connection).await;
+        let restart = StalledLocalRestart {
             connection,
+            epoch: cancel_epoch,
+            #[cfg(target_os = "macos")]
+            route: None,
+            configuration: TunnelConfiguration::new(configuration),
             options,
-            &_connection_guard,
+            step: StalledLocalRestartStep::Start {
+                retry_allowed: true,
+            },
+        };
+        if let Err(error) = stop_result {
+            if allowed() {
+                let status = self.tunnel.status().await;
+                if allowed() && !matches!(status, Ok(TunnelStatus::Stopped | TunnelStatus::Failed))
+                {
+                    return Err(error.into());
+                }
+            }
+        }
+        match self
+            .finish_stalled_local_restart(
+                restart,
+                allowed,
+                &_connection_guard,
+                #[cfg(target_os = "macos")]
+                wake_scope,
+            )
+            .await?
+        {
+            StalledDataPlaneRestartOutcome::Busy => Ok(StalledDataPlaneRecoveryOutcome::Busy),
+            StalledDataPlaneRestartOutcome::Skipped => Ok(StalledDataPlaneRecoveryOutcome::Skipped),
+            StalledDataPlaneRestartOutcome::Reconnected => {
+                Ok(StalledDataPlaneRecoveryOutcome::Reconnected)
+            }
+            StalledDataPlaneRestartOutcome::Failed(error) => Err(error),
+        }
+    }
+
+    /// Continue an already admitted same-lease repair under a fresh power scope.
+    /// Only the original repair can leave a continuation, and Stop retires its epoch.
+    pub async fn resume_stalled_data_plane_restart_guarded(
+        &self,
+        lease_id: &str,
+        allowed: &(impl Fn() -> bool + Sync),
+    ) -> Result<Option<StalledDataPlaneRestartOutcome>, CoreError> {
+        self.resume_stalled_data_plane_restart_with_scope(
+            lease_id,
+            allowed,
+            #[cfg(target_os = "macos")]
+            None,
+            #[cfg(target_os = "macos")]
+            None,
         )
-        .await?;
+        .await
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn resume_stalled_data_plane_restart_guarded_for_wake(
+        &self,
+        lease_id: &str,
+        wake_stamp: Option<i64>,
+        allowed: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Result<Option<StalledDataPlaneRestartOutcome>, CoreError> {
+        let scope = MacosStartWake::new(wake_stamp, allowed);
+        self.resume_stalled_data_plane_restart_with_scope(
+            lease_id,
+            &|| (scope.allowed)(),
+            Some(&scope),
+            None,
+        )
+        .await
+    }
+
+    async fn resume_stalled_data_plane_restart_with_scope(
+        &self,
+        lease_id: &str,
+        allowed: &(impl Fn() -> bool + Sync),
+        #[cfg(target_os = "macos")] wake_scope: Option<&MacosStartWake>,
+        #[cfg(target_os = "macos")] route_poll: Option<i64>,
+    ) -> Result<Option<StalledDataPlaneRestartOutcome>, CoreError> {
+        use StalledDataPlaneRestartOutcome::{Busy, Skipped};
+        let has_restart = self
+            .active_recovery_episode
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|episode| {
+                episode.metrics.session_id == lease_id && episode.local_restart.is_some()
+            });
+        if !has_restart {
+            return Ok(None);
+        }
+        let Ok(_intent_guard) = self.intent_recovery_gate.try_lock() else {
+            return Ok(Some(Busy));
+        };
+        let Ok(_split_guard) = self.split_tunnel_gate.try_lock() else {
+            return Ok(Some(Busy));
+        };
+        let Ok(connection_guard) = self.connection_gate.try_lock() else {
+            return Ok(Some(Busy));
+        };
+        if !allowed() {
+            return Ok(Some(Busy));
+        }
+        let eligible = self.stalled_restart_is_current(lease_id).await;
+        let status = if eligible && !self.runtime_channel_closed() {
+            use nelomai_client_api::RuntimeAuthState;
+            match self.auth.state().await? {
+                RuntimeAuthState::RecoveryRequired => return Ok(Some(Busy)),
+                RuntimeAuthState::Active => {
+                    if !allowed() {
+                        return Ok(Some(Busy));
+                    }
+                    let status = self.tunnel.status().await?;
+                    if matches!(status, TunnelStatus::Starting | TunnelStatus::Stopping) {
+                        return Ok(Some(Busy));
+                    }
+                    let stored = self.load_runtime()?;
+                    if stored
+                        .compatibility
+                        .is_some_and(|compatibility| compatibility.update_required)
+                        || stored.pending_start.is_some()
+                        || stored.pending_compensation_stop.is_some()
+                        || stored.pending_stalled_stop.is_some()
+                        || stored.desktop_redundancy.is_some()
+                    {
+                        None
+                    } else {
+                        Some(status)
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut state = self.state.lock().await;
+        let mut active = self.active_recovery_episode.lock().await;
+        let Some(pending) = active
+            .as_mut()
+            .filter(|episode| episode.metrics.session_id == lease_id)
+            .map(|episode| &mut episode.local_restart)
+        else {
+            return Ok(None);
+        };
+        let Some(restart) = pending.as_ref() else {
+            return Ok(None);
+        };
+        #[cfg(target_os = "macos")]
+        if restart.route.is_some() != route_poll.is_some() {
+            return Ok(None);
+        }
+        if state.phase != Phase::Stopping
+            || self.runtime_channel_closed()
+            || self.ensure_start_not_cancelled(restart.epoch).is_err()
+            || !restart.matches(state.connection.as_ref(), restart.epoch)
+            || status.is_none()
+        {
+            *pending = None;
+            return Ok(Some(Skipped));
+        }
+        if !allowed() {
+            return Ok(Some(Busy));
+        }
+        #[cfg(target_os = "macos")]
+        let _route_restart = route_poll.is_some().then(|| self.begin_route_restart());
+        let mut restart = pending.take().expect("checked pending restart");
+        #[cfg(target_os = "macos")]
+        if let (Some(route), Some(now_unix)) = (&mut restart.route, route_poll) {
+            route.resumed_at_unix = now_unix;
+        }
+        match (status, &restart.step) {
+            (
+                Some(TunnelStatus::Stopped | TunnelStatus::Failed),
+                StalledLocalRestartStep::Verify,
+            ) => {
+                #[cfg(target_os = "macos")]
+                let repair_routes = route_poll.is_some();
+                #[cfg(not(target_os = "macos"))]
+                let repair_routes = false;
+                restart.step = if repair_routes {
+                    // The previous wake's successful Start has since stopped.
+                    StalledLocalRestartStep::Start {
+                        retry_allowed: false,
+                    }
+                } else {
+                    StalledLocalRestartStep::Failed(CoreError::Tunnel(
+                        "tunnel_runtime_stopped".into(),
+                    ))
+                };
+            }
+            (Some(TunnelStatus::Stopped | TunnelStatus::Failed), _) => {}
+            (Some(TunnelStatus::Running), StalledLocalRestartStep::Verify) => {}
+            (Some(TunnelStatus::Running), _) => {
+                // Native may still be running after a failed Stop or an
+                // ambiguous Start result. Keep the current lease available
+                // for fresh probes without attesting the prepared routes.
+                state.phase = Phase::Connected;
+                *active = None;
+                return Ok(Some(Skipped));
+            }
+            _ => return Ok(Some(Skipped)),
+        }
+        state.phase = Phase::Connecting;
+        drop(active);
+        drop(state);
+        self.finish_stalled_local_restart(
+            restart,
+            allowed,
+            &connection_guard,
+            #[cfg(target_os = "macos")]
+            wake_scope,
+        )
+        .await
+        .map(Some)
+    }
+
+    pub(crate) async fn has_stalled_local_restart(&self, connection: Option<&Connection>) -> bool {
+        let epoch = self.start_cancellation_epoch();
+        self.active_recovery_episode
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|episode| episode.local_restart.as_ref())
+            .is_some_and(|restart| restart.matches(connection, epoch))
+    }
+
+    async fn stalled_restart_is_current(&self, lease_id: &str) -> bool {
+        let state = self.state.lock().await;
+        state.phase == Phase::Stopping
+            && state
+                .connection
+                .as_ref()
+                .is_some_and(|connection| connection.lease_id == lease_id)
+            && self
+                .has_stalled_local_restart(state.connection.as_ref())
+                .await
+    }
+
+    async fn park_stalled_local_restart(
+        &self,
+        restart: StalledLocalRestart,
+        connection_guard: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<StalledDataPlaneRestartOutcome, CoreError> {
+        let mut state = self.state.lock().await;
+        let mut active = self.active_recovery_episode.lock().await;
+        if self.ensure_start_not_cancelled(restart.epoch).is_err()
+            || self.runtime_channel_closed()
+            || !restart.matches(state.connection.as_ref(), restart.epoch)
+            || !matches!(
+                state.phase,
+                Phase::Connected | Phase::Connecting | Phase::Stopping
+            )
+        {
+            drop(active);
+            drop(state);
+            if matches!(restart.step, StalledLocalRestartStep::Verify) {
+                return self
+                    .publish_stalled_local_restart(restart, false, &|| true, connection_guard)
+                    .await;
+            }
+            self.ensure_start_not_cancelled(restart.epoch)?;
+            return Ok(StalledDataPlaneRestartOutcome::Skipped);
+        }
+        let Some(episode) = active
+            .as_mut()
+            .filter(|episode| episode.metrics.session_id == restart.connection.lease_id)
+        else {
+            return Ok(StalledDataPlaneRestartOutcome::Skipped);
+        };
+        // Keep the same accepted connection and its Stop action while native
+        // has no confirmed tunnel. An inferred Stop must leave this repair alone.
+        state.phase = Phase::Stopping;
+        #[cfg(target_os = "macos")]
+        let mut restart = restart;
+        #[cfg(target_os = "macos")]
+        if let Some(route) = &mut restart.route {
+            route.fingerprint = None;
+        }
+        episode.local_restart = Some(restart);
+        Ok(StalledDataPlaneRestartOutcome::Busy)
+    }
+
+    async fn finish_stalled_local_restart(
+        &self,
+        mut restart: StalledLocalRestart,
+        allowed: &(impl Fn() -> bool + Sync),
+        connection_guard: &tokio::sync::MutexGuard<'_, ()>,
+        #[cfg(target_os = "macos")] wake_scope: Option<&MacosStartWake>,
+    ) -> Result<StalledDataPlaneRestartOutcome, CoreError> {
+        loop {
+            if !allowed() {
+                return self
+                    .park_stalled_local_restart(restart, connection_guard)
+                    .await;
+            }
+            {
+                let mut state = self.state.lock().await;
+                if self.ensure_start_not_cancelled(restart.epoch).is_err()
+                    || self.runtime_channel_closed()
+                    || !restart.matches(state.connection.as_ref(), restart.epoch)
+                    || !matches!(
+                        state.phase,
+                        Phase::Connected | Phase::Connecting | Phase::Stopping
+                    )
+                {
+                    drop(state);
+                    if matches!(restart.step, StalledLocalRestartStep::Verify) {
+                        return self
+                            .publish_stalled_local_restart(
+                                restart,
+                                false,
+                                &|| true,
+                                connection_guard,
+                            )
+                            .await;
+                    }
+                    self.ensure_start_not_cancelled(restart.epoch)?;
+                    return Ok(StalledDataPlaneRestartOutcome::Skipped);
+                }
+                state.phase = if matches!(restart.step, StalledLocalRestartStep::Failed(_)) {
+                    Phase::Stopping
+                } else {
+                    Phase::Connecting
+                };
+            }
+            if !allowed() {
+                return self
+                    .park_stalled_local_restart(restart, connection_guard)
+                    .await;
+            }
+            match restart.step {
+                StalledLocalRestartStep::Start { retry_allowed } => {
+                    #[cfg(target_os = "macos")]
+                    if let Some(route) = &mut restart.route {
+                        let Ok(state) = self.split_tunnel_store.load() else {
+                            return self
+                                .park_stalled_local_restart(restart, connection_guard)
+                                .await;
+                        };
+                        restart.options =
+                            restart_options_for_current_split_policy(&state, restart.options);
+                        route.fingerprint = self.route_fingerprint(&restart.options).await;
+                        if !allowed() {
+                            return self
+                                .park_stalled_local_restart(restart, connection_guard)
+                                .await;
+                        }
+                    }
+                    let request = TunnelStartRequest {
+                        configuration: TunnelConfiguration::new(
+                            restart.configuration.expose().to_owned(),
+                        ),
+                        options: restart.options.clone(),
+                        quick_reconnect: QuickReconnect::Disabled,
+                        quick_connection: Some(local_restart_connection(&restart.connection)),
+                        redundancy: None,
+                    };
+                    #[cfg(target_os = "macos")]
+                    let result = {
+                        let start = self.tunnel.start_guarded(
+                            request,
+                            self.stalled_start_guard(restart.epoch, wake_scope),
+                        );
+                        match self
+                            .await_with_start_cancellation(Some(restart.epoch), start)
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(error) => {
+                                // Dropping the waiter revokes native admission. Compensate
+                                // if Start may have crossed the final dispatch check.
+                                self.ensure_restarted_tunnel_current(
+                                    restart.epoch,
+                                    &restart.connection,
+                                )
+                                .await?;
+                                return Err(error);
+                            }
+                        }
+                    };
+                    #[cfg(not(target_os = "macos"))]
+                    let result = self.tunnel.start_for_restart(request).await;
+
+                    #[cfg(target_os = "macos")]
+                    if matches!(&result, Err(TunnelError::Backend(code)) if code == WAKE_DISPATCH_DEFERRED)
+                    {
+                        // No Start was dispatched. Preserve this step and its retry budget.
+                        return self
+                            .park_stalled_local_restart(restart, connection_guard)
+                            .await;
+                    }
+                    self.ensure_restarted_tunnel_current(restart.epoch, &restart.connection)
+                        .await?;
+                    restart.step = match result {
+                        Ok(()) => StalledLocalRestartStep::Verify,
+                        Err(error) if retry_allowed => {
+                            #[cfg(target_os = "macos")]
+                            if let Some(route) = &mut restart.route {
+                                if let Some(fallback) = route.fallback.take() {
+                                    restart.options = fallback;
+                                    if let Some(policy) = &mut route.policy {
+                                        policy.rollback = true;
+                                    }
+                                }
+                            }
+                            self.logger.record(crate::CoreLogEvent {
+                                kind: "tunnel.stall.local_start_retry",
+                                operation_id: None,
+                                request_id: None,
+                                code: Some(error.to_string()),
+                            });
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            StalledLocalRestartStep::Start {
+                                retry_allowed: false,
+                            }
+                        }
+                        Err(error) => StalledLocalRestartStep::Failed(error.into()),
+                    };
+                }
+                StalledLocalRestartStep::Verify => {
+                    if restart.configuration.transport() == TunnelTransport::AmneziaWg3 {
+                        let result = self
+                            .ensure_awg3_handshake_guarded(
+                                &restart.connection.lease_id,
+                                None,
+                                restart.epoch,
+                                allowed,
+                                #[cfg(target_os = "macos")]
+                                wake_scope,
+                            )
+                            .await;
+                        if !allowed() || matches!(result, Err(CoreError::RecoveryDeferred)) {
+                            return self
+                                .park_stalled_local_restart(restart, connection_guard)
+                                .await;
+                        }
+                        if let Err(error) = result {
+                            self.ensure_start_not_cancelled(restart.epoch)?;
+                            #[cfg(target_os = "macos")]
+                            let cleanup = if let Some(wake) = wake_scope {
+                                let result =
+                                    self.stop_singleton_for_wake(restart.epoch, wake).await;
+                                // Explicit Stop now owns the running lease. A rejected
+                                // close cannot require compensating a late native Start.
+                                self.ensure_start_not_cancelled(restart.epoch)?;
+                                if matches!(&result, Err(TunnelError::Backend(code)) if code == WAKE_DISPATCH_DEFERRED)
+                                {
+                                    // The helper left this tunnel running. Only a new
+                                    // handshake observation can justify closing it.
+                                    return self
+                                        .park_stalled_local_restart(restart, connection_guard)
+                                        .await;
+                                }
+                                result
+                            } else {
+                                self.tunnel.stop().await
+                            };
+                            #[cfg(not(target_os = "macos"))]
+                            let cleanup = self.tunnel.stop().await;
+                            self.publish_local_recovery_phase(
+                                restart.epoch,
+                                Phase::Stopping,
+                                &restart.connection,
+                            )
+                            .await?;
+                            cleanup?;
+                            restart.step = StalledLocalRestartStep::Failed(error);
+                            continue;
+                        }
+                    }
+                    return self
+                        .publish_stalled_local_restart(restart, true, allowed, connection_guard)
+                        .await;
+                }
+                StalledLocalRestartStep::Failed(error) => {
+                    if !cfg!(target_os = "macos") {
+                        return Err(error);
+                    }
+                    let status = self.tunnel.status().await;
+                    self.ensure_start_not_cancelled(restart.epoch)?;
+                    if !allowed()
+                        || matches!(
+                            status,
+                            Err(_) | Ok(TunnelStatus::Starting | TunnelStatus::Stopping)
+                        )
+                    {
+                        restart.step = StalledLocalRestartStep::Failed(error);
+                        return self
+                            .park_stalled_local_restart(restart, connection_guard)
+                            .await;
+                    }
+                    return if matches!(status, Ok(TunnelStatus::Stopped | TunnelStatus::Failed)) {
+                        #[cfg(target_os = "macos")]
+                        if let Some(route) = restart.route {
+                            self.record_resumed_route(route, None).await;
+                        }
+                        Ok(StalledDataPlaneRestartOutcome::Failed(error))
+                    } else {
+                        Err(error)
+                    };
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn stalled_start_guard(
+        &self,
+        epoch: StartCancellationEpoch,
+        wake_scope: Option<&MacosStartWake>,
+    ) -> WakeDispatchGuard {
+        let start_epoch = self.start_cancel_epoch.clone();
+        let stop_gate = self.local_stop_gate.clone();
+        let auth = self.auth.clone();
+        let wake_stamp = wake_scope.and_then(|scope| scope.stamp);
+        let wake_allowed = wake_scope.map(|scope| scope.allowed.clone());
+        WakeDispatchGuard::new(wake_stamp, move || {
+            wake_allowed.as_ref().is_none_or(|allowed| allowed())
+                && !auth.is_channel_closed()
+                && start_epoch.load(Ordering::SeqCst) == epoch.0
+                && stop_gate.try_lock().is_ok()
+        })
+    }
+
+    async fn publish_stalled_local_restart(
+        &self,
+        restart: StalledLocalRestart,
+        accepted: bool,
+        allowed: &(impl Fn() -> bool + Sync),
+        connection_guard: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<StalledDataPlaneRestartOutcome, CoreError> {
+        #[cfg(target_os = "macos")]
+        let network = restart
+            .route
+            .as_ref()
+            .map_or(RestartNetwork::Keep, |route| {
+                RestartNetwork::Observed(route.fingerprint.as_deref())
+            });
+        #[cfg(not(target_os = "macos"))]
+        let network = RestartNetwork::Keep;
+        let result = self
+            .publish_recovered_split_tunnel_state(
+                restart.epoch,
+                &restart.connection,
+                (&restart.options, network),
+                allowed,
+                |phase| {
+                    accepted
+                        && matches!(
+                            phase,
+                            Phase::Connected | Phase::Connecting | Phase::Stopping
+                        )
+                        && !self.runtime_channel_closed()
+                },
+                connection_guard,
+            )
+            .await;
+        if matches!(result, Err(CoreError::RecoveryDeferred)) {
+            return Box::pin(self.park_stalled_local_restart(restart, connection_guard)).await;
+        }
+        result?;
+        #[cfg(target_os = "macos")]
+        if let Some(route) = restart.route {
+            self.record_resumed_route(route, Some(&restart.options))
+                .await;
+        }
         self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
             .await;
         *self.active_recovery_episode.lock().await = None;
-        Ok(crate::StalledDataPlaneRecoveryOutcome::Reconnected)
+        Ok(StalledDataPlaneRestartOutcome::Reconnected)
+    }
+
+    async fn ensure_restarted_tunnel_current(
+        &self,
+        epoch: StartCancellationEpoch,
+        connection: &Connection,
+    ) -> Result<(), CoreError> {
+        if !cfg!(target_os = "macos") {
+            return self.ensure_offline_start_current(epoch).await;
+        }
+        if self.ensure_start_not_cancelled(epoch).is_ok() {
+            return Ok(());
+        }
+        // Keep the accepted lease available to the waiting Stop and its worker.
+        // A late native Start can still finish after a busy helper rejects close.
+        if let Err(error) = self.tunnel.stop().await {
+            let mut state = self.state.lock().await;
+            if state
+                .connection
+                .as_ref()
+                .is_some_and(|current| same_local_recovery_execution(current, connection))
+            {
+                state.phase = Phase::Stopping;
+                self.pending_compensation_stop_identity(
+                    &connection.lease_id,
+                    true,
+                    None,
+                    connection.session_id.as_deref(),
+                )?;
+            } else if state.connection.is_none() {
+                state.phase = Phase::Error;
+            }
+            return Err(error.into());
+        }
+        Err(CoreError::StartCancelled)
     }
 
     async fn publish_local_recovery_phase(
@@ -1322,7 +2421,9 @@ where
         let mut state = self.state.lock().await;
         if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
             drop(state);
-            return self.ensure_offline_start_current(cancel_epoch).await;
+            return self
+                .ensure_restarted_tunnel_current(cancel_epoch, connection)
+                .await;
         }
         if !state
             .connection
@@ -1337,14 +2438,28 @@ where
         Ok(())
     }
 
-    async fn retire_split_tunnel_confirmation(
+    #[cfg(target_os = "macos")]
+    async fn stop_singleton_for_wake(
+        &self,
+        epoch: StartCancellationEpoch,
+        wake: &MacosStartWake,
+    ) -> Result<(), TunnelError> {
+        let guard = self
+            .stalled_start_guard(epoch, Some(wake))
+            .with_cancellation(self.desktop_epoch_cancelled(epoch));
+        self.tunnel.stop_if_unowned_guarded(guard).await
+    }
+
+    async fn stop_for_local_restart(
         &self,
         connection: &Connection,
-        cancel_epoch: crate::StartCancellationEpoch,
-    ) -> Result<(), CoreError> {
+        epoch: StartCancellationEpoch,
+        allowed: &(impl Fn() -> bool + Sync),
+        #[cfg(target_os = "macos")] wake_scope: Option<&MacosStartWake>,
+    ) -> Result<Option<Result<(), nelomai_client_tunnel::TunnelError>>, CoreError> {
         let state = self.state.lock().await;
         let mut running = self.split_tunnel_options.lock().await;
-        self.ensure_start_not_cancelled(cancel_epoch)?;
+        self.ensure_start_not_cancelled(epoch)?;
         if state.phase != Phase::Connected
             || !state
                 .connection
@@ -1353,37 +2468,77 @@ where
         {
             return Err(CoreError::StartCancelled);
         }
-        // Once native replacement begins, the previous instance may be gone.
-        // Keep its options for retry, but only success can confirm them again.
+        if !allowed() {
+            return Ok(None);
+        }
+        #[cfg(target_os = "macos")]
+        let was_confirmed = running.is_confirmed_for(&connection.lease_id, epoch);
+        // Stop may commit even if the caller loses its reply. Keep the recipe,
+        // but retire its attestation across that ambiguous dispatch window.
         running.native_confirmed = false;
-        // The same lease can return to an identical Connected state. Discard
-        // status replies sampled before this restart if they arrive afterward.
         #[cfg(not(target_os = "android"))]
         self.foreground_sequence
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
+        drop(running);
+        drop(state);
+        #[cfg(target_os = "macos")]
+        if let Some(wake) = wake_scope {
+            let result = self.stop_singleton_for_wake(epoch, wake).await;
+            if matches!(&result, Err(TunnelError::Backend(code)) if code == WAKE_DISPATCH_DEFERRED)
+            {
+                // Native proved that no Stop was sent. A newer lease or a user
+                // Stop still owns its own state and may not inherit this proof.
+                if was_confirmed {
+                    let state = self.state.lock().await;
+                    let mut running = self.split_tunnel_options.lock().await;
+                    if self.ensure_start_not_cancelled(epoch).is_ok()
+                        && state.phase == Phase::Connected
+                        && state.connection.as_ref().is_some_and(|current| {
+                            same_local_recovery_execution(current, connection)
+                        })
+                        && running.is_available_for(&connection.lease_id, epoch)
+                    {
+                        running.native_confirmed = true;
+                    }
+                }
+                return Ok(None);
+            }
+            return Ok(Some(result));
+        }
+        Ok(Some(self.tunnel.stop_for_restart().await))
     }
 
     async fn publish_recovered_split_tunnel_state(
         &self,
         cancel_epoch: crate::StartCancellationEpoch,
-        connection: nelomai_contracts::Connection,
-        options: TunnelOptions,
+        connection: &Connection,
+        (options, network): (&TunnelOptions, RestartNetwork<'_>),
+        allowed: &(impl Fn() -> bool + Sync),
+        may_publish: impl Fn(Phase) -> bool + Send,
         _connection_guard: &tokio::sync::MutexGuard<'_, ()>,
     ) -> Result<(), CoreError> {
         let mut state = self.state.lock().await;
         let mut running = self.split_tunnel_options.lock().await;
+        let mut detector = match network {
+            RestartNetwork::Observed(_) => Some(self.physical_network_change.lock().await),
+            RestartNetwork::Keep => None,
+        };
         if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
+            drop(detector);
             drop(running);
             drop(state);
-            return self.ensure_offline_start_current(cancel_epoch).await;
+            return self
+                .ensure_restarted_tunnel_current(cancel_epoch, connection)
+                .await;
         }
-        if !state
-            .connection
-            .as_ref()
-            .is_some_and(|current| same_local_recovery_execution(current, &connection))
+        if !may_publish(state.phase)
+            || !state
+                .connection
+                .as_ref()
+                .is_some_and(|current| same_local_recovery_execution(current, connection))
         {
             let rejected_state = state.clone();
+            drop(detector);
             drop(running);
             drop(state);
             // This operation still holds the connection gate, so another Core
@@ -1402,7 +2557,13 @@ where
             let mut state = self.state.lock().await;
             *self.split_tunnel_options.lock().await = RunningSplitTunnelOptions::default();
             // Preserve newer metadata and a concurrent Stop's presentation.
-            if self.ensure_start_not_cancelled(cancel_epoch).is_ok() && *state == rejected_state {
+            if self.ensure_start_not_cancelled(cancel_epoch).is_ok()
+                && *state == rejected_state
+                && matches!(
+                    state.phase,
+                    Phase::Ready | Phase::Connected | Phase::Connecting | Phase::Stopping
+                )
+            {
                 state.phase = if cleanup.is_ok() {
                     Phase::Stopping
                 } else {
@@ -1412,10 +2573,25 @@ where
             cleanup.map_err(CoreError::from)?;
             return Err(CoreError::StartCancelled);
         }
+        if !allowed() {
+            return Err(CoreError::RecoveryDeferred);
+        }
         // Only a successful native restart attests to the exact dispatched
         // options. Publish that attestation with the same owner/generation.
-        *running =
-            RunningSplitTunnelOptions::confirmed(options, &connection.lease_id, cancel_epoch);
+        if let (Some(detector), RestartNetwork::Observed(fingerprint)) = (&mut detector, network) {
+            match fingerprint {
+                Some(sample) => detector.mark_applied(sample.to_owned()),
+                None if physical_network_tracking_active(options) => {
+                    detector.require_revalidation()
+                }
+                None => detector.reset(),
+            }
+        }
+        *running = RunningSplitTunnelOptions::confirmed(
+            options.clone(),
+            &connection.lease_id,
+            cancel_epoch,
+        );
         state.phase = Phase::Connected;
         Ok(())
     }
@@ -1557,8 +2733,9 @@ where
         state: &mut StoredSplitTunnelState,
         now_unix: i64,
         resolver: F,
-        observation: Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>,
-        explicit_apply: Option<(DomainResolutionMode, crate::StartCancellationEpoch)>,
+        source: RetainedRefresh<'_>,
+        allowed: &(impl Fn() -> bool + Sync),
+        #[cfg(target_os = "macos")] wake_scope: Option<&MacosStartWake>,
     ) -> Result<Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>, CoreError>
     where
         F: Fn(String) -> Fut + Clone,
@@ -1572,6 +2749,11 @@ where
         };
         let Some(policy) = state.cached_policy.clone() else {
             return Ok(None);
+        };
+        let (observation, explicit_apply, cancel) = match source {
+            RetainedRefresh::Tick(snapshot, epoch) => (Some(snapshot), None, epoch),
+            RetainedRefresh::Cached(epoch) => (None, None, epoch),
+            RetainedRefresh::Apply(mode, epoch) => (None, Some(mode), epoch),
         };
         let force = explicit_apply.is_some();
         let revision = policy_revision(&policy);
@@ -1613,12 +2795,9 @@ where
         if !force && !refresh_due {
             return Ok(None);
         }
-        let cancel = explicit_apply
-            .map(|(_, epoch)| epoch)
-            .unwrap_or_else(|| self.start_cancellation_epoch());
         self.ensure_start_not_cancelled(cancel)?;
         let snapshot = match observation {
-            Some(value) => value,
+            Some(value) => value.clone(),
             None => {
                 let _writer = self.connection_gate.lock().await;
                 self.tunnel
@@ -1646,8 +2825,8 @@ where
             revision,
             next_attempt: now_unix.saturating_add(DOMAIN_REFRESH_SECONDS),
         };
-        let previous = self.desktop_domain_refresh.lock().await.clone();
-        let same_context = previous.as_ref().is_some_and(|old| {
+        let previous_context = self.desktop_domain_refresh.lock().await.clone();
+        let same_context = previous_context.as_ref().is_some_and(|old| {
             old.scope == context.scope
                 && old.role == context.role
                 && old.network == context.network
@@ -1657,13 +2836,17 @@ where
         });
         if !force
             && same_context
-            && previous
+            && previous_context
                 .as_ref()
                 .is_some_and(|old| now_unix < old.next_attempt)
         {
             return Ok(None);
         }
-        let access = self.access_snapshot().await?;
+        let access = self.access_snapshot().await;
+        if !allowed() {
+            return Ok(None);
+        }
+        let access = access?;
         if stored.auth_scope.as_ref()
             != Some(&nelomai_client_storage::RuntimeAuthScope {
                 auth_epoch: access.auth_epoch(),
@@ -1673,7 +2856,6 @@ where
         {
             return Err(CoreError::Storage);
         }
-        *self.desktop_domain_refresh.lock().await = Some(context);
         let active = capabilities.address_split_tunnel
             && split_tunnel_active(SplitTunnelContext {
                 global_enabled: policy.enabled,
@@ -1688,7 +2870,7 @@ where
                 &policy,
                 &mut resolved_state,
                 now_unix,
-                explicit_apply.map_or(DomainResolutionMode::Refresh, |(mode, _)| mode),
+                explicit_apply.unwrap_or(DomainResolutionMode::Refresh),
                 resolver,
             )
             .await
@@ -1721,13 +2903,18 @@ where
                 scope: snapshot.session.scope.clone(),
             })
             .await?;
-        if fresh != snapshot {
+        if !allowed() || fresh != snapshot {
             return Ok(None);
         }
         if unix_desktop {
             self.update_domain_resolution_warning(&resolved).await;
         }
         if resolved.missing_cache {
+            let mut refresh = self.desktop_domain_refresh.lock().await;
+            if !allowed() {
+                return Ok(None);
+            }
+            *refresh = Some(context);
             return Err(CoreError::SplitTunnel(
                 "split_tunnel_domain_resolution_unavailable".into(),
             ));
@@ -1779,25 +2966,61 @@ where
         let pending_result = apply_pending_policy
             .then(|| applied_policy_result(&policy, now_unix))
             .transpose()?;
+        let mut running = self.split_tunnel_options.lock().await;
+        let mut refresh = self.desktop_domain_refresh.lock().await;
+        if !allowed() {
+            return Ok(None);
+        }
+        *refresh = Some(context);
+        drop(refresh);
         let updated = if previous.is_confirmed_for(&pair.connection.lease_id, cancel)
             && previous_options.has_same_effective_routes(&options)
         {
+            drop(running);
             fresh
         } else {
             // Native may commit before its reply is lost or this wait is cancelled.
             // Keep the restart recipe, but require a fresh exact ACK after dispatch.
-            self.split_tunnel_options.lock().await.native_confirmed = false;
-            let updated = self
-                .tunnel
-                .desktop_redundancy_command(Command::RefreshSplitTunnel {
-                    scope: fresh.session.scope.clone(),
-                    expected_revision: fresh.session.local_revision,
-                    expected_network_epoch: fresh.session.network_epoch,
-                    expected_role_generation: fresh.session.role_generation,
-                    expected_membership_generation: fresh.session.membership_generation,
-                    options: DesktopTunnelOptions::from_tunnel_options(&options),
-                })
-                .await?;
+            running.native_confirmed = false;
+            drop(running);
+            let command = Command::RefreshSplitTunnel {
+                scope: fresh.session.scope.clone(),
+                expected_revision: fresh.session.local_revision,
+                expected_network_epoch: fresh.session.network_epoch,
+                expected_role_generation: fresh.session.role_generation,
+                expected_membership_generation: fresh.session.membership_generation,
+                options: DesktopTunnelOptions::from_tunnel_options(&options),
+            };
+            #[cfg(target_os = "macos")]
+            let result = if let Some(scope) = wake_scope {
+                let guard = self
+                    .stalled_start_guard(cancel, Some(scope))
+                    .with_cancellation(self.desktop_epoch_cancelled(cancel));
+                self.tunnel
+                    .desktop_redundancy_command_guarded(command, guard)
+                    .await
+            } else {
+                self.tunnel.desktop_redundancy_command(command).await
+            };
+            #[cfg(not(target_os = "macos"))]
+            let result = self.tunnel.desktop_redundancy_command(command).await;
+            #[cfg(target_os = "macos")]
+            if wake_scope.is_some()
+                && matches!(&result, Err(TunnelError::Backend(code)) if code == WAKE_DISPATCH_DEFERRED)
+            {
+                // The transport proves that it did not submit this mutation.
+                // Keep the old instance's attestation and its original retry window.
+                let mut running = self.split_tunnel_options.lock().await;
+                if self.ensure_start_not_cancelled(cancel).is_ok()
+                    && previous.is_confirmed_for(&pair.connection.lease_id, cancel)
+                    && running.is_available_for(&pair.connection.lease_id, cancel)
+                {
+                    running.native_confirmed = true;
+                }
+                *self.desktop_domain_refresh.lock().await = previous_context;
+                return Ok(None);
+            }
+            let updated = result?;
             let mut expected = fresh;
             expected.session.local_revision = expected
                 .session
@@ -1844,10 +3067,66 @@ where
         now_unix: i64,
         force_full: bool,
     ) -> Result<SplitTunnelSyncOutcome, CoreError> {
-        self.synchronize_split_tunnel_with_resolver(now_unix, force_full, resolve_domain_ipv4)
+        self.synchronize_split_tunnel_guarded(now_unix, force_full, &|| true)
             .await
     }
 
+    pub async fn synchronize_split_tunnel_guarded(
+        &self,
+        now_unix: i64,
+        force_full: bool,
+        allowed: &(impl Fn() -> bool + Sync),
+    ) -> Result<SplitTunnelSyncOutcome, CoreError> {
+        self.synchronize_split_tunnel_with_resolver_guarded(
+            now_unix,
+            force_full,
+            false,
+            resolve_domain_ipv4,
+            allowed,
+            #[cfg(target_os = "macos")]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn synchronize_split_tunnel_for_wake(
+        &self,
+        now_unix: i64,
+        retry_revision: bool,
+        wake_stamp: Option<i64>,
+        allowed: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Result<SplitTunnelSyncOutcome, CoreError> {
+        let scope = MacosStartWake::new(wake_stamp, allowed);
+        self.synchronize_split_tunnel_with_resolver_guarded(
+            now_unix,
+            false,
+            retry_revision,
+            resolve_domain_ipv4,
+            &|| (scope.allowed)(),
+            Some(&scope),
+        )
+        .await
+    }
+
+    pub async fn retry_split_tunnel_revision_guarded(
+        &self,
+        now_unix: i64,
+        allowed: &(impl Fn() -> bool + Sync),
+    ) -> Result<SplitTunnelSyncOutcome, CoreError> {
+        self.synchronize_split_tunnel_with_resolver_guarded(
+            now_unix,
+            false,
+            true,
+            resolve_domain_ipv4,
+            allowed,
+            #[cfg(target_os = "macos")]
+            None,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn synchronize_split_tunnel_with_resolver<F, Fut>(
         &self,
         now_unix: i64,
@@ -1858,17 +3137,54 @@ where
         F: Fn(String) -> Fut + Clone,
         Fut: Future<Output = Option<Vec<String>>>,
     {
+        self.synchronize_split_tunnel_with_resolver_guarded(
+            now_unix,
+            force_full,
+            false,
+            resolver,
+            &|| true,
+            #[cfg(target_os = "macos")]
+            None,
+        )
+        .await
+    }
+
+    async fn synchronize_split_tunnel_with_resolver_guarded<F, Fut>(
+        &self,
+        now_unix: i64,
+        force_full: bool,
+        retry_revision: bool,
+        resolver: F,
+        allowed: &(impl Fn() -> bool + Sync),
+        #[cfg(target_os = "macos")] wake_scope: Option<&MacosStartWake>,
+    ) -> Result<SplitTunnelSyncOutcome, CoreError>
+    where
+        F: Fn(String) -> Fut + Clone,
+        Fut: Future<Output = Option<Vec<String>>>,
+    {
         let epochs = self.address_edit_epochs();
         let _guard = self.split_tunnel_gate.lock().await;
+        if !allowed() {
+            return Ok(SplitTunnelSyncOutcome::Skipped);
+        }
         self.ensure_address_edit_runtime_current(&epochs)?;
         let mut state = self
             .split_tunnel_store
             .load()
             .map_err(|_| CoreError::Storage)?;
-        let revision_check_due = force_full || revision_poll_due(&state, now_unix);
+        let revision_check_due =
+            force_full || retry_revision || revision_poll_due(&state, now_unix);
         if !revision_check_due {
             let refreshed = self
-                .refresh_cached_split_tunnel(&mut state, now_unix, resolver, &epochs)
+                .refresh_cached_split_tunnel(
+                    &mut state,
+                    now_unix,
+                    resolver,
+                    &epochs,
+                    allowed,
+                    #[cfg(target_os = "macos")]
+                    wake_scope,
+                )
                 .await?;
             return Ok(if refreshed {
                 SplitTunnelSyncOutcome::Updated { reconnected: false }
@@ -1878,28 +3194,55 @@ where
         }
 
         // A due revision check takes precedence over installing cached exclusions.
-        let mut access_token = self.access_snapshot().await?;
-        let revision = match self.request_split_tunnel_revision(&mut access_token).await {
+        let access = self.access_snapshot().await;
+        if !allowed() {
+            return Ok(SplitTunnelSyncOutcome::Skipped);
+        }
+        let mut access_token = access?;
+        let revision = self
+            .request_split_tunnel_revision(&mut access_token, allowed)
+            .await;
+        if !allowed() {
+            return Ok(SplitTunnelSyncOutcome::Skipped);
+        }
+        let revision = match revision {
             Ok(revision) => revision,
             Err(CoreError::AuthRefreshPending | CoreError::Api(CoreApiError::Retryable)) => {
-                state.last_revision_check_unix = Some(now_unix);
-                self.flush_pending_apply_results(&mut access_token, &mut state)
+                self.flush_pending_apply_results(&mut access_token, &mut state, allowed)
                     .await;
+                self.ensure_address_edit_runtime_current(&epochs)?;
+                if !allowed() {
+                    self.split_tunnel_store
+                        .save(&state)
+                        .map_err(|_| CoreError::Storage)?;
+                    return Ok(SplitTunnelSyncOutcome::Skipped);
+                }
+                state.last_revision_check_unix = Some(now_unix);
                 return self
-                    .finish_offline_split_tunnel_sync(&mut state, now_unix, Some(resolver), &epochs)
+                    .finish_offline_split_tunnel_sync(
+                        &mut state,
+                        now_unix,
+                        Some(resolver),
+                        &epochs,
+                        allowed,
+                        #[cfg(target_os = "macos")]
+                        wake_scope,
+                    )
                     .await;
             }
             Err(error) => return Err(error),
         };
 
         let track_revision = self.tracks_split_tunnel_revisions(&state).await?;
+        if !allowed() {
+            return Ok(SplitTunnelSyncOutcome::Skipped);
+        }
         self.ensure_address_edit_runtime_current(&epochs)?;
         let observed_changed = track_revision && observe_panel_revision(&mut state, &revision);
         let cached_superseded = state
             .cached_policy
             .as_ref()
             .is_some_and(|policy| policy_is_superseded(&state, policy));
-        state.last_revision_check_unix = Some(now_unix);
         if observed_changed && cached_superseded {
             // Retain evidence against the old cache even if loading the new
             // policy fails or the process exits during the request.
@@ -1925,7 +3268,15 @@ where
             (false, None)
         } else {
             match self
-                .refresh_cached_split_tunnel(&mut state, now_unix, resolver.clone(), &epochs)
+                .refresh_cached_split_tunnel(
+                    &mut state,
+                    now_unix,
+                    resolver.clone(),
+                    &epochs,
+                    allowed,
+                    #[cfg(target_os = "macos")]
+                    wake_scope,
+                )
                 .await
             {
                 Ok(refreshed) => (refreshed, None),
@@ -1935,9 +3286,19 @@ where
                 Err(error) => return Err(error),
             }
         };
-        self.flush_pending_apply_results(&mut access_token, &mut state)
+        if !allowed() {
+            return Ok(SplitTunnelSyncOutcome::Skipped);
+        }
+        self.flush_pending_apply_results(&mut access_token, &mut state, allowed)
             .await;
         self.ensure_address_edit_runtime_current(&epochs)?;
+        if !allowed() {
+            self.split_tunnel_store
+                .save(&state)
+                .map_err(|_| CoreError::Storage)?;
+            return Ok(SplitTunnelSyncOutcome::Skipped);
+        }
+        state.last_revision_check_unix = Some(now_unix);
         if !full_sync_due {
             state.last_seen_force_revision = revision.force_revision;
             state.last_seen_address_revision = revision.address_revision;
@@ -1956,11 +3317,19 @@ where
                         &policy,
                         &mut state,
                         &mut access_token,
-                        now_unix,
-                        DomainResolutionMode::Refresh,
-                        epochs.start,
+                        PolicyApplyContext {
+                            now_unix,
+                            domain_resolution: DomainResolutionMode::Refresh,
+                            cancel_epoch: epochs.start,
+                        },
+                        allowed,
+                        #[cfg(target_os = "macos")]
+                        wake_scope,
                     )
                     .await?;
+                if outcome.retry_revision(allowed) {
+                    state.last_revision_check_unix = None;
+                }
                 self.split_tunnel_store
                     .save(&state)
                     .map_err(|_| CoreError::Storage)?;
@@ -1987,11 +3356,28 @@ where
             });
         }
 
-        let policy = match self.request_split_tunnel_policy(&mut access_token).await {
+        if !allowed() {
+            return Ok(SplitTunnelSyncOutcome::Skipped);
+        }
+        let policy = self
+            .request_split_tunnel_policy(&mut access_token, allowed)
+            .await;
+        if !allowed() {
+            return Ok(SplitTunnelSyncOutcome::Skipped);
+        }
+        let policy = match policy {
             Ok(policy) => policy,
             Err(CoreError::AuthRefreshPending | CoreError::Api(CoreApiError::Retryable)) => {
                 return self
-                    .finish_offline_split_tunnel_sync(&mut state, now_unix, Some(resolver), &epochs)
+                    .finish_offline_split_tunnel_sync(
+                        &mut state,
+                        now_unix,
+                        Some(resolver),
+                        &epochs,
+                        allowed,
+                        #[cfg(target_os = "macos")]
+                        wake_scope,
+                    )
                     .await;
             }
             Err(error) => return Err(error),
@@ -2007,7 +3393,15 @@ where
         }
         if policy_is_superseded(&state, &policy) {
             return self
-                .finish_offline_split_tunnel_sync(&mut state, now_unix, None::<F>, &epochs)
+                .finish_offline_split_tunnel_sync(
+                    &mut state,
+                    now_unix,
+                    None::<F>,
+                    &epochs,
+                    allowed,
+                    #[cfg(target_os = "macos")]
+                    wake_scope,
+                )
                 .await;
         }
 
@@ -2022,8 +3416,6 @@ where
         }
         state.cached_policy = Some(policy.clone());
         state.last_full_sync_unix = Some(now_unix);
-        state.last_seen_force_revision = revision.force_revision.max(policy.force_revision);
-        state.last_seen_address_revision = revision.address_revision.max(policy.address_revision);
         self.split_tunnel_store
             .save(&state)
             .map_err(|_| CoreError::Storage)?;
@@ -2042,14 +3434,26 @@ where
                 &policy,
                 &mut state,
                 &mut access_token,
-                now_unix,
-                DomainResolutionMode::Refresh,
-                epochs.start,
+                PolicyApplyContext {
+                    now_unix,
+                    domain_resolution: DomainResolutionMode::Refresh,
+                    cancel_epoch: epochs.start,
+                },
+                allowed,
+                #[cfg(target_os = "macos")]
+                wake_scope,
             )
             .await?
         } else {
             ConnectedPolicyApplyOutcome::Unchanged
         };
+        if outcome.retry_revision(allowed) {
+            state.last_revision_check_unix = None;
+        } else {
+            state.last_seen_force_revision = revision.force_revision.max(policy.force_revision);
+            state.last_seen_address_revision =
+                revision.address_revision.max(policy.address_revision);
+        }
         self.split_tunnel_store
             .save(&state)
             .map_err(|_| CoreError::Storage)?;
@@ -2064,18 +3468,28 @@ where
         now_unix: i64,
         resolver: F,
         epochs: &AddressEditEpochs,
+        allowed: &(impl Fn() -> bool + Sync),
+        #[cfg(target_os = "macos")] wake_scope: Option<&MacosStartWake>,
     ) -> Result<bool, CoreError>
     where
         F: Fn(String) -> Fut + Clone,
         Fut: Future<Output = Option<Vec<String>>>,
     {
         self.ensure_address_edit_runtime_current(epochs)?;
-        if self.ensure_start_not_cancelled(epochs.start).is_err() {
+        if !allowed() || self.ensure_start_not_cancelled(epochs.start).is_err() {
             return Ok(false);
         }
         #[cfg(not(target_os = "android"))]
         let refreshed = self
-            .refresh_retained_split_tunnel(state, now_unix, resolver, None, None)
+            .refresh_retained_split_tunnel(
+                state,
+                now_unix,
+                resolver,
+                RetainedRefresh::Cached(epochs.start),
+                allowed,
+                #[cfg(target_os = "macos")]
+                wake_scope,
+            )
             .await?
             .is_some();
         #[cfg(target_os = "android")]
@@ -2098,6 +3512,8 @@ where
         now_unix: i64,
         resolver: Option<F>,
         epochs: &AddressEditEpochs,
+        allowed: &(impl Fn() -> bool + Sync),
+        #[cfg(target_os = "macos")] wake_scope: Option<&MacosStartWake>,
     ) -> Result<SplitTunnelSyncOutcome, CoreError>
     where
         F: Fn(String) -> Fut + Clone,
@@ -2105,7 +3521,15 @@ where
     {
         if let Some(resolver) = resolver {
             match self
-                .refresh_cached_split_tunnel(state, now_unix, resolver, epochs)
+                .refresh_cached_split_tunnel(
+                    state,
+                    now_unix,
+                    resolver,
+                    epochs,
+                    allowed,
+                    #[cfg(target_os = "macos")]
+                    wake_scope,
+                )
                 .await
             {
                 Ok(_)
@@ -2115,9 +3539,16 @@ where
             }
         }
         self.ensure_address_edit_runtime_current(epochs)?;
+        let deferred = !allowed();
+        if deferred {
+            state.last_revision_check_unix = None;
+        }
         self.split_tunnel_store
             .save(state)
             .map_err(|_| CoreError::Storage)?;
+        if deferred {
+            return Ok(SplitTunnelSyncOutcome::Skipped);
+        }
         self.set_split_tunnel_warning(SplitTunnelWarningKind::Sync, "split_tunnel_cached_offline")
             .await;
         Ok(SplitTunnelSyncOutcome::CachedOffline)
@@ -2135,7 +3566,7 @@ where
             .map_err(|_| CoreError::Storage)?;
         let track_revision = self.tracks_split_tunnel_revisions(&state).await?;
         let mut access_token = self.access_snapshot().await?;
-        self.flush_pending_apply_results(&mut access_token, &mut state)
+        self.flush_pending_apply_results(&mut access_token, &mut state, &|| true)
             .await;
         let policy = self
             .request_split_tunnel_settings(&mut access_token, request)
@@ -2176,9 +3607,14 @@ where
                 &policy,
                 &mut state,
                 &mut access_token,
-                now_unix,
-                DomainResolutionMode::CachedOnly,
-                self.start_cancellation_epoch(),
+                PolicyApplyContext {
+                    now_unix,
+                    domain_resolution: DomainResolutionMode::CachedOnly,
+                    cancel_epoch: self.start_cancellation_epoch(),
+                },
+                &|| true,
+                #[cfg(target_os = "macos")]
+                None,
             )
             .await?
         } else {
@@ -2233,7 +3669,7 @@ where
             .load()
             .map_err(|_| CoreError::Storage)?;
         let mut access_token = self.access_snapshot().await?;
-        self.flush_pending_apply_results(&mut access_token, &mut state)
+        self.flush_pending_apply_results(&mut access_token, &mut state, &|| true)
             .await;
         let track_revision = self.tracks_split_tunnel_revisions(&state).await?;
         self.ensure_address_edit_runtime_current(&epochs)?;
@@ -2272,7 +3708,7 @@ where
             .load()
             .map_err(|_| CoreError::Storage)?;
         let mut access_token = self.access_snapshot().await?;
-        self.flush_pending_apply_results(&mut access_token, &mut state)
+        self.flush_pending_apply_results(&mut access_token, &mut state, &|| true)
             .await;
         let track_revision = self.tracks_split_tunnel_revisions(&state).await?;
         self.ensure_address_edit_runtime_current(&epochs)?;
@@ -2328,9 +3764,14 @@ where
                 &policy,
                 state,
                 access_token,
-                now_unix,
-                DomainResolutionMode::Refresh,
-                epochs.start,
+                PolicyApplyContext {
+                    now_unix,
+                    domain_resolution: DomainResolutionMode::Refresh,
+                    cancel_epoch: epochs.start,
+                },
+                &|| true,
+                #[cfg(target_os = "macos")]
+                None,
             )
             .await
         {
@@ -2531,7 +3972,7 @@ where
             .save(&state)
             .map_err(|_| CoreError::Storage)?;
         if let Some(access_token) = access_token {
-            self.flush_pending_apply_results(access_token, &mut state)
+            self.flush_pending_apply_results(access_token, &mut state, &|| true)
                 .await;
             self.split_tunnel_store
                 .save(&state)
@@ -2540,8 +3981,14 @@ where
         Ok(())
     }
 
-    pub(crate) async fn retry_pending_split_tunnel_results(&self) {
+    pub(crate) async fn retry_pending_split_tunnel_results(
+        &self,
+        allowed: &(impl Fn() -> bool + Sync),
+    ) {
         let _guard = self.split_tunnel_gate.lock().await;
+        if !allowed() {
+            return;
+        }
         let Ok(mut state) = self.split_tunnel_store.load() else {
             return;
         };
@@ -2551,7 +3998,7 @@ where
         let Ok(mut access_token) = self.access_snapshot().await else {
             return;
         };
-        self.flush_pending_apply_results(&mut access_token, &mut state)
+        self.flush_pending_apply_results(&mut access_token, &mut state, allowed)
             .await;
         let _ = self.split_tunnel_store.save(&state);
     }
@@ -2598,11 +4045,19 @@ where
         policy: &SplitTunnelPolicy,
         state: &mut StoredSplitTunnelState,
         access_token: &mut AccessSnapshot,
-        now_unix: i64,
-        domain_resolution: DomainResolutionMode,
-        cancel_epoch: crate::StartCancellationEpoch,
+        apply: PolicyApplyContext,
+        allowed: &(impl Fn() -> bool + Sync),
+        #[cfg(target_os = "macos")] wake_scope: Option<&MacosStartWake>,
     ) -> Result<ConnectedPolicyApplyOutcome, CoreError> {
+        let PolicyApplyContext {
+            now_unix,
+            domain_resolution,
+            cancel_epoch,
+        } = apply;
         self.ensure_start_not_cancelled(cancel_epoch)?;
+        if !allowed() {
+            return Ok(ConnectedPolicyApplyOutcome::Deferred);
+        }
         let current = {
             let current_state = self.state.lock().await;
             (current_state.phase == Phase::Connected)
@@ -2622,17 +4077,21 @@ where
             },
             None => None,
         } {
-            if self
+            let refreshed = self
                 .refresh_retained_split_tunnel(
                     state,
                     now_unix,
                     resolve_domain_ipv4,
-                    None,
-                    Some((resolution, cancel_epoch)),
+                    RetainedRefresh::Apply(resolution, cancel_epoch),
+                    allowed,
+                    #[cfg(target_os = "macos")]
+                    wake_scope,
                 )
-                .await?
-                .is_none()
-            {
+                .await;
+            if !allowed() && refreshed.is_err() {
+                return Ok(ConnectedPolicyApplyOutcome::Deferred);
+            }
+            if refreshed?.is_none() {
                 return Ok(ConnectedPolicyApplyOutcome::Deferred);
             }
             clear_policy_failure(state);
@@ -2640,6 +4099,7 @@ where
                 access_token,
                 state,
                 applied_policy_result(policy, now_unix)?,
+                allowed,
             )
             .await;
             return Ok(ConnectedPolicyApplyOutcome::AppliedWithoutReconnect);
@@ -2656,7 +4116,7 @@ where
         // publish the cache belonging to the plan that is actually applied.
         let mut proposed_state = state.clone();
         let mut previous_state = state.clone();
-        let new_options = match self
+        let prepared_options = self
             .effective_tunnel_options_with_state(
                 policy,
                 connection.layer,
@@ -2665,8 +4125,11 @@ where
                 now_unix,
                 domain_resolution,
             )
-            .await
-        {
+            .await;
+        if !allowed() {
+            return Ok(ConnectedPolicyApplyOutcome::Deferred);
+        }
+        let new_options = match prepared_options {
             Ok(options) => options,
             Err(CoreError::SplitTunnel(code)) => {
                 self.set_split_tunnel_warning(SplitTunnelWarningKind::Sync, code.clone())
@@ -2687,7 +4150,7 @@ where
         // may be reconstructed from persistent working-policy state.
         if !previous.is_available_for(&connection.lease_id, cancel_epoch) {
             if let Some(working_policy) = working_policy(state).cloned() {
-                previous_options = match self
+                let rollback_options = self
                     .effective_tunnel_options_with_state(
                         &working_policy,
                         connection.layer,
@@ -2700,8 +4163,11 @@ where
                             DomainResolutionMode::ResolveMissing
                         },
                     )
-                    .await
-                {
+                    .await;
+                if !allowed() {
+                    return Ok(ConnectedPolicyApplyOutcome::Deferred);
+                }
+                previous_options = match rollback_options {
                     Ok(options) => options,
                     Err(CoreError::SplitTunnel(code)) => {
                         // Replacement needs a known rollback plan. Do not
@@ -2732,6 +4198,9 @@ where
         };
         if !connection_is_still_current {
             return Ok(ConnectedPolicyApplyOutcome::Unchanged);
+        }
+        if !allowed() {
+            return Ok(ConnectedPolicyApplyOutcome::Deferred);
         }
         if new_options.has_same_effective_routes(&previous_options)
             && (previous.is_confirmed_for(&connection.lease_id, cancel_epoch)
@@ -2772,7 +4241,7 @@ where
                 error_code: None,
                 applied_at: rfc3339(now_unix)?,
             };
-            self.report_or_queue_apply_result(access_token, state, result)
+            self.report_or_queue_apply_result(access_token, state, result, allowed)
                 .await;
             return Ok(ConnectedPolicyApplyOutcome::AppliedWithoutReconnect);
         }
@@ -2811,15 +4280,71 @@ where
                 error_code: Some(ERROR_CODE.to_string()),
                 applied_at: rfc3339(now_unix)?,
             };
-            self.report_or_queue_apply_result(access_token, state, result)
+            self.report_or_queue_apply_result(access_token, state, result, allowed)
                 .await;
             return Ok(ConnectedPolicyApplyOutcome::ConfigurationUnavailable);
         };
-        self.retire_split_tunnel_confirmation(&connection, cancel_epoch)
-            .await?;
-        if self.tunnel.stop_for_restart().await.is_err() {
+        if !allowed() {
+            return Ok(ConnectedPolicyApplyOutcome::Deferred);
+        }
+        let previous_had_policy = previous_options.policy_hash.is_some();
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let rollback_options = restart_options_for_current_split_policy(state, previous_options);
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let rollback_options = previous_options;
+        #[cfg(target_os = "macos")]
+        let report = DeferredPolicyReport {
+            requested_hash: policy.policy_hash.clone(),
+            applied_options_hash: new_options.policy_hash.clone(),
+            previous_had_policy,
+            rollback: false,
+            proposed_domains: proposed_state.domain_resolutions.clone(),
+            rollback_domains: previous_state.domain_resolutions.clone(),
+        };
+        let route = RouteRestart {
+            #[cfg(target_os = "macos")]
+            policy: Some(&report),
+            #[cfg(target_os = "macos")]
+            now_unix,
+            #[cfg(target_os = "macos")]
+            rollback: false,
+            connection: &connection,
+            epoch: cancel_epoch,
+            configuration: &configuration,
+            guard: &_connection_guard,
+        };
+        #[cfg(target_os = "macos")]
+        let _route_restart = self.begin_route_restart();
+        let Some(stop_result) = self
+            .stop_for_local_restart(
+                &connection,
+                cancel_epoch,
+                allowed,
+                #[cfg(target_os = "macos")]
+                wake_scope,
+            )
+            .await?
+        else {
+            return Ok(ConnectedPolicyApplyOutcome::StopDeferred);
+        };
+        if stop_result.is_err() {
+            let status = self.tunnel.status().await;
+            #[cfg(target_os = "macos")]
+            if !allowed() {
+                self.park_route_restart(
+                    route,
+                    &new_options,
+                    Some(&rollback_options),
+                    StalledLocalRestartStep::Start {
+                        retry_allowed: true,
+                    },
+                )
+                .await?;
+                retire_route_facts(state);
+                return Ok(ConnectedPolicyApplyOutcome::Deferred);
+            }
             mark_policy_failure(state, policy, now_unix);
-            let phase = match self.tunnel.status().await {
+            let phase = match status {
                 Ok(
                     nelomai_client_tunnel::TunnelStatus::Stopped
                     | nelomai_client_tunnel::TunnelStatus::Stopping
@@ -2860,7 +4385,7 @@ where
                 )
                 .await;
             }
-            self.report_or_queue_apply_result(access_token, state, result)
+            self.report_or_queue_apply_result(access_token, state, result, allowed)
                 .await;
             return Ok(ConnectedPolicyApplyOutcome::StopFailed);
         }
@@ -2869,30 +4394,34 @@ where
             self.ensure_start_not_cancelled(cancel_epoch)?;
             current_state.phase = Phase::Connecting;
         }
-        let start_new = self
-            .tunnel
-            .start_for_restart(nelomai_client_tunnel::TunnelStartRequest {
-                configuration: nelomai_client_tunnel::TunnelConfiguration::new(
-                    configuration.clone(),
-                ),
-                options: new_options.clone(),
-                quick_reconnect: nelomai_client_tunnel::QuickReconnect::Disabled,
-                quick_connection: Some(local_restart_connection(&connection)),
-                redundancy: None,
-            })
-            .await;
-        // Both success and error can follow a physical start. Never dispatch
-        // rollback with a stale epoch; compensate an already dispatched start.
-        self.ensure_offline_start_current(cancel_epoch).await?;
+        let start = |route, options, fallback| {
+            self.start_route_attempt(
+                route,
+                options,
+                fallback,
+                allowed,
+                #[cfg(target_os = "macos")]
+                wake_scope,
+            )
+        };
+        let Some(start_new) = start(route, &new_options, Some(&rollback_options)).await? else {
+            retire_route_facts(state);
+            return Ok(ConnectedPolicyApplyOutcome::Deferred);
+        };
+        let confirm = |route, options| async move {
+            let fingerprint = self.route_fingerprint(options).await;
+            let applied = self
+                .confirm_route_attempt(route, options, fingerprint.as_deref(), allowed)
+                .await?;
+            Ok::<_, CoreError>((applied, fingerprint))
+        };
         let (outcome, status, error_code) = if start_new.is_ok() {
-            *self.split_tunnel_options.lock().await = RunningSplitTunnelOptions::confirmed(
-                new_options.clone(),
-                &connection.lease_id,
-                cancel_epoch,
-            );
-            state.applied_physical_network_fingerprint = self
-                .initialize_physical_network_detector(&new_options)
-                .await;
+            let (applied, fingerprint) = confirm(route, &new_options).await?;
+            if !applied {
+                retire_route_facts(state);
+                return Ok(ConnectedPolicyApplyOutcome::Deferred);
+            }
+            state.applied_physical_network_fingerprint = fingerprint;
             state.domain_resolutions = proposed_state.domain_resolutions;
             record_working_policy(state, policy);
             clear_policy_failure(state);
@@ -2900,8 +4429,6 @@ where
                 .await;
             self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
                 .await;
-            self.publish_local_start_state(cancel_epoch, Phase::Connected, connection)
-                .await?;
             (
                 ConnectedPolicyApplyOutcome::Applied,
                 SplitTunnelApplyStatus::Applied,
@@ -2909,24 +4436,18 @@ where
             )
         } else {
             self.ensure_start_not_cancelled(cancel_epoch)?;
-            let previous_had_policy = previous_options.policy_hash.is_some();
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
-            let rollback_options =
-                restart_options_for_current_split_policy(state, previous_options);
-            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-            let rollback_options = previous_options;
-            let rollback = self
-                .tunnel
-                .start_for_restart(nelomai_client_tunnel::TunnelStartRequest {
-                    configuration: nelomai_client_tunnel::TunnelConfiguration::new(configuration),
-                    options: rollback_options.clone(),
-                    quick_reconnect: nelomai_client_tunnel::QuickReconnect::Disabled,
-                    quick_connection: Some(local_restart_connection(&connection)),
-                    redundancy: None,
-                })
-                .await;
-            self.ensure_offline_start_current(cancel_epoch).await?;
+            let route = route.for_rollback();
+            let Some(rollback) = start(route, &rollback_options, None).await? else {
+                retire_route_facts(state);
+                return Ok(ConnectedPolicyApplyOutcome::Deferred);
+            };
             if rollback.is_ok() {
+                let (applied, fingerprint) = confirm(route, &rollback_options).await?;
+                if !applied {
+                    retire_route_facts(state);
+                    return Ok(ConnectedPolicyApplyOutcome::Deferred);
+                }
+                state.applied_physical_network_fingerprint = fingerprint;
                 let (outcome, status, error_code) =
                     if previous_had_policy && rollback_options.policy_hash.is_none() {
                         state.working_policy_hash = None;
@@ -2947,16 +4468,6 @@ where
                         )
                     };
                 mark_policy_failure(state, policy, now_unix);
-                *self.split_tunnel_options.lock().await = RunningSplitTunnelOptions::confirmed(
-                    rollback_options.clone(),
-                    &connection.lease_id,
-                    cancel_epoch,
-                );
-                state.applied_physical_network_fingerprint = self
-                    .initialize_physical_network_detector(&rollback_options)
-                    .await;
-                self.publish_local_start_state(cancel_epoch, Phase::Connected, connection)
-                    .await?;
                 self.set_split_tunnel_warning(SplitTunnelWarningKind::Operation, error_code)
                     .await;
                 (outcome, status, Some(error_code.to_string()))
@@ -2999,7 +4510,7 @@ where
             self.clear_split_tunnel_warning(SplitTunnelWarningKind::Storage)
                 .await;
         }
-        self.report_or_queue_apply_result(access_token, state, result)
+        self.report_or_queue_apply_result(access_token, state, result, allowed)
             .await;
         Ok(outcome)
     }
@@ -3007,11 +4518,18 @@ where
     async fn request_split_tunnel_revision(
         &self,
         access_token: &mut AccessSnapshot,
+        allowed: &(impl Fn() -> bool + Sync),
     ) -> Result<SplitTunnelRevision, CoreError> {
+        if !allowed() {
+            return Err(CoreError::RecoveryDeferred);
+        }
         match self.api.split_tunnel_revision(access_token).await {
             Ok(response) => Ok(response),
-            Err(CoreApiError::Unauthorized) => {
+            Err(CoreApiError::Unauthorized) if allowed() => {
                 *access_token = self.refresh_access_token(access_token).await?;
+                if !allowed() {
+                    return Err(CoreError::RecoveryDeferred);
+                }
                 self.api
                     .split_tunnel_revision(access_token)
                     .await
@@ -3159,11 +4677,18 @@ where
     async fn request_split_tunnel_policy(
         &self,
         access_token: &mut AccessSnapshot,
+        allowed: &(impl Fn() -> bool + Sync),
     ) -> Result<SplitTunnelPolicy, CoreError> {
+        if !allowed() {
+            return Err(CoreError::RecoveryDeferred);
+        }
         match self.api.split_tunnel_policy(access_token).await {
             Ok(response) => Ok(response),
-            Err(CoreApiError::Unauthorized) => {
+            Err(CoreApiError::Unauthorized) if allowed() => {
                 *access_token = self.refresh_access_token(access_token).await?;
+                if !allowed() {
+                    return Err(CoreError::RecoveryDeferred);
+                }
                 self.api
                     .split_tunnel_policy(access_token)
                     .await
@@ -3244,15 +4769,22 @@ where
         &self,
         access_token: &mut AccessSnapshot,
         result: &SplitTunnelApplyResult,
+        allowed: &(impl Fn() -> bool + Sync),
     ) -> Result<(), CoreError> {
+        if !allowed() {
+            return Err(CoreError::RecoveryDeferred);
+        }
         match self
             .api
             .report_split_tunnel_apply_result(access_token, result)
             .await
         {
             Ok(()) => Ok(()),
-            Err(CoreApiError::Unauthorized) => {
+            Err(CoreApiError::Unauthorized) if allowed() => {
                 *access_token = self.refresh_access_token(access_token).await?;
+                if !allowed() {
+                    return Err(CoreError::RecoveryDeferred);
+                }
                 self.api
                     .report_split_tunnel_apply_result(access_token, result)
                     .await
@@ -3266,10 +4798,15 @@ where
         &self,
         access_token: &mut AccessSnapshot,
         state: &mut StoredSplitTunnelState,
+        allowed: &(impl Fn() -> bool + Sync),
     ) {
         let pending = std::mem::take(&mut state.pending_apply_results);
         for result in pending {
-            if self.send_apply_result(access_token, &result).await.is_err() {
+            if self
+                .send_apply_result(access_token, &result, allowed)
+                .await
+                .is_err()
+            {
                 state.pending_apply_results.push(result);
             }
         }
@@ -3280,11 +4817,23 @@ where
         access_token: &mut AccessSnapshot,
         state: &mut StoredSplitTunnelState,
         result: SplitTunnelApplyResult,
+        allowed: &(impl Fn() -> bool + Sync),
     ) {
-        if self.send_apply_result(access_token, &result).await.is_err() {
+        if self
+            .send_apply_result(access_token, &result, allowed)
+            .await
+            .is_err()
+        {
             state.pending_apply_results.push(result);
         }
     }
+}
+
+fn retire_route_facts(state: &mut StoredSplitTunnelState) {
+    state.working_policy_hash = None;
+    state.working_policy_revision = None;
+    state.applied_physical_network_fingerprint = None;
+    state.last_revision_check_unix = None;
 }
 
 fn physical_network_tracking_active(options: &TunnelOptions) -> bool {

@@ -824,6 +824,29 @@ impl ServiceTunnelBackend for MacosBackend {
         })
     }
 
+    fn macos_probe_path(&self) -> Option<crate::MacosProbePath> {
+        use crate::member_network::counters;
+        if !self.mode.owns_network()
+            || self.state != ServiceTunnelState::Running
+            || self.transport_owner.stopping()
+        {
+            return None;
+        }
+        let owner = self.verified_identity().ok()?;
+        let data = counters::native(owner.index).ok()?;
+        if self.verified_identity().ok()? != owner {
+            return None;
+        }
+        Some(crate::MacosProbePath {
+            interface: owner.interface.clone(),
+            index: owner.index,
+            socket_device: owner.socket.device,
+            socket_inode: owner.socket.inode,
+            sent_ip_packets: data.sent_packets,
+            received_ip_packets: data.received_packets,
+        })
+    }
+
     fn diagnostics(&self) -> Result<String, ServiceError> {
         let mut output = self.diagnostics.render(&self.diagnostic_snapshot());
         append_userspace_log(&mut output, &self.runtime_directory);
@@ -1542,6 +1565,7 @@ fn native_ordinary_userspace_owner() {
             | "foreign-reused"
             | "listener-changed"
             | "dns-foreign"
+            | "probe-path"
     ));
     struct OccupiedSocket {
         path: PathBuf,
@@ -1776,6 +1800,43 @@ fn native_ordinary_userspace_owner() {
         assert_eq!(renamed_service.servers, [scoped_baseline]);
         restore_qa_dns_baseline(saved).unwrap();
         baseline.0 = None;
+        return;
+    }
+    if stage == "probe-path" {
+        use crate::{Request, TunnelRequestHandler};
+        let mut handler = TunnelRequestHandler::new(backend, "test");
+        assert!(handler
+            .handle(Request::metrics(false))
+            .macos_probe_path
+            .is_none());
+        let before = handler
+            .handle(Request::metrics(true))
+            .macos_probe_path
+            .unwrap();
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        socket
+            .send_to(b"native ip counter test", "198.19.236.7:9")
+            .unwrap();
+        let limit = Instant::now() + Duration::from_secs(2);
+        let after = loop {
+            let current = handler
+                .handle(Request::metrics(true))
+                .macos_probe_path
+                .unwrap();
+            if current.sent_ip_packets > before.sent_ip_packets || Instant::now() >= limit {
+                break current;
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        let stop = handler.handle(Request::stop());
+        assert_eq!(stop.state, Some(ServiceTunnelState::Stopped));
+        assert!(handler
+            .handle(Request::metrics(true))
+            .macos_probe_path
+            .is_none());
+        assert!(before.same_tunnel(&after));
+        assert!(after.sent_ip_packets > before.sent_ip_packets);
+        assert_eq!(after.received_ip_packets, before.received_ip_packets);
         return;
     }
     if stage == "listener-changed" {

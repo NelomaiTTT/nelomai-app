@@ -501,6 +501,8 @@ fn actual_runtime_record_projects_known_and_legacy_unknown_cleanup_without_secre
     });
     legacy.pending_start = Some(StoredPendingStart {
         operation_id: "legacy-start".into(),
+        issued_lease_id: None,
+        native_start_attempted: None,
         redundancy_contract_version: None,
         reserve_enabled: None,
         layer: nelomai_contracts::Layer::Tic,
@@ -514,6 +516,7 @@ fn actual_runtime_record_projects_known_and_legacy_unknown_cleanup_without_secre
         cancel_operation_id: None,
     });
     legacy.pending_compensation_stop = Some(StoredPendingCompensationStop {
+        inferred_release: false,
         operation_id: "legacy-stop".into(),
         recovery_contract_version: None,
         redundant_session_id: None,

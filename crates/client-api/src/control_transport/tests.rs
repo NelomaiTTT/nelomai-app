@@ -732,6 +732,29 @@ impl Dialer for PanelRoute {
 }
 
 #[tokio::test]
+async fn wake_health_uses_the_backup_tls_path_when_the_primary_does_not_answer() {
+    use crate::panel_dns::https_tests::{DnsAnswer, DnsScope, HttpsFixture, Reply};
+
+    let primary = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backup = HttpsFixture::start_with(true, Reply::Status(200));
+    let _roots = DnsScope::new(DnsAnswer::Success, backup.address).with_roots(true);
+    let mut api = crate::ClientApi::new("https://nelomai.ru").unwrap();
+    api.http.control = Some(Arc::new(Slot::new(
+        Url::parse("https://nelomai.ru").unwrap(),
+        Arc::new(PanelRoute {
+            primary: primary.local_addr().unwrap(),
+            backup: backup.address,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }),
+    )));
+
+    assert!(api.probe_wake_control_network().await);
+    let (request, sni) = backup.server.join().unwrap();
+    assert_eq!(sni.as_deref(), Some("nelomai.top"));
+    assert!(request.unwrap().starts_with("GET /health HTTP/1.1"));
+}
+
+#[tokio::test]
 async fn native_panel_uses_independent_backup_tls_identity_after_pre_http_failure() {
     use crate::panel_dns::https_tests::{DnsAnswer, DnsScope, HttpsFixture, Reply};
     let primary = HttpsFixture::start_with(true, Reply::Status(200));

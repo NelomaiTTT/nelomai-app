@@ -163,6 +163,284 @@ fn real_engine_channel_keeps_diagnostics_rebind_and_eof_cleanup() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn cancelled_stall_rebind_never_reaches_native_engine() {
+    use nelomai_client_tunnel::{StallRebindGuard, TunnelController};
+    use nelomai_contracts::dispatcher as d;
+    use nelomai_unix_service::UnixTunnelController;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    for drop_future in [true, false] {
+        let (root, owner) = owned_dispatcher();
+        let dispatcher_path = root.path().join("life.sock");
+        let native_path = root.path().join("test.sock");
+        let uid = unsafe { libc::geteuid() };
+        let dispatcher = bind_listener(&dispatcher_path, uid).unwrap();
+        let native = bind_listener(&native_path, uid).unwrap();
+        let identity = owner.lock().unwrap().layout.identity.clone();
+        let binding = d::CommonEngineBinding::default();
+        binding.bind(identity.clone()).unwrap();
+        let (version_seen, seen) = tokio::sync::oneshot::channel();
+        let (allow_reply, held) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = dispatcher.accept().unwrap();
+            let request = d::read_frame(&mut socket, d::MAX_DISPATCHER_FRAME).unwrap();
+            assert!(matches!(
+                serde_json::from_slice(d::frame_body(&request, d::MAX_DISPATCHER_FRAME).unwrap())
+                    .unwrap(),
+                d::DispatcherRequest::Version {
+                    contract_version: 1
+                }
+            ));
+            version_seen.send(()).unwrap();
+            held.recv_timeout(Duration::from_secs(4)).unwrap();
+            socket
+                .write_all(
+                    &d::encode_frame(&d::DispatcherResponse::success(identity, true)).unwrap(),
+                )
+                .unwrap();
+        });
+        let controller = UnixTunnelController::new(
+            UnixSocketTransport::with_dispatcher(native_path, dispatcher_path).for_common(binding),
+        );
+        let current = Arc::new(AtomicBool::new(true));
+        let still_current = Arc::clone(&current);
+        let guard = StallRebindGuard::new(Instant::now() + Duration::from_secs(15), move || {
+            still_current.load(Ordering::SeqCst)
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let rebind = tokio::spawn(async move { controller.rebind_udp_for_stall(guard).await });
+            tokio::time::timeout(Duration::from_secs(3), seen)
+                .await
+                .unwrap()
+                .unwrap();
+            if drop_future {
+                rebind.abort();
+                assert!(rebind.await.unwrap_err().is_cancelled());
+                allow_reply.send(()).unwrap();
+            } else {
+                current.store(false, Ordering::SeqCst);
+                allow_reply.send(()).unwrap();
+                assert!(rebind.await.unwrap().is_err());
+            }
+        });
+        server.join().unwrap();
+        // Drain any detached blocking exchange before checking the native socket.
+        native.set_nonblocking(true).unwrap();
+        drop(runtime);
+        assert!(matches!(
+            native.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn cancelled_stall_start_during_dispatcher_version_never_dispatches_start() {
+    assert_cancelled_stall_start(false);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn cancelled_stall_start_during_dispatcher_start_never_contacts_native_engine() {
+    assert_cancelled_stall_start(true);
+}
+
+#[cfg(target_os = "macos")]
+fn assert_cancelled_stall_start(delay_lifecycle_start: bool) {
+    use nelomai_client_tunnel::{
+        TunnelConfiguration, TunnelController, TunnelError, TunnelStartRequest, WakeDispatchGuard,
+        WAKE_DISPATCH_DEFERRED,
+    };
+    use nelomai_contracts::dispatcher as d;
+    use nelomai_unix_service::UnixTunnelController;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    for drop_future in [false, true] {
+        let (root, owner) = owned_dispatcher();
+        let dispatcher_path = root.path().join("life.sock");
+        let native_path = root.path().join("test.sock");
+        let uid = unsafe { libc::geteuid() };
+        let dispatcher = bind_listener(&dispatcher_path, uid).unwrap();
+        let native = bind_listener(&native_path, uid).unwrap();
+        let identity = owner.lock().unwrap().layout.identity.clone();
+        let binding = d::CommonEngineBinding::default();
+        binding.bind(identity.clone()).unwrap();
+        let (request_seen, seen) = tokio::sync::oneshot::channel();
+        let (allow_reply, held) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let read_request = |socket: &mut std::os::unix::net::UnixStream| {
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let frame = d::read_frame(socket, d::MAX_DISPATCHER_FRAME).unwrap();
+                serde_json::from_slice::<d::DispatcherRequest>(
+                    d::frame_body(&frame, d::MAX_DISPATCHER_FRAME).unwrap(),
+                )
+                .unwrap()
+            };
+            let mut reply_to = dispatcher.accept().unwrap().0;
+            assert!(matches!(
+                read_request(&mut reply_to),
+                d::DispatcherRequest::Version {
+                    contract_version: 1
+                }
+            ));
+            if delay_lifecycle_start {
+                reply_to
+                    .write_all(
+                        &d::encode_frame(&d::DispatcherResponse::success(identity.clone(), false))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                reply_to = dispatcher.accept().unwrap().0;
+                assert!(matches!(
+                    read_request(&mut reply_to),
+                    d::DispatcherRequest::Start { contract_version: 1, identity: requested }
+                        if requested == identity
+                ));
+            }
+            request_seen.send(()).unwrap();
+            held.recv_timeout(Duration::from_secs(4)).unwrap();
+            reply_to
+                .write_all(
+                    &d::encode_frame(&d::DispatcherResponse::success(
+                        identity,
+                        delay_lifecycle_start,
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+            dispatcher
+        });
+
+        let controller = UnixTunnelController::new(
+            UnixSocketTransport::with_dispatcher(native_path, dispatcher_path).for_common(binding),
+        );
+        let current = Arc::new(AtomicBool::new(true));
+        let still_current = Arc::clone(&current);
+        let guard = WakeDispatchGuard::new(None, move || still_current.load(Ordering::SeqCst));
+        let request = TunnelStartRequest::full_tunnel(TunnelConfiguration::new(
+            "[Interface]\nAddress = 10.0.0.2/32\n".into(),
+        ));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let start = tokio::spawn(async move { controller.start_guarded(request, guard).await });
+            tokio::time::timeout(Duration::from_secs(3), seen)
+                .await
+                .unwrap()
+                .unwrap();
+            if drop_future {
+                start.abort();
+                assert!(start.await.unwrap_err().is_cancelled());
+                allow_reply.send(()).unwrap();
+            } else {
+                current.store(false, Ordering::SeqCst);
+                allow_reply.send(()).unwrap();
+                assert!(matches!(
+                    start.await.unwrap(),
+                    Err(TunnelError::Backend(code)) if code == WAKE_DISPATCH_DEFERRED
+                ));
+            }
+        });
+        let dispatcher = server.join().unwrap();
+        // A dropped async caller can leave a blocking worker completing its lookup.
+        drop(runtime);
+        dispatcher.set_nonblocking(true).unwrap();
+        native.set_nonblocking(true).unwrap();
+        assert!(matches!(
+            dispatcher.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert!(matches!(
+            native.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn current_stall_start_dispatches_one_ordinary_request() {
+    use nelomai_client_tunnel::{
+        TunnelConfiguration, TunnelController, TunnelError, TunnelStartRequest, WakeDispatchGuard,
+        WAKE_DISPATCH_DEFERRED,
+    };
+    use nelomai_contracts::dispatcher as d;
+    use nelomai_unix_service::{
+        decode_request, encode_response, Request, Response, UnixTunnelController,
+    };
+    use std::io::Write;
+    use std::time::Duration;
+
+    let root = tempdir().unwrap();
+    let path = root.path().join("test.sock");
+    let native = bind_listener(&path, unsafe { libc::geteuid() }).unwrap();
+    let controller = UnixTunnelController::new(UnixSocketTransport::new(path));
+    let request = || {
+        let mut request = TunnelStartRequest::full_tunnel(TunnelConfiguration::new(
+            "[Interface]\nAddress = 10.0.0.2/32\nDNS = 192.0.2.1\n".into(),
+        ));
+        request.options.dns_servers = vec!["192.0.2.2".parse().unwrap()];
+        request
+    };
+    assert!(matches!(
+        controller
+            .start_guarded(request(), WakeDispatchGuard::new(None, || false))
+            .await,
+        Err(TunnelError::Backend(code)) if code == WAKE_DISPATCH_DEFERRED
+    ));
+    native.set_nonblocking(true).unwrap();
+    assert!(matches!(
+        native.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    native.set_nonblocking(false).unwrap();
+    let helper = std::thread::spawn(move || {
+        let (mut stream, _) = native.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let frame = d::read_frame(&mut stream, d::MAX_ENGINE_FRAME).unwrap();
+        assert!(matches!(
+            decode_request(&frame).unwrap(),
+            Request::Start { configuration, .. }
+                if configuration.as_str() == "[Interface]\nAddress = 10.0.0.2/32\nDNS = 192.0.2.2\n"
+        ));
+        stream
+            .write_all(
+                &encode_response(&Response::success(Some(ServiceTunnelState::Running))).unwrap(),
+            )
+            .unwrap();
+        native
+    });
+    controller
+        .start_guarded(request(), WakeDispatchGuard::new(None, || true))
+        .await
+        .unwrap();
+    let native = helper.join().unwrap();
+    native.set_nonblocking(true).unwrap();
+    assert!(matches!(
+        native.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+}
+
 #[tokio::test]
 async fn common_bound_transport_launches_signed_stable_through_real_dispatcher_socket() {
     use nelomai_contracts::{dispatcher as d, RuntimeSlot};
@@ -528,11 +806,12 @@ async fn native_macos_start_fits_the_client_ipc_deadline() {
                     owner_uid: 0,
                     installed_client_path: std::env::current_exe().unwrap().canonicalize().unwrap(),
                 };
-                let start = serve_one(&listener, &policy, &mut handler);
+                let calls = if reserve { 4 } else { 3 };
                 // Process Stop before asserting the Start result, including
                 // when the client gives up before the server completes.
-                let stop = serve_one(&listener, &policy, &mut handler);
-                (start, stop)
+                (0..calls)
+                    .map(|_| serve_one(&listener, &policy, &mut handler))
+                    .collect::<Vec<_>>()
             }
         });
         let (start, stop) = if reserve {
@@ -564,14 +843,41 @@ async fn native_macos_start_fits_the_client_ipc_deadline() {
         } else {
             (
                 Request::start_with_options(configuration.into(), options.clone()),
-                Request::stop(),
+                Request::stop_if_unowned(),
             )
         };
         let transport = UnixSocketTransport::new(socket);
         let started_at = std::time::Instant::now();
-        let started = transport.exchange(start).await;
+        let started = transport
+            .exchange_wake_mutation(
+                start,
+                nelomai_client_tunnel::WakeDispatchGuard::new(None, || true),
+            )
+            .await;
         let start_ms = started_at.elapsed().as_millis();
-        let stopped = transport.exchange(stop).await;
+        let guarded_stop = |allowed: bool| {
+            transport.exchange_wake_mutation(
+                Request::stop_if_unowned(),
+                nelomai_client_tunnel::WakeDispatchGuard::new(None, move || allowed),
+            )
+        };
+        let deferred = guarded_stop(false).await;
+        let foreign_stop = if reserve {
+            Some(guarded_stop(true).await)
+        } else {
+            None
+        };
+        let still_live = transport.exchange(Request::status()).await;
+        let stopped = if reserve {
+            transport.exchange(stop).await
+        } else {
+            transport
+                .exchange_wake_mutation(
+                    stop,
+                    nelomai_client_tunnel::WakeDispatchGuard::new(None, || true),
+                )
+                .await
+        };
         let service = server.join().unwrap();
         let started = started.expect("native Start must answer before the client IPC deadline");
         assert!(
@@ -579,8 +885,23 @@ async fn native_macos_start_fits_the_client_ipc_deadline() {
             "Start returned {:?}",
             started.error_code
         );
-        assert!(service.0.is_ok(), "Start response failed: {:?}", service.0);
-        assert!(service.1.is_ok(), "Stop response failed: {:?}", service.1);
+        assert!(
+            service.iter().all(Result::is_ok),
+            "native responses: {service:?}"
+        );
+        assert!(matches!(deferred, Err(ServiceError::WakeDispatchDeferred)));
+        if let Some(result) = foreign_stop {
+            assert!(
+                result.unwrap().error_code.is_some(),
+                "singleton Stop must preserve a pair"
+            );
+        }
+        let still_live = still_live.unwrap();
+        assert!(matches!(
+            still_live.state,
+            Some(ServiceTunnelState::Starting | ServiceTunnelState::Running)
+        ));
+        assert_eq!(still_live.redundancy.is_some(), reserve);
         let stopped = stopped.unwrap();
         assert!(
             stopped.error_code.is_none(),

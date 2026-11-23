@@ -448,6 +448,106 @@ pub enum TunnelError {
     InvalidOptions { code: &'static str },
 }
 
+/// The queued recovery command was rejected before native dispatch.
+#[cfg(target_os = "macos")]
+pub const WAKE_DISPATCH_DEFERRED: &str = "wake_dispatch_deferred";
+
+#[cfg(target_os = "macos")]
+pub type DispatchCancellation = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+#[cfg(target_os = "macos")]
+/// Admission for a queued native recovery operation in this macOS wake.
+pub struct WakeDispatchGuard {
+    cancellation: Option<DispatchCancellation>,
+    uptime_deadline: Option<std::time::Duration>,
+    wake_stamp: Option<i64>,
+    can_dispatch: Box<dyn Fn() -> bool + Send>,
+}
+
+#[cfg(target_os = "macos")]
+impl WakeDispatchGuard {
+    pub fn new(wake_stamp: Option<i64>, can_dispatch: impl Fn() -> bool + Send + 'static) -> Self {
+        Self {
+            cancellation: None,
+            uptime_deadline: None,
+            wake_stamp,
+            can_dispatch: Box::new(can_dispatch),
+        }
+    }
+
+    /// Revoke an unsent mutation while preserving the reply of one already dispatched.
+    pub fn with_cancellation(
+        mut self,
+        revoked: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Self {
+        self.cancellation = Some(Box::pin(revoked));
+        self
+    }
+
+    pub fn take_cancellation(&mut self) -> Option<DispatchCancellation> {
+        self.cancellation.take()
+    }
+
+    /// Absolute CLOCK_MONOTONIC_RAW deadline, shared by Runtime and Common.
+    pub fn with_uptime_deadline(mut self, deadline: Option<std::time::Duration>) -> Self {
+        self.uptime_deadline = deadline;
+        self
+    }
+
+    pub fn uptime_deadline(&self) -> Option<std::time::Duration> {
+        self.uptime_deadline
+    }
+
+    pub fn wake_stamp(&self) -> Option<i64> {
+        self.wake_stamp
+    }
+
+    pub fn is_current(&self) -> bool {
+        (self.can_dispatch)()
+    }
+}
+
+/// Authority to dispatch one ordinary macOS stall rebind before its deadline.
+#[cfg(target_os = "macos")]
+pub struct StallRebindGuard {
+    wake: Option<WakeDispatchGuard>,
+    deadline: std::time::Instant,
+    can_dispatch: Box<dyn Fn() -> bool + Send>,
+}
+
+#[cfg(target_os = "macos")]
+impl StallRebindGuard {
+    pub fn new(
+        deadline: std::time::Instant,
+        can_dispatch: impl Fn() -> bool + Send + 'static,
+    ) -> Self {
+        Self {
+            wake: None,
+            deadline,
+            can_dispatch: Box::new(can_dispatch),
+        }
+    }
+
+    pub fn with_wake(mut self, wake: WakeDispatchGuard) -> Self {
+        self.wake = Some(wake);
+        self
+    }
+
+    pub fn wake(&self) -> Option<&WakeDispatchGuard> {
+        self.wake.as_ref()
+    }
+
+    pub fn deadline(&self) -> std::time::Instant {
+        self.deadline
+    }
+
+    pub fn is_current(&self) -> bool {
+        (self.can_dispatch)()
+            && std::time::Instant::now() < self.deadline
+            && self.wake.as_ref().is_none_or(WakeDispatchGuard::is_current)
+    }
+}
+
 #[async_trait]
 pub trait TunnelController: Send + Sync {
     /// Positive, authenticated proof that desktop cleanup left no pair and the
@@ -467,6 +567,17 @@ pub trait TunnelController: Send + Sync {
             "desktop_redundancy_unsupported".into(),
         ))
     }
+    #[cfg(target_os = "macos")]
+    async fn desktop_redundancy_command_guarded(
+        &self,
+        command: redundancy::protocol::Command,
+        guard: WakeDispatchGuard,
+    ) -> Result<redundancy::protocol::Snapshot, TunnelError> {
+        if !guard.is_current() {
+            return Err(TunnelError::Backend(WAKE_DISPATCH_DEFERRED.into()));
+        }
+        self.desktop_redundancy_command(command).await
+    }
     async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError>;
     async fn stop(&self) -> Result<(), TunnelError>;
     /// Prepare a same-lease local restart, not a user cancellation. Android
@@ -477,10 +588,29 @@ pub trait TunnelController: Send + Sync {
     async fn start_for_restart(&self, request: TunnelStartRequest) -> Result<(), TunnelError> {
         self.start(request).await
     }
+    /// Restart the ordinary macOS tunnel while the recovery still has dispatch authority.
+    #[cfg(target_os = "macos")]
+    async fn start_guarded(
+        &self,
+        request: TunnelStartRequest,
+        guard: WakeDispatchGuard,
+    ) -> Result<(), TunnelError> {
+        if !guard.is_current() {
+            return Err(TunnelError::Backend(WAKE_DISPATCH_DEFERRED.into()));
+        }
+        self.start_for_restart(request).await
+    }
     /// Core cleanup must not cancel an independent native session. Native
     /// owners enforce this at command execution, not just at a prior status read.
     async fn stop_if_unowned(&self) -> Result<(), TunnelError> {
         self.stop().await
+    }
+    #[cfg(target_os = "macos")]
+    async fn stop_if_unowned_guarded(&self, guard: WakeDispatchGuard) -> Result<(), TunnelError> {
+        if !guard.is_current() {
+            return Err(TunnelError::Backend(WAKE_DISPATCH_DEFERRED.into()));
+        }
+        self.stop_if_unowned().await
     }
     /// Rebind the client UDP socket without replacing the panel lease.
     ///
@@ -488,6 +618,14 @@ pub trait TunnelController: Send + Sync {
     /// when the platform does not support the operation.
     async fn rebind_udp(&self) -> Result<bool, TunnelError> {
         Ok(false)
+    }
+    /// Rebind the ordinary macOS tunnel without a preliminary status query.
+    #[cfg(target_os = "macos")]
+    async fn rebind_udp_for_stall(&self, guard: StallRebindGuard) -> Result<bool, TunnelError> {
+        if !guard.is_current() {
+            return Err(TunnelError::Backend("udp_rebind_cancelled".into()));
+        }
+        self.rebind_udp().await
     }
     async fn status(&self) -> Result<TunnelStatus, TunnelError>;
     /// A native owner manages the whole v2 session, including its configurations.

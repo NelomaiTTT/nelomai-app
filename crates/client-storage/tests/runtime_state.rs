@@ -313,6 +313,7 @@ fn exact_cleanup_snapshot_is_sanitized_and_fences_late_runtime_writes() {
     .unwrap();
     legacy.pending_compensation_stop =
         Some(nelomai_client_storage::StoredPendingCompensationStop {
+            inferred_release: false,
             operation_id: "legacy-stop".into(),
             lease_id: "lease-b".into(),
             recovery_contract_version: None,

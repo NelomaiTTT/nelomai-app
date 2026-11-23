@@ -192,7 +192,7 @@ pub(crate) fn receive_endpoint(stream: &mut UnixStream) -> io::Result<UnixStream
     {
         return Err(failed());
     }
-    // Called once before run_product creates runtime threads/subprocesses.
+    // Keep the received endpoint out of child process inheritance.
     if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
         return Err(io::Error::last_os_error());
     }

@@ -83,6 +83,8 @@ type NativeApplication = ClientApplication<
 pub(crate) struct SplitTunnelScheduler {
     gate: Mutex<()>,
     startup_gate: Arc<Mutex<()>>,
+    #[cfg(target_os = "macos")]
+    startup_refresh: tokio::sync::Notify,
 }
 
 pub(crate) struct PushRegistrationScheduler {
@@ -94,9 +96,12 @@ impl SplitTunnelScheduler {
         Self {
             gate: Mutex::new(()),
             startup_gate: Arc::new(Mutex::new(())),
+            #[cfg(target_os = "macos")]
+            startup_refresh: tokio::sync::Notify::new(),
         }
     }
 
+    #[cfg(any(not(target_os = "macos"), test))]
     pub(crate) async fn schedule_startup_sync(
         &self,
         wait_for_initial_policy: bool,
@@ -117,6 +122,14 @@ impl SplitTunnelScheduler {
 
     pub(crate) async fn wait_for_startup_sync(&self) {
         let _guard = self.startup_gate.lock().await;
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn wait_for_policy_poll(&self, interval: &mut tokio::time::Interval) {
+        tokio::select! {
+            _ = interval.tick() => {},
+            _ = self.startup_refresh.notified() => {},
+        }
     }
 
     pub(crate) async fn synchronize(
@@ -149,6 +162,26 @@ async fn startup_policy_waits_for_the_registered_initial_sync() {
     }
     release.send(()).unwrap();
     waiting.await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn bootstrap_refresh_wakes_the_regular_policy_worker_and_coalesces_repeats() {
+    let scheduler = SplitTunnelScheduler::new();
+    let mut interval = tokio::time::interval(SPLIT_TUNNEL_POLL_INTERVAL);
+    interval.tick().await;
+    scheduler.startup_refresh.notify_one();
+    scheduler.startup_refresh.notify_one();
+    tokio::select! {
+        biased;
+        _ = scheduler.wait_for_policy_poll(&mut interval) => {}
+        _ = std::future::ready(()) => panic!("lost the bootstrap refresh"),
+    }
+    tokio::select! {
+        biased;
+        _ = scheduler.wait_for_policy_poll(&mut interval) => panic!("duplicate refresh"),
+        _ = std::future::ready(()) => {}
+    }
 }
 
 #[tokio::test]
@@ -680,6 +713,7 @@ fn automatic_upload_error_code(error: &ApplicationError) -> String {
             CoreError::UpdateRequired => "update_required".to_string(),
             CoreError::SavedConnectionUnavailable => "saved_connection_unavailable".to_string(),
             CoreError::StartCancelled => "connection_intent_cancelled".to_string(),
+            CoreError::RecoveryDeferred => "recovery_power_deferred".to_string(),
             CoreError::Storage => "storage_unavailable".to_string(),
             CoreError::Api(error) => api_code(error),
             CoreError::Tunnel(code) | CoreError::SplitTunnel(code) => code.clone(),
@@ -691,11 +725,83 @@ fn start_split_tunnel_scheduler(
     application: Arc<NativeApplication>,
     scheduler: Arc<SplitTunnelScheduler>,
 ) {
+    #[cfg(target_os = "macos")]
+    use nelomai_client_core::{CoreApiError, CoreError, SplitTunnelSyncOutcome};
+
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(SPLIT_TUNNEL_POLL_INTERVAL);
         interval.tick().await;
+        #[cfg(target_os = "macos")]
+        let mut retrying_wake_poll = false;
+        #[cfg(target_os = "macos")]
+        let mut retry_revision = false;
+        #[cfg(target_os = "macos")]
+        let mut last_panel_epoch = macos_power::panel_work_epoch();
         loop {
+            #[cfg(target_os = "macos")]
+            scheduler.wait_for_policy_poll(&mut interval).await;
+            #[cfg(not(target_os = "macos"))]
             interval.tick().await;
+            #[cfg(target_os = "macos")]
+            {
+                if !macos_power::check_recovery_network(&application)
+                    .await
+                    .allows_panel_work()
+                {
+                    retrying_wake_poll = true;
+                    interval.reset_after(macos_power::RETRY_INTERVAL);
+                    continue;
+                }
+                let Some(epoch) = macos_power::panel_work_epoch() else {
+                    retrying_wake_poll = true;
+                    interval.reset_after(macos_power::RETRY_INTERVAL);
+                    continue;
+                };
+                if last_panel_epoch != Some(epoch) {
+                    // Another scheduler can confirm the wake network before
+                    // this due poll resumes. Keep the short retry in that case.
+                    retrying_wake_poll = true;
+                    last_panel_epoch = Some(epoch);
+                }
+                let Some(repair) = macos_power::local_repair_epoch() else {
+                    retrying_wake_poll = true;
+                    interval.reset_after(macos_power::RETRY_INTERVAL);
+                    continue;
+                };
+                let result = match application.current_access_token().await {
+                    Ok(_) => {
+                        let _guard = scheduler.gate.lock().await;
+                        application
+                            .synchronize_split_tunnel_for_wake(
+                                current_unix_time(),
+                                retry_revision,
+                                repair.wake_stamp(),
+                                move || epoch.is_current() && repair.is_current(),
+                            )
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                retrying_wake_poll = !epoch.is_current()
+                    || retrying_wake_poll
+                        && matches!(
+                            &result,
+                            Ok(SplitTunnelSyncOutcome::CachedOffline)
+                                | Err(ApplicationError::Core(
+                                    CoreError::AuthRefreshPending
+                                        | CoreError::Api(CoreApiError::Retryable)
+                                ))
+                        );
+                // Only bypass the normal cadence after an offline poll
+                // actually consumed a revision check.
+                retry_revision = retrying_wake_poll
+                    && (retry_revision
+                        || matches!(result, Ok(SplitTunnelSyncOutcome::CachedOffline)));
+                if retrying_wake_poll {
+                    interval.reset_after(macos_power::RETRY_INTERVAL);
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
             if application.current_access_token().await.is_ok() {
                 let _ = scheduler.synchronize(&application, false).await;
             }
@@ -726,22 +832,21 @@ fn start_physical_network_scheduler(
         loop {
             interval.tick().await;
             #[cfg(target_os = "macos")]
-            if macos_power::defer_reason().is_some() {
+            let Some(epoch) = macos_power::local_repair_epoch() else {
                 continue;
-            }
+            };
+            #[cfg(target_os = "macos")]
+            let result = application
+                .poll_physical_network_for_wake(
+                    current_unix_time(),
+                    epoch.wake_stamp(),
+                    move || epoch.is_current(),
+                )
+                .await;
+            #[cfg(not(target_os = "macos"))]
+            let result = application.poll_physical_network(current_unix_time()).await;
             if matches!(
-                application
-                    .poll_physical_network_guarded(current_unix_time(), || {
-                        #[cfg(target_os = "macos")]
-                        {
-                            macos_power::defer_reason().is_none()
-                        }
-                        #[cfg(not(target_os = "macos"))]
-                        {
-                            true
-                        }
-                    })
-                    .await,
+                result,
                 Ok(nelomai_client_core::PhysicalNetworkPollOutcome::Reconnected)
             ) {
                 connection_intent.wake_for_network_change().await;
@@ -815,6 +920,7 @@ struct DesktopPairObservation {
 async fn coordinate_desktop_redundancy<T, S, TF, SF>(
     schedule: &mut DesktopCoordinationSchedule,
     now: i64,
+    allow_tick: bool,
     diagnostics: Option<(&diagnostics::AppDiagnostics, &str)>,
     tick: T,
     status: S,
@@ -838,7 +944,7 @@ where
 {
     use nelomai_client_application::ApplicationError;
     use nelomai_client_core::{CoreApiError, CoreError};
-    if schedule.pending.is_none() && now >= schedule.retry_at_unix {
+    if allow_tick && schedule.pending.is_none() && now >= schedule.retry_at_unix {
         schedule.pending = Some(tokio::spawn(tick()));
     }
     let completed = if let Some(pending) = schedule.pending.as_mut() {
@@ -1018,6 +1124,10 @@ fn start_connection_metrics_scheduler(
         let mut last_diagnostics_session: Option<String> = None;
         let mut last_diagnostics_sample = None;
         let mut last_incident_sample = None;
+        #[cfg(target_os = "macos")]
+        let mut last_incident_probe_path: Option<nelomai_unix_service::MacosProbePath> = None;
+        #[cfg(target_os = "macos")]
+        let mut last_incident_scope = None;
         let mut skipped_probe_session: Option<String> = None;
         let mut probe_diagnostics = connection_metrics::ProbeDiagnostics::default();
         #[cfg(not(target_os = "android"))]
@@ -1039,6 +1149,11 @@ fn start_connection_metrics_scheduler(
                 last_diagnostics_session = None;
                 last_diagnostics_sample = None;
                 last_incident_sample = None;
+                #[cfg(target_os = "macos")]
+                {
+                    last_incident_probe_path = None;
+                    last_incident_scope = None;
+                }
                 skipped_probe_session = None;
                 probe_diagnostics = connection_metrics::ProbeDiagnostics::default();
                 #[cfg(not(target_os = "android"))]
@@ -1053,18 +1168,64 @@ fn start_connection_metrics_scheduler(
                 windows_service_recovery.reset();
                 continue;
             };
+            #[cfg(target_os = "macos")]
+            let allow_panel_work = {
+                let readiness = macos_power::check_recovery_network(&application).await;
+                let reason = readiness.defer_reason();
+                if reason != last_power_defer {
+                    diagnostics.record_named(
+                        "tunnel.recovery.power_gate",
+                        Some(&context.session_id),
+                        None,
+                        Some(reason.unwrap_or("recovery_resumed")),
+                    );
+                    last_power_defer = reason;
+                }
+                if !readiness.allows_local_repair() {
+                    last_incident_sample = None;
+                    last_incident_probe_path = None;
+                    last_incident_scope = None;
+                    last_diagnostics_sample = None;
+                    continue;
+                }
+                readiness.allows_panel_work()
+            };
+            #[cfg(not(any(target_os = "macos", target_os = "android")))]
+            let allow_panel_work = true;
             #[cfg(not(target_os = "android"))]
             let coordination_now = current_unix_time();
             #[cfg(not(target_os = "android"))]
             let pair_observation = coordinate_desktop_redundancy(
                 &mut desktop_coordination,
                 coordination_now,
+                allow_panel_work,
                 Some((&diagnostics, &context.session_id)),
                 || {
                     let application = application.clone();
                     async move {
+                        #[cfg(target_os = "macos")]
+                        let Some(epoch) = macos_power::panel_work_epoch() else {
+                            return Ok(None);
+                        };
+                        #[cfg(target_os = "macos")]
+                        let wake_stamp = epoch.wake_stamp();
+                        #[cfg(not(target_os = "macos"))]
+                        let wake_stamp = None;
                         application
-                            .desktop_redundancy_tick(current_unix_time())
+                            .desktop_redundancy_tick_guarded(
+                                current_unix_time(),
+                                wake_stamp,
+                                move || {
+                                    #[cfg(target_os = "macos")]
+                                    {
+                                        epoch.is_current()
+                                    }
+                                    #[cfg(not(target_os = "macos"))]
+                                    {
+                                        true
+                                    }
+                                },
+                            )
                             .await
                     }
                 },
@@ -1085,24 +1246,6 @@ fn start_connection_metrics_scheduler(
             #[cfg(not(any(target_os = "macos", windows, target_os = "android")))]
             let _ = pair_owns_tunnel;
             let observed = tracker.is_observed().await;
-            #[cfg(target_os = "macos")]
-            {
-                let reason = macos_power::defer_reason();
-                if reason != last_power_defer {
-                    diagnostics.record_named(
-                        "tunnel.recovery.power_gate",
-                        Some(&context.session_id),
-                        None,
-                        Some(reason.unwrap_or("recovery_resumed")),
-                    );
-                    last_power_defer = reason;
-                }
-                if reason.is_some() {
-                    last_incident_sample = None;
-                    last_diagnostics_sample = None;
-                    continue;
-                }
-            }
             let endpoint_route_guard =
                 cfg!(windows) && context.layer == nelomai_contracts::Layer::Stray;
             let incident_sampling = cfg!(desktop);
@@ -1126,6 +1269,11 @@ fn start_connection_metrics_scheduler(
             if new_diagnostics_session {
                 last_diagnostics_sample = None;
                 last_incident_sample = None;
+                #[cfg(target_os = "macos")]
+                {
+                    last_incident_probe_path = None;
+                    last_incident_scope = None;
+                }
                 failure_recorded = false;
                 probe_diagnostics = connection_metrics::ProbeDiagnostics::default();
                 #[cfg(any(target_os = "macos", windows))]
@@ -1154,8 +1302,52 @@ fn start_connection_metrics_scheduler(
             }
             let collect_probe_target =
                 cfg!(target_os = "macos") && context.layer == nelomai_contracts::Layer::Stray;
-            match tunnel.metrics(collect_probe_target).await {
+            #[cfg(target_os = "macos")]
+            let ordinary_stray = collect_probe_target && !pair_owns_tunnel;
+            #[cfg(target_os = "macos")]
+            let Some(repair_epoch) = macos_power::local_repair_epoch() else {
+                continue;
+            };
+            #[cfg(target_os = "macos")]
+            let Some(stall_execution) = application.macos_stall_epoch() else {
+                continue;
+            };
+            #[cfg(target_os = "macos")]
+            let recovery_scope = MacosStallScope {
+                power: repair_epoch,
+                execution: stall_execution,
+            };
+            #[cfg(target_os = "macos")]
+            if ordinary_stray
+                && resume_macos_stall_after_wake(
+                    &_app,
+                    &application,
+                    &diagnostics,
+                    &context.session_id,
+                    recovery_scope,
+                    &mut macos_stall_recovery,
+                )
+                .await
+            {
+                continue;
+            }
+            #[cfg(target_os = "macos")]
+            let (metrics, probe_path) = if ordinary_stray {
+                match tunnel.macos_probe_metrics().await {
+                    Ok((metrics, path)) => (Ok(Some(metrics)), path),
+                    Err(error) => (Err(error), None),
+                }
+            } else {
+                (tunnel.metrics(collect_probe_target).await, None)
+            };
+            #[cfg(not(target_os = "macos"))]
+            let metrics = tunnel.metrics(collect_probe_target).await;
+            match metrics {
                 Ok(Some(sample)) => {
+                    #[cfg(target_os = "macos")]
+                    if !recovery_scope.is_current(&application) {
+                        continue;
+                    }
                     failure_recorded = false;
                     #[cfg(windows)]
                     windows_service_recovery.reset();
@@ -1165,16 +1357,46 @@ fn start_connection_metrics_scheduler(
                         let direct_probe_target = take_direct_probe_target(&mut sample);
                         (sample, direct_probe_target)
                     };
+                    #[cfg(not(target_os = "macos"))]
+                    let ip_packet_deltas = None;
+                    #[cfg(target_os = "macos")]
+                    {
+                        let scope = ordinary_stray.then_some(recovery_scope);
+                        if scope != last_incident_scope
+                            || macos_probe_path_changed(
+                                last_incident_probe_path.as_ref(),
+                                probe_path.as_ref(),
+                            )
+                        {
+                            macos_stall_recovery.reset();
+                            diagnostics.restart_tunnel_ip_observation(&context.session_id);
+                            last_incident_sample = None;
+                            last_incident_probe_path = None;
+                        }
+                        last_incident_scope = scope;
+                    }
+                    #[cfg(target_os = "macos")]
+                    let ip_packet_deltas = ordinary_stray.then(|| {
+                        macos_ip_packet_deltas(
+                            last_incident_probe_path.as_ref(),
+                            probe_path.as_ref(),
+                        )
+                    });
                     let incident_observation = diagnostics.observe_tunnel_metrics(
                         &context.session_id,
                         &sample,
                         last_incident_sample.as_ref(),
+                        ip_packet_deltas,
                     );
                     #[cfg(not(target_os = "macos"))]
                     let _ = incident_observation;
                     last_incident_sample = Some(sample.clone());
                     #[cfg(target_os = "macos")]
-                    if !pair_owns_tunnel && context.layer == nelomai_contracts::Layer::Stray {
+                    {
+                        last_incident_probe_path = probe_path;
+                    }
+                    #[cfg(target_os = "macos")]
+                    if ordinary_stray {
                         if let Some(observation) = incident_observation {
                             if macos_stall_recovery.should_attempt(
                                 &context.session_id,
@@ -1183,15 +1405,32 @@ fn start_connection_metrics_scheduler(
                             ) {
                                 let result = diagnose_and_recover_macos_stall(
                                     &_app,
-                                    application.as_ref(),
+                                    &application,
                                     diagnostics.as_ref(),
                                     &context,
-                                    direct_probe_target,
+                                    (direct_probe_target, last_incident_probe_path.as_ref()),
                                     &mut stall_recovery_limiter,
-                                    macos_stall_recovery.allows_uncertain_recovery(),
+                                    (
+                                        recovery_scope,
+                                        macos_stall_recovery.allows_uncertain_recovery(),
+                                    ),
                                 )
                                 .await;
-                                macos_stall_recovery.complete(result, current_unix_time());
+                                let completed_at = current_unix_time();
+                                let result = if result == MacosStallRecoveryResult::Verified {
+                                    if recovery_scope.is_current(&application) {
+                                        diagnostics.confirm_tunnel_ip_recovery(
+                                            &context.session_id,
+                                            completed_at,
+                                        );
+                                        result
+                                    } else {
+                                        MacosStallRecoveryResult::Retry
+                                    }
+                                } else {
+                                    result
+                                };
+                                macos_stall_recovery.complete(result, completed_at);
                             }
                         }
                     } else {
@@ -1299,6 +1538,8 @@ enum DesktopStallClassification {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MacosStallRecoveryResult {
     Complete,
+    #[cfg(target_os = "macos")]
+    Verified,
     Retry,
     RetryAt(i64),
     DirectProbeUnavailable,
@@ -1353,12 +1594,9 @@ impl MacosStallRecoveryEpisode {
 
     fn complete(&mut self, result: MacosStallRecoveryResult, now_unix: i64) {
         match result {
-            MacosStallRecoveryResult::Complete => {
-                self.pending = false;
-                self.retry_count = 0;
-                self.direct_probe_failures = 0;
-                self.next_attempt_at_unix = None;
-            }
+            MacosStallRecoveryResult::Complete => self.reset(),
+            #[cfg(target_os = "macos")]
+            MacosStallRecoveryResult::Verified => self.reset(),
             MacosStallRecoveryResult::Retry | MacosStallRecoveryResult::DirectProbeUnavailable => {
                 self.pending = true;
                 self.retry_count = self.retry_count.saturating_add(1);
@@ -1653,23 +1891,355 @@ fn take_direct_probe_target(
 }
 
 #[cfg(target_os = "macos")]
-async fn diagnose_and_recover_macos_stall(
+async fn probe_macos_tunnel_health(interface: &str, primary_url: tauri::Url) -> MacosTunnelCheck {
+    let backup = nelomai_client_api::panel_backup_url(&primary_url);
+    let primary = probe_macos_health_endpoint(interface, primary_url);
+    let Some(backup) = backup else {
+        return combine_macos_endpoint_checks(primary.await, MacosHealthEndpointCheck::Unavailable);
+    };
+    let backup = probe_macos_health_endpoint(interface, backup);
+    tokio::pin!(primary, backup);
+    let (first, other) = tokio::select! {
+        result = &mut primary => (result, backup.as_mut()),
+        result = &mut backup => (result, primary.as_mut()),
+    };
+    if first == MacosHealthEndpointCheck::Https {
+        return MacosTunnelCheck::Responsive;
+    }
+    combine_macos_endpoint_checks(first, other.await)
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MacosHealthEndpointCheck {
+    Https,
+    Tcp,
+    NoReply,
+    Unavailable,
+}
+
+#[cfg(target_os = "macos")]
+fn combine_macos_endpoint_checks(
+    first: MacosHealthEndpointCheck,
+    second: MacosHealthEndpointCheck,
+) -> MacosTunnelCheck {
+    use MacosHealthEndpointCheck::*;
+    match (first, second) {
+        (Https, _) | (_, Https) => MacosTunnelCheck::Responsive,
+        (Tcp, _) | (_, Tcp) => MacosTunnelCheck::Inconclusive,
+        (NoReply, _) | (_, NoReply) => MacosTunnelCheck::NoReply,
+        (Unavailable, Unavailable) => MacosTunnelCheck::Inconclusive,
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn probe_macos_health_endpoint(interface: &str, url: tauri::Url) -> MacosHealthEndpointCheck {
+    use std::net::SocketAddr;
+
+    let Some(port) = url.port_or_known_default() else {
+        return MacosHealthEndpointCheck::Unavailable;
+    };
+    let mut client = nelomai_client_api::panel_http_client_builder()
+        .interface(interface)
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(3));
+    let addresses = if let Some(host) = url.domain() {
+        // Allow the panel resolver's own one-second fallback deadline to
+        // elapse before bounding an unexpected DNS stall here.
+        let Ok(Ok(mut addresses)) = tokio::time::timeout(
+            Duration::from_secs(2),
+            nelomai_client_api::resolve_panel_addresses(host),
+        )
+        .await
+        else {
+            return MacosHealthEndpointCheck::Unavailable;
+        };
+        if addresses.is_empty() {
+            return MacosHealthEndpointCheck::Unavailable;
+        }
+        for address in &mut addresses {
+            address.set_port(port);
+        }
+        client = client.resolve_to_addrs(host, &addresses);
+        addresses
+    } else {
+        let Some(ip) = url.host_str().and_then(|host| {
+            host.trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .ok()
+        }) else {
+            return MacosHealthEndpointCheck::Unavailable;
+        };
+        vec![SocketAddr::new(ip, port)]
+    };
+    let Ok(client) = client.build() else {
+        return MacosHealthEndpointCheck::Unavailable;
+    };
+    match client.get(url).send().await {
+        Ok(_) => MacosHealthEndpointCheck::Https,
+        // The HTTP connector also times the TLS handshake. Confirm a lack
+        // of TCP replies separately before using it as a reason to repair.
+        Err(error) if error.is_connect() || error.is_timeout() => {
+            match verify_macos_tcp_reply(interface, addresses).await {
+                MacosHealthEndpointCheck::NoReply if !error.is_timeout() => {
+                    MacosHealthEndpointCheck::Unavailable
+                }
+                check => check,
+            }
+        }
+        Err(_) => MacosHealthEndpointCheck::Unavailable,
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn verify_macos_tcp_reply(
+    interface: &str,
+    addresses: Vec<std::net::SocketAddr>,
+) -> MacosHealthEndpointCheck {
+    use std::{ffi::CString, os::fd::AsRawFd};
+    use tokio::net::TcpSocket;
+
+    let Ok(interface) = CString::new(interface) else {
+        return MacosHealthEndpointCheck::Unavailable;
+    };
+    let index = unsafe { libc::if_nametoindex(interface.as_ptr()) };
+    if index == 0 {
+        return MacosHealthEndpointCheck::Unavailable;
+    }
+    let mut probes = tokio::task::JoinSet::new();
+    for address in addresses {
+        probes.spawn(async move {
+            let (socket, level, option) = if address.is_ipv4() {
+                (TcpSocket::new_v4()?, libc::IPPROTO_IP, libc::IP_BOUND_IF)
+            } else {
+                (
+                    TcpSocket::new_v6()?,
+                    libc::IPPROTO_IPV6,
+                    libc::IPV6_BOUND_IF,
+                )
+            };
+            if unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    level,
+                    option,
+                    (&index as *const u32).cast(),
+                    std::mem::size_of_val(&index) as libc::socklen_t,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            match tokio::time::timeout(Duration::from_secs(2), socket.connect(address)).await {
+                Ok(result) => result.map(|_| false),
+                Err(_) => Ok(true),
+            }
+        });
+    }
+    let mut timed_out = false;
+    while let Some(result) = probes.join_next().await {
+        match result {
+            Ok(Ok(false)) => return MacosHealthEndpointCheck::Tcp,
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                return MacosHealthEndpointCheck::Tcp;
+            }
+            Ok(Ok(true)) => timed_out = true,
+            _ => {}
+        }
+    }
+    if timed_out {
+        MacosHealthEndpointCheck::NoReply
+    } else {
+        MacosHealthEndpointCheck::Unavailable
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MacosTunnelCheck {
+    Responsive,
+    NoReply,
+    Inconclusive,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MacosStallScope {
+    power: macos_power::LocalRepairEpoch,
+    execution: nelomai_client_core::MacosStallEpoch,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosStallScope {
+    fn is_current(self, application: &NativeApplication) -> bool {
+        self.power.is_current() && application.macos_stall_epoch_is_current(self.execution)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_probe_path_changed(
+    before: Option<&nelomai_unix_service::MacosProbePath>,
+    after: Option<&nelomai_unix_service::MacosProbePath>,
+) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => !before.same_tunnel(after),
+        (None, None) => false,
+        _ => true,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_ip_packet_deltas(
+    before: Option<&nelomai_unix_service::MacosProbePath>,
+    after: Option<&nelomai_unix_service::MacosProbePath>,
+) -> (u64, u64) {
+    match (before, after) {
+        (Some(before), Some(after)) if before.same_tunnel(after) => (
+            after.sent_ip_packets.saturating_sub(before.sent_ip_packets),
+            after
+                .received_ip_packets
+                .saturating_sub(before.received_ip_packets),
+        ),
+        _ => (0, 0),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_tunnel_check(
+    before: &nelomai_unix_service::MacosProbePath,
+    after: Option<&nelomai_unix_service::MacosProbePath>,
+    probe: MacosTunnelCheck,
+) -> MacosTunnelCheck {
+    if after.is_some_and(|sample| before.same_tunnel(sample)) {
+        probe
+    } else {
+        MacosTunnelCheck::Inconclusive
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn verify_macos_local_repair(
     app: &tauri::AppHandle,
     application: &NativeApplication,
+    scope: MacosStallScope,
+    expected: Option<&nelomai_unix_service::MacosProbePath>,
+) -> MacosTunnelCheck {
+    use tauri::Manager;
+
+    if !scope.is_current(application) {
+        return MacosTunnelCheck::Inconclusive;
+    }
+    let Ok(url) = tauri::Url::parse(&format!("{PANEL_BASE}/health")) else {
+        return MacosTunnelCheck::Inconclusive;
+    };
+    let tunnel = app.state::<Arc<platform::PlatformTunnelController>>();
+    let Ok((_, Some(before))) = tunnel.macos_probe_metrics().await else {
+        return MacosTunnelCheck::Inconclusive;
+    };
+    if !scope.is_current(application) || expected.is_some_and(|path| !path.same_tunnel(&before)) {
+        return MacosTunnelCheck::Inconclusive;
+    }
+    let probe = probe_macos_tunnel_health(&before.interface, url).await;
+    let after = tunnel
+        .macos_probe_metrics()
+        .await
+        .ok()
+        .and_then(|(_, path)| path);
+    if !scope.is_current(application) {
+        return MacosTunnelCheck::Inconclusive;
+    }
+    macos_tunnel_check(&before, after.as_ref(), probe)
+}
+
+#[cfg(target_os = "macos")]
+async fn resume_macos_stall_after_wake(
+    app: &tauri::AppHandle,
+    application: &Arc<NativeApplication>,
+    diagnostics: &diagnostics::AppDiagnostics,
+    lease_id: &str,
+    scope: MacosStallScope,
+    episode: &mut MacosStallRecoveryEpisode,
+) -> bool {
+    use nelomai_client_core::StalledDataPlaneRestartOutcome;
+    use tauri::Manager;
+
+    let guarded_application = Arc::clone(application);
+    let resumed = application
+        .resume_stalled_data_plane_restart_guarded_for_wake(
+            lease_id,
+            scope.power.wake_stamp(),
+            move || scope.is_current(&guarded_application),
+        )
+        .await;
+    match resumed {
+        Ok(None | Some(StalledDataPlaneRestartOutcome::Skipped)) => false,
+        Ok(Some(StalledDataPlaneRestartOutcome::Busy)) => true,
+        Ok(Some(StalledDataPlaneRestartOutcome::Reconnected)) => {
+            if verify_macos_local_repair(app, application, scope, None).await
+                == MacosTunnelCheck::Responsive
+                && scope.is_current(application)
+            {
+                let now = current_unix_time();
+                diagnostics.confirm_tunnel_ip_recovery(lease_id, now);
+                episode.complete(MacosStallRecoveryResult::Verified, now);
+                diagnostics.record_named(
+                    "tunnel.stall.local_tunnel_restarted",
+                    Some(lease_id),
+                    None,
+                    Some("verified_after_wake"),
+                );
+            }
+            true
+        }
+        Ok(Some(StalledDataPlaneRestartOutcome::Failed(error))) => {
+            diagnostics.record_named(
+                "tunnel.stall.local_restart_failed",
+                Some(lease_id),
+                None,
+                Some(&error.to_string()),
+            );
+            app.state::<Arc<connection_intent::DesktopConnectionIntent>>()
+                .handle_stall(lease_id, scope, None)
+                .await;
+            true
+        }
+        Err(error) => {
+            diagnostics.record_named(
+                "tunnel.stall.local_restart_resume_failed",
+                Some(lease_id),
+                None,
+                Some(&automatic_upload_error_code(&error)),
+            );
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn diagnose_and_recover_macos_stall(
+    app: &tauri::AppHandle,
+    application: &Arc<NativeApplication>,
     diagnostics: &diagnostics::AppDiagnostics,
     context: &nelomai_client_core::ConnectionMetricsContext,
-    direct_probe_target: Option<std::net::IpAddr>,
+    targets: (
+        Option<std::net::IpAddr>,
+        Option<&nelomai_unix_service::MacosProbePath>,
+    ),
     limiter: &mut connection_metrics::StallRecoveryLimiter,
-    allow_uncertain_recovery: bool,
+    recovery: (MacosStallScope, bool),
 ) -> MacosStallRecoveryResult {
     use nelomai_client_core::{StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome};
 
-    if macos_power::defer_reason().is_some() {
+    let (scope, allow_uncertain_recovery) = recovery;
+    let (direct_probe_target, Some(observed_path)) = targets else {
+        return MacosStallRecoveryResult::Retry;
+    };
+    if !scope.is_current(application) {
         return MacosStallRecoveryResult::Retry;
     }
 
-    let tunnel_probe_url = format!("{PANEL_BASE}/health");
-    let tunnel_probe = application.probe_fresh_connection_latency_ms(&tunnel_probe_url);
+    let tunnel_probe = verify_macos_local_repair(app, application, scope, Some(observed_path));
     let direct_probe = async {
         match (context.probe_url.as_deref(), direct_probe_target) {
             (Some(url), Some(resolved_ip)) => Some(
@@ -1681,11 +2251,17 @@ async fn diagnose_and_recover_macos_stall(
             _ => None,
         }
     };
-    let (tunnel_latency, direct_succeeded) = tokio::join!(tunnel_probe, direct_probe);
-    if macos_power::defer_reason().is_some() {
+    let (tunnel_check, direct_succeeded) = tokio::join!(tunnel_probe, direct_probe);
+    if !scope.is_current(application) {
         return MacosStallRecoveryResult::Retry;
     }
-    let classification = classify_desktop_stall_probe(tunnel_latency.is_some(), direct_succeeded);
+    if tunnel_check == MacosTunnelCheck::Inconclusive {
+        return MacosStallRecoveryResult::Retry;
+    }
+    let classification = classify_desktop_stall_probe(
+        tunnel_check == MacosTunnelCheck::Responsive,
+        direct_succeeded,
+    );
     let classification_code = match classification {
         DesktopStallClassification::TunnelPathFailed => "tunnel_path_failed_direct_ok",
         DesktopStallClassification::PhysicalPathFailed => "physical_path_failed",
@@ -1699,7 +2275,7 @@ async fn diagnose_and_recover_macos_stall(
         Some(classification_code),
     );
     match classify_macos_stall_recovery(classification, allow_uncertain_recovery) {
-        MacosStallProbeAction::Complete => return MacosStallRecoveryResult::Complete,
+        MacosStallProbeAction::Complete => return MacosStallRecoveryResult::Verified,
         MacosStallProbeAction::RetryProbe => {
             return MacosStallRecoveryResult::DirectProbeUnavailable;
         }
@@ -1712,20 +2288,6 @@ async fn diagnose_and_recover_macos_stall(
                     Some(classification_code),
                 );
             }
-        }
-    }
-    {
-        use tauri::Manager;
-
-        let runtime = app
-            .state::<Arc<connection_intent::DesktopConnectionIntent>>()
-            .inner()
-            .clone();
-        if runtime.handle_stall(&context.session_id).await {
-            if macos_power::defer_reason().is_some() {
-                return MacosStallRecoveryResult::Retry;
-            }
-            return MacosStallRecoveryResult::Complete;
         }
     }
     let mut attempt_unix = current_unix_time();
@@ -1743,12 +2305,32 @@ async fn diagnose_and_recover_macos_stall(
         );
     }
 
-    if macos_power::defer_reason().is_some() {
+    if !scope.is_current(application) {
         limiter.cancel_attempt(&context.session_id, attempt_unix);
         return MacosStallRecoveryResult::Retry;
     }
+    {
+        use tauri::Manager;
+
+        let runtime = app
+            .state::<Arc<connection_intent::DesktopConnectionIntent>>()
+            .inner()
+            .clone();
+        if let Some(result) = runtime
+            .handle_stall(&context.session_id, scope, Some(observed_path))
+            .await
+        {
+            return result;
+        }
+    }
+    let guarded_application = Arc::clone(application);
     let rebind = application
-        .recover_stalled_data_plane(&context.session_id, StalledDataPlaneRecovery::RebindUdp)
+        .recover_stalled_data_plane_guarded_for_wake(
+            &context.session_id,
+            StalledDataPlaneRecovery::RebindUdp,
+            scope.power.wake_stamp(),
+            move || scope.is_current(&guarded_application),
+        )
         .await;
     match rebind {
         Ok(StalledDataPlaneRecoveryOutcome::Rebound) => {
@@ -1759,18 +2341,21 @@ async fn diagnose_and_recover_macos_stall(
                 None,
             );
             tokio::time::sleep(Duration::from_secs(2)).await;
-            if application
-                .probe_fresh_connection_latency_ms(&tunnel_probe_url)
-                .await
-                .is_some()
-            {
-                diagnostics.record_named(
-                    "tunnel.stall.recovered_after_rebind",
-                    Some(&context.session_id),
-                    None,
-                    None,
-                );
-                return MacosStallRecoveryResult::Complete;
+            match verify_macos_local_repair(app, application, scope, Some(observed_path)).await {
+                MacosTunnelCheck::Responsive => {
+                    diagnostics.record_named(
+                        "tunnel.stall.recovered_after_rebind",
+                        Some(&context.session_id),
+                        None,
+                        None,
+                    );
+                    return MacosStallRecoveryResult::Verified;
+                }
+                MacosTunnelCheck::Inconclusive => {
+                    limiter.cancel_attempt(&context.session_id, attempt_unix);
+                    return MacosStallRecoveryResult::Retry;
+                }
+                MacosTunnelCheck::NoReply => {}
             }
         }
         Ok(StalledDataPlaneRecoveryOutcome::Busy) => {
@@ -1813,7 +2398,7 @@ async fn diagnose_and_recover_macos_stall(
     }
 
     for restart_attempt in 1..=2 {
-        if macos_power::defer_reason().is_some() {
+        if !scope.is_current(application) {
             limiter.cancel_attempt(&context.session_id, attempt_unix);
             return MacosStallRecoveryResult::Retry;
         }
@@ -1833,19 +2418,19 @@ async fn diagnose_and_recover_macos_stall(
                 );
             }
         }
+        let guarded_application = Arc::clone(application);
         match application
-            .recover_stalled_data_plane(
+            .recover_stalled_data_plane_guarded_for_wake(
                 &context.session_id,
                 StalledDataPlaneRecovery::RestartLocalTunnel,
+                scope.power.wake_stamp(),
+                move || scope.is_current(&guarded_application),
             )
             .await
         {
             Ok(StalledDataPlaneRecoveryOutcome::Reconnected) => {
-                if application
-                    .probe_fresh_connection_latency_ms(&tunnel_probe_url)
-                    .await
-                    .is_some()
-                {
+                let check = verify_macos_local_repair(app, application, scope, None).await;
+                if check == MacosTunnelCheck::Responsive {
                     diagnostics.record_named(
                         "tunnel.stall.local_tunnel_restarted",
                         Some(&context.session_id),
@@ -1856,7 +2441,11 @@ async fn diagnose_and_recover_macos_stall(
                             "verified_retry"
                         }),
                     );
-                    return MacosStallRecoveryResult::Complete;
+                    return MacosStallRecoveryResult::Verified;
+                }
+                if check == MacosTunnelCheck::Inconclusive {
+                    limiter.cancel_attempt(&context.session_id, attempt_unix);
+                    return MacosStallRecoveryResult::Retry;
                 }
                 diagnostics.record_named(
                     "tunnel.stall.local_restart_verification_failed",
@@ -2054,6 +2643,7 @@ mod tests {
         coordinate_desktop_redundancy(
             &mut schedule,
             100,
+            true,
             None,
             move || async move {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -2067,6 +2657,7 @@ mod tests {
         coordinate_desktop_redundancy(
             &mut schedule,
             102,
+            true,
             None,
             || async { panic!("must continue the in-flight probe, not start another") },
             || async { Ok(None) },
@@ -2093,6 +2684,7 @@ mod tests {
             coordinate_desktop_redundancy(
                 &mut schedule,
                 10,
+                true,
                 None,
                 {
                     let calls = tick_calls.clone();
@@ -2120,6 +2712,7 @@ mod tests {
             coordinate_desktop_redundancy(
                 &mut schedule,
                 11,
+                true,
                 None,
                 || async { panic!("no retry before panel delay") },
                 || async {
@@ -2136,6 +2729,7 @@ mod tests {
             !coordinate_desktop_redundancy(
                 &mut schedule,
                 55,
+                true,
                 None,
                 {
                     let calls = tick_calls.clone();
@@ -2179,6 +2773,7 @@ mod tests {
             coordinate_desktop_redundancy(
                 &mut schedule,
                 100,
+                true,
                 None,
                 move || async move {
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -2191,6 +2786,7 @@ mod tests {
             coordinate_desktop_redundancy(
                 &mut schedule,
                 100 + delay - 1,
+                true,
                 None,
                 || async { panic!("no retry before the delay expires") },
                 || async { Ok(None) },
@@ -2201,6 +2797,7 @@ mod tests {
             coordinate_desktop_redundancy(
                 &mut schedule,
                 100 + delay,
+                true,
                 None,
                 move || async move {
                     calls.fetch_add(1, Ordering::SeqCst);
@@ -2279,6 +2876,7 @@ mod tests {
             coordinate_desktop_redundancy(
                 &mut schedule,
                 10,
+                true,
                 None,
                 move || async move {
                     match case {
@@ -2323,6 +2921,7 @@ mod tests {
                 let observation = coordinate_desktop_redundancy(
                     &mut schedule,
                     now,
+                    true,
                     None,
                     {
                         let state = state.clone();
@@ -2372,6 +2971,7 @@ mod tests {
         coordinate_desktop_redundancy(
             &mut schedule,
             100,
+            true,
             Some((&diagnostics, "experiment-session")),
             || async {
                 Err(ApplicationError::Api(CoreApiError::Rejected {
@@ -2394,6 +2994,7 @@ mod tests {
         coordinate_desktop_redundancy(
             &mut schedule,
             140,
+            true,
             Some((&diagnostics, "experiment-session")),
             || async { panic!("backoff must still suppress the tick") },
             std::future::pending,
@@ -2425,6 +3026,7 @@ mod tests {
             let observation = coordinate_desktop_redundancy(
                 &mut schedule,
                 100,
+                true,
                 Some((&diagnostics, "session")),
                 || async { Ok(None) },
                 || async { Err(ApplicationError::Core(CoreError::Tunnel(code.into()))) },
@@ -2448,6 +3050,7 @@ mod tests {
             coordinate_desktop_redundancy(
                 &mut schedule,
                 100,
+                true,
                 None,
                 std::future::pending,
                 || async { Err(nelomai_client_application::ApplicationError::Storage) }
@@ -2488,8 +3091,9 @@ mod tests {
         let observation = coordinate_desktop_redundancy(
             &mut schedule,
             10,
+            false,
             None,
-            || async { Ok(None) },
+            || async { panic!("must not start an online tick before wake readiness") },
             || async { Ok(Some(snapshot.clone())) },
         )
         .await;
@@ -2501,6 +3105,7 @@ mod tests {
         let fresh = coordinate_desktop_redundancy(
             &mut schedule,
             11,
+            true,
             None,
             move || async move { Ok(Some(stale)) },
             || async { Ok(Some(snapshot.clone())) },
@@ -2511,6 +3116,7 @@ mod tests {
             !coordinate_desktop_redundancy(
                 &mut schedule,
                 11,
+                true,
                 None,
                 || async { Ok(None) },
                 || async { Ok(None) }
@@ -3038,6 +3644,229 @@ mod tests {
             Some("192.0.2.10".parse().unwrap()),
         );
         assert_eq!(sample.probe_target, None);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_probe_path() -> nelomai_unix_service::MacosProbePath {
+        nelomai_unix_service::MacosProbePath {
+            interface: "utun5".into(),
+            index: 23,
+            socket_device: 1,
+            socket_inode: 41,
+            sent_ip_packets: 70,
+            received_ip_packets: 50,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unavailable_probe_stays_inconclusive_with_other_tunnel_traffic() {
+        let before = macos_probe_path();
+        let mut after = before.clone();
+        after.sent_ip_packets += 3;
+        assert_eq!(
+            macos_tunnel_check(&before, Some(&after), MacosTunnelCheck::Inconclusive),
+            MacosTunnelCheck::Inconclusive
+        );
+        assert_eq!(
+            macos_tunnel_check(&before, Some(&after), MacosTunnelCheck::NoReply),
+            MacosTunnelCheck::NoReply
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_probe_results_only_apply_to_the_probed_tunnel() {
+        let before = macos_probe_path();
+        let mut after = before.clone();
+        assert_eq!(
+            macos_tunnel_check(&before, Some(&after), MacosTunnelCheck::Responsive),
+            MacosTunnelCheck::Responsive
+        );
+
+        // utun name and kernel index may be reused after Stop and Start.
+        after.socket_inode += 1;
+        for result in [MacosTunnelCheck::Responsive, MacosTunnelCheck::NoReply] {
+            assert_eq!(
+                macos_tunnel_check(&before, Some(&after), result),
+                MacosTunnelCheck::Inconclusive
+            );
+            assert_eq!(
+                macos_tunnel_check(&before, None, result),
+                MacosTunnelCheck::Inconclusive
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_probe_does_not_fall_back_to_an_unbound_socket() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = tauri::Url::parse(&format!("http://{}/health", listener.local_addr().unwrap()))
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(request[..read].starts_with(b"GET /health "));
+            stream
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            probe_macos_tunnel_health("no-such-utun", url.clone()).await,
+            MacosTunnelCheck::Inconclusive
+        );
+        assert_eq!(
+            probe_macos_tunnel_health("lo0", url).await,
+            MacosTunnelCheck::Responsive
+        );
+        server.await.unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_tcp_reply_prevents_false_repair_if_the_other_endpoint_times_out() {
+        use MacosHealthEndpointCheck::*;
+        assert_eq!(
+            combine_macos_endpoint_checks(Tcp, NoReply),
+            MacosTunnelCheck::Inconclusive
+        );
+        assert_eq!(
+            combine_macos_endpoint_checks(Unavailable, NoReply),
+            MacosTunnelCheck::NoReply
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_slow_tls_does_not_claim_no_tcp_reply() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = tauri::Url::parse(&format!(
+            "https://{}/health",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let (probe, accepts) = tokio::join!(probe_macos_tunnel_health("lo0", url), async {
+            let (_tls_connection, _) = listener.accept().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(6), listener.accept()).await
+        });
+        assert_eq!(probe, MacosTunnelCheck::Inconclusive);
+        accepts.unwrap().unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_replacement_path_requires_fresh_stall_evidence_for_the_same_lease() {
+        use crate::diagnostics::TunnelMetricsObservation;
+        use crate::network_incidents::{NetworkIncidentObservation, NetworkIncidentRecorder};
+
+        let directory = tempfile::tempdir().unwrap();
+        let recorder = NetworkIncidentRecorder::new(directory.path()).unwrap();
+        let mut episode = MacosStallRecoveryEpisode::default();
+        let sample = nelomai_client_tunnel::TunnelMetrics::default();
+        let observe = |at, activity| {
+            recorder
+                .observe_with_ip_activity("lease", &sample, None, at, Some(activity))
+                .unwrap()
+                .observation
+        };
+        for second in 0..10 {
+            assert_eq!(
+                observe(second, (1, 0)),
+                NetworkIncidentObservation::Unchanged
+            );
+        }
+        assert_eq!(observe(10, (0, 0)), NetworkIncidentObservation::Detected);
+        assert!(episode.should_attempt("lease", TunnelMetricsObservation::Detected, 10));
+        episode.complete(MacosStallRecoveryResult::Retry, 10);
+
+        let before = macos_probe_path();
+        let mut after = before.clone();
+        after.socket_inode += 1;
+        assert!(macos_probe_path_changed(Some(&before), Some(&after)));
+        assert!(!macos_probe_path_changed(Some(&after), Some(&after)));
+        recorder.restart_ip_observation("lease").unwrap();
+        episode.reset();
+        let first = macos_ip_packet_deltas(Some(&before), Some(&after));
+        assert_eq!(observe(20, first), NetworkIncidentObservation::Unchanged);
+        assert!(!episode.should_attempt("lease", TunnelMetricsObservation::Unchanged, 20));
+        for second in 21..26 {
+            assert_eq!(
+                observe(second, (1, 0)),
+                NetworkIncidentObservation::Unchanged
+            );
+        }
+        assert_eq!(observe(26, (0, 0)), NetworkIncidentObservation::Detected);
+        assert!(episode.should_attempt("lease", TunnelMetricsObservation::Detected, 26));
+        assert_eq!(observe(27, (0, 1)), NetworkIncidentObservation::Recovered);
+        let snapshot = recorder
+            .snapshot(Some("lease"), None, None, None)
+            .unwrap()
+            .unwrap();
+        let archive: serde_json::Value = serde_json::from_str(&snapshot.payload).unwrap();
+        let incidents = archive["sessions"][0]["detailed"].as_array().unwrap();
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0]["recovered_at_unix"], 27);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_incident_stays_open_until_ip_replies_resume() {
+        use crate::network_incidents::{NetworkIncidentObservation, NetworkIncidentRecorder};
+
+        let directory = tempfile::tempdir().unwrap();
+        let recorder = NetworkIncidentRecorder::new(directory.path()).unwrap();
+        let mut path = macos_probe_path();
+        let mut control = nelomai_client_tunnel::TunnelMetrics::default();
+        let mut previous = control.clone();
+        let mut previous_path = path.clone();
+        let mut detected = false;
+        for second in 10..=21 {
+            // IP sends go unanswered while encrypted keepalives continue.
+            path.sent_ip_packets += 1;
+            control.received_bytes += 32;
+            let activity = macos_ip_packet_deltas(Some(&previous_path), Some(&path));
+            let observation = recorder
+                .observe_with_ip_activity(
+                    "lease",
+                    &control,
+                    Some(&previous),
+                    second,
+                    Some(activity),
+                )
+                .unwrap()
+                .observation;
+            assert_ne!(observation, NetworkIncidentObservation::Recovered);
+            detected |= observation == NetworkIncidentObservation::Detected;
+            previous = control.clone();
+            previous_path = path.clone();
+        }
+        assert!(detected);
+
+        control.latest_handshake_epoch_millis = Some(22_000);
+        control.received_bytes += 92;
+        let activity = macos_ip_packet_deltas(Some(&previous_path), Some(&path));
+        assert_eq!(
+            recorder
+                .observe_with_ip_activity("lease", &control, Some(&previous), 22, Some(activity))
+                .unwrap()
+                .observation,
+            NetworkIncidentObservation::Unchanged
+        );
+
+        path.received_ip_packets += 1;
+        let activity = macos_ip_packet_deltas(Some(&previous_path), Some(&path));
+        assert_eq!(
+            recorder
+                .observe_with_ip_activity("lease", &control, Some(&previous), 23, Some(activity))
+                .unwrap()
+                .observation,
+            NetworkIncidentObservation::Recovered
+        );
     }
 
     #[test]

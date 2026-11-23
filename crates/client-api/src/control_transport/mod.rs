@@ -482,6 +482,40 @@ impl Slot {
         Ok(client)
     }
 
+    /// Health is a read-only, unauthenticated request. Both approved origins
+    /// get the same short budget even if the first one blackholes connections.
+    #[cfg(any(target_os = "macos", test))]
+    pub(super) async fn probe_wake_health(&self) -> bool {
+        let check = |slot, endpoint| async move {
+            let Ok(client) = self.client_for(slot, &endpoint) else {
+                return false;
+            };
+            let request = reqwest::Request::new(reqwest::Method::GET, endpoint);
+            client
+                .execute(request)
+                .await
+                .is_ok_and(|response| response.status().is_success())
+        };
+        let Ok(endpoint) = self.origin.join("/health") else {
+            return false;
+        };
+        let backup = crate::panel_backup_url(&endpoint);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let primary = check(&self.current, endpoint);
+            let Some(backup) = backup else {
+                return primary.await;
+            };
+            let backup = check(&self.backup, backup);
+            tokio::pin!(primary, backup);
+            tokio::select! {
+                ready = &mut primary => ready || backup.await,
+                ready = &mut backup => ready || primary.await,
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
     #[cfg(test)]
     pub async fn execute(
         &self,

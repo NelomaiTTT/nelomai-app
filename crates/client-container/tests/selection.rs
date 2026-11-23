@@ -648,6 +648,7 @@ async fn manual_upgrade_after_completed_logout_admits_only_empty_runtime_state()
         let mut old_state = old.load().unwrap().unwrap();
         if retained_work {
             old_state.pending_compensation_stop = Some(StoredPendingCompensationStop {
+                inferred_release: false,
                 operation_id: "old-stop".into(),
                 lease_id: "old-lease".into(),
                 recovery_contract_version: None,
@@ -1578,6 +1579,7 @@ async fn common_host_restart_case(
     if change_source {
         let mut state = record.operational().load().unwrap().unwrap();
         state.pending_compensation_stop = Some(StoredPendingCompensationStop {
+            inferred_release: false,
             operation_id: "changed-after-handoff".into(),
             lease_id: "synthetic-changed-lease".into(),
             accept_warm: false,

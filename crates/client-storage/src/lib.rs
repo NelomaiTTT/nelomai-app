@@ -87,6 +87,10 @@ fn default_allow_alternate() -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredPendingStart {
     pub operation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_lease_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_start_attempted: Option<bool>,
     pub layer: StoredLayer,
     pub tic_connection_mode: StoredTicConnectionMode,
     pub route_mode: StoredRouteMode,
@@ -118,6 +122,9 @@ pub struct StoredPendingStalledStop {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredPendingCompensationStop {
+    /// Stale panel ownership inferred before Start. Automatic replay still needs admission.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inferred_release: bool,
     pub operation_id: String,
     pub lease_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -689,6 +696,8 @@ mod tests {
         );
         let pending = stored.pending_start.unwrap();
         assert_eq!(pending.egress_mode, StoredEgressMode::Ipv4);
+        assert_eq!(pending.issued_lease_id, None);
+        assert_eq!(pending.native_start_attempted, None);
         assert!(pending.allow_alternate);
         assert!(pending.probes.is_empty());
     }
@@ -719,6 +728,7 @@ mod tests {
         .unwrap();
 
         assert!(pending.accept_warm);
+        assert!(!pending.inferred_release);
         let encoded = serde_json::to_value(pending).unwrap();
         assert!(!encoded
             .as_object()
@@ -730,11 +740,13 @@ mod tests {
             .contains_key("redundant_session_id"));
         assert!(encoded.as_object().unwrap().contains_key("failure_code"));
         assert!(encoded["failure_code"].is_null());
+        assert!(encoded.get("inferred_release").is_none());
     }
 
     #[test]
     fn recovery_v2_compensation_identity_round_trips_without_configuration() {
         let pending = StoredPendingCompensationStop {
+            inferred_release: true,
             operation_id: "22222222-2222-4222-8222-222222222222".to_string(),
             lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
             recovery_contract_version: Some(2),

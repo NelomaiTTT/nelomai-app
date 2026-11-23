@@ -68,6 +68,8 @@ struct RuntimeState {
     owned_lease_id: Option<String>,
     initial_preflight: Option<InitialDesktopPreflight>,
     pending_redundant_recovery: Option<PendingRedundantRecovery>,
+    #[cfg(target_os = "macos")]
+    stall_scope: Option<crate::MacosStallScope>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,6 +106,9 @@ enum InitialDesktopPreflightAction {
 enum AttemptKind {
     #[default]
     Start,
+    Legacy {
+        skip_probe_refresh: bool,
+    },
     StallReplacement,
 }
 
@@ -133,6 +138,8 @@ impl Default for RuntimeState {
             owned_lease_id: None,
             initial_preflight: None,
             pending_redundant_recovery: None,
+            #[cfg(target_os = "macos")]
+            stall_scope: None,
         }
     }
 }
@@ -379,6 +386,10 @@ impl DesktopConnectionIntent {
                 state.owned_lease_id = None;
                 state.initial_preflight = None;
                 state.pending_redundant_recovery = None;
+                #[cfg(target_os = "macos")]
+                {
+                    state.stall_scope = None;
+                }
             }
             cancelled
         };
@@ -391,9 +402,28 @@ impl DesktopConnectionIntent {
     }
 
     pub(crate) async fn retry_pending_stop(&self) {
+        #[cfg(target_os = "macos")]
+        let panel_epoch = crate::macos_power::panel_work_epoch();
+        #[cfg(target_os = "macos")]
+        let wake_stamp = panel_epoch.and_then(|epoch| epoch.wake_stamp());
+        #[cfg(not(target_os = "macos"))]
+        let wake_stamp = None;
+        let inferred_stop_allowed = move || {
+            #[cfg(target_os = "macos")]
+            {
+                panel_epoch.is_some_and(|epoch| epoch.is_current())
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                true
+            }
+        };
         crate::retry_pending_stop_once(
-            self.application
-                .retry_pending_stop_observed(pending_stop_generation(&self.state)),
+            self.application.retry_pending_stop_observed_guarded(
+                pending_stop_generation(&self.state),
+                wake_stamp,
+                inferred_stop_allowed,
+            ),
             |(generation, completion)| self.pending_stop_completed(completion, generation),
         )
         .await;
@@ -461,24 +491,42 @@ impl DesktopConnectionIntent {
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) async fn handle_stall(&self, lease_id: &str) -> bool {
+    pub(crate) async fn handle_stall(
+        &self,
+        lease_id: &str,
+        scope: crate::MacosStallScope,
+        observed_path: Option<&nelomai_unix_service::MacosProbePath>,
+    ) -> Option<crate::MacosStallRecoveryResult> {
+        use crate::MacosStallRecoveryResult;
+
+        // A confirmed native failure can enter the queue across a power
+        // transition. The queued proof still carries its original wake and
+        // cannot authorize Stop after another wake.
+        let can_queue = || {
+            self.application
+                .macos_stall_epoch_is_current(scope.execution)
+                && (observed_path.is_none() || scope.power.is_current())
+        };
+        if !can_queue() {
+            return Some(MacosStallRecoveryResult::Retry);
+        }
         let (options, generation) = {
             let state = self.state.lock().await;
-            let Some(options) = state.options.clone() else {
-                return false;
-            };
+            let options = state.options.clone()?;
             if !can_begin_stall_recovery(state.coordinator.status(), state.armed) {
-                return true;
+                return Some(MacosStallRecoveryResult::Complete);
             }
             if state.owned_lease_id.as_deref() != Some(lease_id) {
-                return false;
+                return None;
             }
             (options, state.coordinator.generation())
         };
-        let current = self.application.state().await.connection;
-        let Some(current) = current.filter(|connection| connection.lease_id == lease_id) else {
-            return false;
-        };
+        let current = self
+            .application
+            .state()
+            .await
+            .connection
+            .filter(|connection| connection.lease_id == lease_id)?;
         let pinned = current.pinned;
         let transport = self
             .application
@@ -486,20 +534,29 @@ impl DesktopConnectionIntent {
             .unwrap_or(RecoveryTransport::Other);
         let plan = nelomai_client_core::stall_recovery_plan(&options, pinned, transport);
 
-        if self
-            .recover_current_connection_locally(generation, lease_id)
-            .await
-            .is_some()
-        {
-            return true;
+        if let Some(observed_path) = observed_path {
+            match self
+                .recover_current_connection_locally(generation, lease_id, scope, observed_path)
+                .await
+            {
+                crate::MacosTunnelCheck::Responsive => {
+                    return Some(MacosStallRecoveryResult::Verified)
+                }
+                crate::MacosTunnelCheck::Inconclusive => {
+                    return Some(MacosStallRecoveryResult::Retry)
+                }
+                crate::MacosTunnelCheck::NoReply => {}
+            }
+            if !crate::macos_power::readiness().allows_panel_work() {
+                return Some(MacosStallRecoveryResult::Retry);
+            }
         }
 
-        #[cfg(target_os = "macos")]
-        if crate::macos_power::defer_reason().is_some() {
-            return true;
-        }
-        let generation = {
+        {
             let mut state = self.state.lock().await;
+            if !can_queue() {
+                return Some(MacosStallRecoveryResult::Retry);
+            }
             if state
                 .coordinator
                 .handle_stall(
@@ -512,24 +569,21 @@ impl DesktopConnectionIntent {
                 )
                 .is_err()
             {
-                return true;
+                return Some(MacosStallRecoveryResult::Complete);
             }
             let generation = state.coordinator.generation();
+            let now = crate::current_unix_time();
             state.attempt_kind = attempt_kind_for_stall_plan(plan);
+            state.stall_scope = Some(scope);
             state.refresh_capability_before_attempt = true;
-            state.next_retry_at_unix = None;
+            state.next_retry_at_unix = Some(now);
             state.retry_not_before_unix = None;
-            consume_immediate_retry_slot(
-                &mut state.coordinator,
-                generation,
-                crate::current_unix_time(),
-            );
-            generation
-        };
+            consume_immediate_retry_slot(&mut state.coordinator, generation, now);
+        }
         self.diagnostics
             .record_connection_intent(ConnectionIntentDiagnosticEvent::LeaseReplacementStarted);
-        let _ = self.run_attempt(generation, true).await;
-        true
+        self.wake.notify_one();
+        Some(MacosStallRecoveryResult::Complete)
     }
 
     #[cfg(target_os = "macos")]
@@ -537,57 +591,99 @@ impl DesktopConnectionIntent {
         &self,
         generation: IntentGeneration,
         lease_id: &str,
-    ) -> Option<Connection> {
-        if crate::macos_power::defer_reason().is_some() {
-            return None;
+        scope: crate::MacosStallScope,
+        observed_path: &nelomai_unix_service::MacosProbePath,
+    ) -> crate::MacosTunnelCheck {
+        use crate::MacosTunnelCheck;
+        if !scope.is_current(&self.application) {
+            return MacosTunnelCheck::Inconclusive;
         }
+        let application = Arc::clone(&self.application);
         let rebind = self
             .application
-            .recover_stalled_data_plane(lease_id, StalledDataPlaneRecovery::RebindUdp)
+            .recover_stalled_data_plane_guarded_for_wake(
+                lease_id,
+                StalledDataPlaneRecovery::RebindUdp,
+                scope.power.wake_stamp(),
+                move || scope.is_current(&application),
+            )
             .await;
-        if matches!(rebind, Ok(StalledDataPlaneRecoveryOutcome::Rebound)) {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            if self
-                .application
-                .probe_fresh_connection_latency_ms(&format!("{}/health", crate::PANEL_BASE))
-                .await
-                .is_some()
-            {
-                return self
-                    .accept_local_recovery(
-                        generation,
-                        lease_id,
-                        "connection.intent.stall_recovered_after_rebind",
-                    )
-                    .await;
-            }
-        }
-
-        if crate::macos_power::defer_reason().is_some() {
-            return None;
-        }
-        let local_restart = self
-            .application
-            .recover_stalled_data_plane(lease_id, StalledDataPlaneRecovery::RestartLocalTunnel)
-            .await;
-        if matches!(
-            local_restart,
-            Ok(StalledDataPlaneRecoveryOutcome::Reconnected)
-        ) && self
-            .application
-            .probe_fresh_connection_latency_ms(&format!("{}/health", crate::PANEL_BASE))
-            .await
-            .is_some()
-        {
-            return self
-                .accept_local_recovery(
-                    generation,
-                    lease_id,
-                    "connection.intent.stall_recovered_after_local_restart",
+        match rebind {
+            Ok(StalledDataPlaneRecoveryOutcome::Rebound) => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let check = crate::verify_macos_local_repair(
+                    &self.app,
+                    &self.application,
+                    scope,
+                    Some(observed_path),
                 )
                 .await;
+                match check {
+                    MacosTunnelCheck::Responsive => {
+                        let recovered = self
+                            .accept_local_recovery(
+                                generation,
+                                lease_id,
+                                scope,
+                                "connection.intent.stall_recovered_after_rebind",
+                            )
+                            .await;
+                        return if recovered.is_some() {
+                            check
+                        } else {
+                            MacosTunnelCheck::Inconclusive
+                        };
+                    }
+                    MacosTunnelCheck::Inconclusive => return check,
+                    MacosTunnelCheck::NoReply => {}
+                }
+            }
+            Ok(
+                StalledDataPlaneRecoveryOutcome::Busy | StalledDataPlaneRecoveryOutcome::Skipped,
+            ) => {
+                return MacosTunnelCheck::Inconclusive;
+            }
+            _ => {}
         }
-        None
+
+        if !scope.is_current(&self.application) {
+            return MacosTunnelCheck::Inconclusive;
+        }
+        let application = Arc::clone(&self.application);
+        match self
+            .application
+            .recover_stalled_data_plane_guarded_for_wake(
+                lease_id,
+                StalledDataPlaneRecovery::RestartLocalTunnel,
+                scope.power.wake_stamp(),
+                move || scope.is_current(&application),
+            )
+            .await
+        {
+            Ok(StalledDataPlaneRecoveryOutcome::Reconnected) => {
+                let check =
+                    crate::verify_macos_local_repair(&self.app, &self.application, scope, None)
+                        .await;
+                if check == MacosTunnelCheck::Responsive
+                    && self
+                        .accept_local_recovery(
+                            generation,
+                            lease_id,
+                            scope,
+                            "connection.intent.stall_recovered_after_local_restart",
+                        )
+                        .await
+                        .is_none()
+                {
+                    return MacosTunnelCheck::Inconclusive;
+                }
+                check
+            }
+            Ok(
+                StalledDataPlaneRecoveryOutcome::Busy | StalledDataPlaneRecoveryOutcome::Skipped,
+            ) => MacosTunnelCheck::Inconclusive,
+            _ => MacosTunnelCheck::NoReply,
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -595,10 +691,14 @@ impl DesktopConnectionIntent {
         &self,
         generation: IntentGeneration,
         lease_id: &str,
+        scope: crate::MacosStallScope,
         event: &str,
     ) -> Option<Connection> {
         let core_state = self.application.state().await;
         let state = self.state.lock().await;
+        if !scope.is_current(&self.application) {
+            return None;
+        }
         let connection = local_recovery_connection(
             &core_state,
             generation,
@@ -642,14 +742,45 @@ impl DesktopConnectionIntent {
                     _ = self.wake.notified() => { continue; }
                 }
             }
+            #[cfg(target_os = "macos")]
+            if !crate::macos_power::check_recovery_network(&self.application)
+                .await
+                .allows_panel_work()
+            {
+                // Preserve the retry budget and a pending pair's exact owner.
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                    _ = self.wake.notified() => {},
+                }
+                continue;
+            }
             let pending_redundant = self.state.lock().await.pending_redundant_recovery.is_some();
             if pending_redundant {
+                #[cfg(target_os = "macos")]
+                let panel_epoch = crate::macos_power::panel_work_epoch();
                 let application = &self.application;
                 let generation = advance_redundant_recovery(
                     &self.state,
                     crate::current_unix_time(),
                     || self.application.desktop_redundancy_status(),
-                    |snapshot| async move { application.prepare_desktop_recovery(&snapshot).await },
+                    |snapshot| async move {
+                        #[cfg(target_os = "macos")]
+                        let wake_stamp = panel_epoch.and_then(|epoch| epoch.wake_stamp());
+                        #[cfg(not(target_os = "macos"))]
+                        let wake_stamp = None;
+                        application
+                            .prepare_desktop_recovery_guarded(&snapshot, wake_stamp, move || {
+                                #[cfg(target_os = "macos")]
+                                {
+                                    panel_epoch.is_some_and(|epoch| epoch.is_current())
+                                }
+                                #[cfg(not(target_os = "macos"))]
+                                {
+                                    true
+                                }
+                            })
+                            .await
+                    },
                 )
                 .await;
                 if let Some(generation) = generation {
@@ -666,16 +797,6 @@ impl DesktopConnectionIntent {
                 .then(|| state.coordinator.generation())
             };
             if let Some(generation) = generation {
-                #[cfg(target_os = "macos")]
-                if crate::macos_power::defer_reason().is_some() {
-                    // Keep the same pending intent without spending its retry budget.
-                    // Manual start/stop do not enter this scheduler-only gate.
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(1)) => {},
-                        _ = self.wake.notified() => {},
-                    }
-                    continue;
-                }
                 let _ = self.run_attempt(generation, true).await;
             }
         }
@@ -690,7 +811,7 @@ impl DesktopConnectionIntent {
             mut options,
             reconcile_before_attempt,
             repair_before_attempt,
-            attempt_kind,
+            mut attempt_kind,
             refresh_capability_before_attempt,
             initial_preflight,
             reserve_requested,
@@ -719,7 +840,7 @@ impl DesktopConnectionIntent {
                 // Keep this obligation through capability/preflight failures.
                 // Only successful reconciliation may consume a cold-stop receipt.
                 state.reconcile_before_attempt,
-                std::mem::take(&mut state.repair_before_attempt),
+                state.repair_before_attempt,
                 state.attempt_kind,
                 state.refresh_capability_before_attempt,
                 state.initial_preflight.clone(),
@@ -732,9 +853,87 @@ impl DesktopConnectionIntent {
         if let Err(error) = self.application.check_start_cancellation(cancel_epoch) {
             return self.complete_error(generation, error).await;
         }
+        #[cfg(target_os = "macos")]
+        let is_stall_replacement = attempt_kind == AttemptKind::StallReplacement;
+        #[cfg(target_os = "macos")]
+        let stall_scope = if is_stall_replacement {
+            self.state.lock().await.stall_scope
+        } else {
+            None
+        };
+        #[cfg(target_os = "macos")]
+        let stall_is_current = {
+            let application = self.application.clone();
+            move || {
+                !is_stall_replacement
+                    || stall_scope.is_some_and(|scope| scope.is_current(&application))
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let stall_is_current = || true;
+        if !stall_is_current() {
+            return self
+                .finish_obsolete_stall_attempt(generation, cancel_epoch)
+                .await;
+        }
+        self.wait_for_recovery_power(generation, automatic).await?;
+        if !stall_is_current() {
+            return self
+                .finish_obsolete_stall_attempt(generation, cancel_epoch)
+                .await;
+        }
+        #[cfg(target_os = "macos")]
+        let panel_epoch = automatic
+            .then(crate::macos_power::panel_work_epoch)
+            .flatten();
+        let recovery_allowed = move || {
+            #[cfg(target_os = "macos")]
+            {
+                !automatic || panel_epoch.is_some_and(|epoch| epoch.is_current())
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                true
+            }
+        };
+        let stall_recovery_allowed = {
+            #[cfg(target_os = "macos")]
+            let stall_is_current = stall_is_current.clone();
+            move || recovery_allowed() && stall_is_current()
+        };
+        #[cfg(target_os = "macos")]
+        let start_wake = automatic.then(|| {
+            let application = self.application.clone();
+            let allowed = stall_recovery_allowed.clone();
+            nelomai_client_core::MacosStartWake::new(
+                panel_epoch.and_then(|epoch| epoch.wake_stamp()),
+                move || allowed() && application.check_start_cancellation(cancel_epoch).is_ok(),
+            )
+            .with_handshake_wake(|| {
+                let wake = crate::macos_power::local_repair_epoch()?;
+                Some(nelomai_client_core::MacosStartWake::new(
+                    wake.wake_stamp(),
+                    move || wake.is_current(),
+                ))
+            })
+        });
+        let start_admission: &dyn nelomai_client_core::StartAdmission = {
+            #[cfg(target_os = "macos")]
+            if let Some(wake) = &start_wake {
+                wake
+            } else {
+                &stall_recovery_allowed
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                &stall_recovery_allowed
+            }
+        };
         if let Some(initial_preflight) = initial_preflight {
             let resolve_started = Instant::now();
-            let resolved = self.resolve_initial_desktop_start(&initial_preflight).await;
+            let resolved = self
+                .resolve_initial_desktop_start(&initial_preflight, &recovery_allowed)
+                .await;
             self.diagnostics.record_timed_named(
                 "connection.initial_desktop_resolve",
                 None,
@@ -742,6 +941,11 @@ impl DesktopConnectionIntent {
                 None,
                 resolve_started.elapsed(),
             );
+            if !recovery_allowed() {
+                return self
+                    .complete_error(generation, ApplicationError::RecoveryDeferred)
+                    .await;
+            }
             let (start_mode, resolved_options) = match resolved {
                 Ok(resolved) => resolved,
                 Err(error) => return self.complete_error(generation, error).await,
@@ -770,7 +974,12 @@ impl DesktopConnectionIntent {
             }
             let preflight_started = Instant::now();
             let preflight = self
-                .run_initial_desktop_preflight(&options, &initial_preflight, reserve_requested)
+                .run_initial_desktop_preflight(
+                    &options,
+                    &initial_preflight,
+                    reserve_requested,
+                    start_admission,
+                )
                 .await;
             self.diagnostics.record_timed_named(
                 "connection.initial_desktop_preflight",
@@ -779,6 +988,11 @@ impl DesktopConnectionIntent {
                 None,
                 preflight_started.elapsed(),
             );
+            if !recovery_allowed() {
+                return self
+                    .complete_error(generation, ApplicationError::RecoveryDeferred)
+                    .await;
+            }
             // An explicit eligible reserve request cannot fall through to an
             // ordinary Start merely because an old capability chose Legacy.
             let start_mode = if desktop_reserve_eligible(&options, reserve_requested) {
@@ -786,7 +1000,8 @@ impl DesktopConnectionIntent {
             } else {
                 start_mode
             };
-            match initial_desktop_preflight_action(start_mode, preflight.is_ok()) {
+            let action = initial_desktop_preflight_action(start_mode, preflight.is_ok());
+            match action {
                 InitialDesktopPreflightAction::RetryIntent => {
                     return self
                         .complete_error(
@@ -795,7 +1010,8 @@ impl DesktopConnectionIntent {
                         )
                         .await;
                 }
-                InitialDesktopPreflightAction::ContinueRecovery => {
+                InitialDesktopPreflightAction::ContinueRecovery
+                | InitialDesktopPreflightAction::RunLegacy => {
                     let mut state = self.state.lock().await;
                     if !attempt_is_current_after_async_boundary(&mut state.coordinator, generation)
                     {
@@ -805,30 +1021,63 @@ impl DesktopConnectionIntent {
                         ));
                     }
                     state.initial_preflight = None;
-                }
-                InitialDesktopPreflightAction::RunLegacy => {
-                    self.wait_for_recovery_power(generation, automatic).await?;
-                    let skip_probe_refresh = initial_preflight
-                        .quick_toggle_skip_probe_refresh
-                        .unwrap_or(false);
-                    self.abandon_initial_intent_for_legacy(generation).await?;
-                    let result = if skip_probe_refresh {
-                        self.application
-                            .start_without_probe_refresh(options, crate::current_unix_time())
-                            .await
-                    } else {
-                        self.application
-                            .start(options, crate::current_unix_time())
-                            .await
-                    };
-                    return result
-                        .map(StartCommandResponse::connected)
-                        .map_err(CommandError::from);
+                    if action == InitialDesktopPreflightAction::RunLegacy {
+                        attempt_kind = AttemptKind::Legacy {
+                            skip_probe_refresh: initial_preflight
+                                .quick_toggle_skip_probe_refresh
+                                .unwrap_or(false),
+                        };
+                        state.attempt_kind = attempt_kind;
+                    }
                 }
             }
         }
+        if !recovery_allowed() {
+            return self
+                .complete_error(generation, ApplicationError::RecoveryDeferred)
+                .await;
+        }
+        if let AttemptKind::Legacy { skip_probe_refresh } = attempt_kind {
+            let result = self
+                .application
+                .start_legacy_intent_guarded(
+                    options,
+                    crate::current_unix_time(),
+                    cancel_epoch,
+                    skip_probe_refresh,
+                    start_admission,
+                )
+                .await;
+            if matches!(result, Err(ApplicationError::RecoveryDeferred)) {
+                return self
+                    .complete_error(generation, ApplicationError::RecoveryDeferred)
+                    .await;
+            }
+            self.abandon_initial_intent_for_legacy(generation).await?;
+            return result
+                .map(StartCommandResponse::connected)
+                .map_err(CommandError::from);
+        }
         if refresh_capability_before_attempt {
-            if let Err(error) = self.refresh_recovery_capability().await {
+            let capability = self
+                .refresh_recovery_capability(&stall_recovery_allowed)
+                .await;
+            if !stall_is_current() {
+                return self
+                    .finish_obsolete_stall_attempt(generation, cancel_epoch)
+                    .await;
+            }
+            if !recovery_allowed() {
+                return self
+                    .complete_error(generation, ApplicationError::RecoveryDeferred)
+                    .await;
+            }
+            if let Err(error) = capability {
+                let error = if recovery_allowed() {
+                    error
+                } else {
+                    ApplicationError::RecoveryDeferred
+                };
                 return self.complete_error(generation, error).await;
             }
             let mut state = self.state.lock().await;
@@ -838,19 +1087,36 @@ impl DesktopConnectionIntent {
                     "Подключение отменено",
                 ));
             }
-            state.refresh_capability_before_attempt = false;
+            if recovery_allowed() {
+                state.refresh_capability_before_attempt = false;
+            }
+        }
+        if !recovery_allowed() {
+            return self
+                .complete_error(generation, ApplicationError::RecoveryDeferred)
+                .await;
         }
         if reconcile_before_attempt {
-            if let Err(error) = self
+            let reconciled = self
                 .application
-                .reconcile_pending_operation_for_retry()
-                .await
-            {
+                .reconcile_pending_operation_for_retry_guarded(&stall_recovery_allowed)
+                .await;
+            if !stall_is_current() {
+                return self
+                    .finish_obsolete_stall_attempt(generation, cancel_epoch)
+                    .await;
+            }
+            if let Err(error) = reconciled {
                 let mut state = self.state.lock().await;
                 if state.coordinator.generation() == generation {
                     state.reconcile_before_attempt = true;
                 }
                 drop(state);
+                let error = if recovery_allowed() {
+                    error
+                } else {
+                    ApplicationError::RecoveryDeferred
+                };
                 return self.complete_error(generation, error).await;
             }
             let mut state = self.state.lock().await;
@@ -862,44 +1128,50 @@ impl DesktopConnectionIntent {
             }
             state.reconcile_before_attempt = false;
         }
-        if repair_before_attempt {
-            self.wait_for_recovery_power(generation, automatic).await?;
+        if repair_before_attempt && stall_recovery_allowed() {
             let _ = crate::platform::prepare_tunnel(self.app.clone()).await;
+            let mut state = self.state.lock().await;
+            if state.coordinator.generation() == generation && recovery_allowed() {
+                state.repair_before_attempt = false;
+            }
         }
-        self.wait_for_recovery_power(generation, automatic).await?;
-        let recovery_allowed = || {
-            #[cfg(target_os = "macos")]
-            {
-                !automatic || crate::macos_power::defer_reason().is_none()
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                true
-            }
+        if !stall_is_current() {
+            return self
+                .finish_obsolete_stall_attempt(generation, cancel_epoch)
+                .await;
+        }
+        if !recovery_allowed() {
+            return self
+                .complete_error(generation, ApplicationError::RecoveryDeferred)
+                .await;
+        }
+        let result = if attempt_kind == AttemptKind::StallReplacement {
+            self.application
+                .replace_stalled_connection_at_epoch(
+                    options,
+                    crate::current_unix_time(),
+                    cancel_epoch,
+                    start_admission,
+                )
+                .await
+        } else {
+            self.application
+                .desktop_connection_intent_attempt_at_epoch(
+                    options,
+                    crate::current_unix_time(),
+                    reserve_requested,
+                    cancel_epoch,
+                    start_admission,
+                )
+                .await
         };
-        let result = match attempt_kind {
-            AttemptKind::Start => {
-                self.application
-                    .desktop_connection_intent_attempt_at_epoch(
-                        options,
-                        crate::current_unix_time(),
-                        reserve_requested,
-                        cancel_epoch,
-                        recovery_allowed,
-                    )
-                    .await
-            }
-            AttemptKind::StallReplacement => {
-                self.application
-                    .replace_stalled_connection_guarded(
-                        options,
-                        crate::current_unix_time(),
-                        recovery_allowed,
-                    )
-                    .await
-            }
-        };
+        if result.is_err() && !stall_is_current() {
+            return self
+                .finish_obsolete_stall_attempt(generation, cancel_epoch)
+                .await;
+        }
         if result.is_err() && attempt_kind == AttemptKind::StallReplacement {
+            let power_deferred = matches!(result, Err(ApplicationError::RecoveryDeferred));
             let terminal_old_lease =
                 self.application
                     .state()
@@ -909,7 +1181,7 @@ impl DesktopConnectionIntent {
                         matches!(
                             connection.status,
                             LeaseStatus::Released | LeaseStatus::Failed
-                        )
+                        ) || (power_deferred && connection.status == LeaseStatus::Warm)
                     });
             if terminal_old_lease {
                 self.state.lock().await.attempt_kind = AttemptKind::Start;
@@ -927,7 +1199,11 @@ impl DesktopConnectionIntent {
         _automatic: bool,
     ) -> Result<(), CommandError> {
         #[cfg(target_os = "macos")]
-        while _automatic && crate::macos_power::defer_reason().is_some() {
+        while _automatic
+            && !crate::macos_power::check_recovery_network(&self.application)
+                .await
+                .allows_panel_work()
+        {
             {
                 let mut state = self.state.lock().await;
                 if !attempt_is_current_after_async_boundary(&mut state.coordinator, generation) {
@@ -949,18 +1225,28 @@ impl DesktopConnectionIntent {
         Ok(())
     }
 
-    async fn refresh_recovery_capability(&self) -> Result<(), ApplicationError> {
+    async fn refresh_recovery_capability(
+        &self,
+        allowed: &(impl Fn() -> bool + Sync),
+    ) -> Result<(), ApplicationError> {
         let now_unix = crate::current_unix_time();
-        let bootstrap = self.application.bootstrap(now_unix).await?;
+        let bootstrap = self
+            .application
+            .bootstrap_guarded(now_unix, allowed)
+            .await?;
         recovery_capability_result(bootstrap.capabilities.as_ref(), now_unix)
     }
 
     async fn resolve_initial_desktop_start(
         &self,
         preflight: &InitialDesktopPreflight,
+        allowed: &(impl Fn() -> bool + Sync),
     ) -> Result<(InitialDesktopStartMode, Option<ConnectOptions>), ApplicationError> {
         let now_unix = crate::current_unix_time();
-        let bootstrap = self.application.bootstrap(now_unix).await?;
+        let bootstrap = self
+            .application
+            .bootstrap_guarded(now_unix, allowed)
+            .await?;
         if let Some(expected_device_id) = preflight.expected_device_id.as_ref() {
             if bootstrap.device.id != *expected_device_id {
                 return Err(ApplicationError::Core(CoreError::Api(
@@ -1015,11 +1301,21 @@ impl DesktopConnectionIntent {
         options: &ConnectOptions,
         preflight: &InitialDesktopPreflight,
         reserve_requested: bool,
+        admission: &dyn nelomai_client_core::StartAdmission,
     ) -> Result<(), ApplicationError> {
+        let allowed = || admission.allows_start();
         #[cfg(not(windows))]
         let _ = reserve_requested;
+        if !allowed() {
+            return Err(ApplicationError::RecoveryDeferred);
+        }
         if let Some(binding_request) = preflight.binding_request.as_ref() {
-            self.application.bind_peer(binding_request.clone()).await?;
+            self.application
+                .bind_peer_guarded(binding_request.clone(), admission)
+                .await?;
+        }
+        if !allowed() {
+            return Err(ApplicationError::RecoveryDeferred);
         }
         match crate::platform::prepare_tunnel(self.app.clone()).await {
             Ok(()) => self
@@ -1039,6 +1335,9 @@ impl DesktopConnectionIntent {
             && !desktop_reserve_eligible(options, reserve_requested)
         {
             crate::commands::ensure_defender_ready_for_awg(&self.diagnostics).await?;
+        }
+        if !allowed() {
+            return Err(ApplicationError::RecoveryDeferred);
         }
         crate::commands::refresh_installed_applications_before_start(
             &self.app,
@@ -1083,9 +1382,83 @@ impl DesktopConnectionIntent {
         generation: IntentGeneration,
         connection: Connection,
     ) -> Result<StartCommandResponse, CommandError> {
+        self.finish_connected(generation, connection, true, || true)
+            .await
+    }
+
+    async fn finish_obsolete_stall_attempt(
+        &self,
+        generation: IntentGeneration,
+        cancel_epoch: StartCancellationEpoch,
+    ) -> Result<StartCommandResponse, CommandError> {
+        if let Err(error) = self.application.check_start_cancellation(cancel_epoch) {
+            return self.complete_error(generation, error).await;
+        }
+        #[cfg(target_os = "macos")]
+        let current_scope = crate::macos_power::local_repair_epoch()
+            .zip(self.application.macos_stall_epoch())
+            .map(|(power, execution)| crate::MacosStallScope { power, execution });
+        let still_current = || {
+            #[cfg(target_os = "macos")]
+            if !current_scope.is_some_and(|scope| scope.is_current(&self.application)) {
+                return false;
+            }
+            self.application
+                .check_start_cancellation(cancel_epoch)
+                .is_ok()
+        };
+        if !still_current() {
+            return self
+                .complete_error(generation, ApplicationError::RecoveryDeferred)
+                .await;
+        }
+        let current = self.application.state().await;
+        if current.phase == Phase::Connecting || !still_current() {
+            return self
+                .complete_error(generation, ApplicationError::RecoveryDeferred)
+                .await;
+        }
+        if current.phase == Phase::Connected {
+            if let Some(connection) = current.connection {
+                // Another restart already owns this lease. Restore the live
+                // intent without logging success or compensating a new owner.
+                return self
+                    .finish_connected(generation, connection, false, still_current)
+                    .await;
+            }
+        }
+        {
+            let mut state = self.state.lock().await;
+            if state.coordinator.generation() == generation {
+                state.attempt_kind = AttemptKind::Start;
+                state.reconcile_before_attempt = true;
+                #[cfg(target_os = "macos")]
+                {
+                    state.stall_scope = None;
+                }
+            }
+        }
+        self.complete_error(generation, ApplicationError::RecoveryDeferred)
+            .await
+    }
+
+    async fn finish_connected(
+        &self,
+        generation: IntentGeneration,
+        connection: Connection,
+        started_here: bool,
+        allowed: impl FnOnce() -> bool,
+    ) -> Result<StartCommandResponse, CommandError> {
         let (decision, recovered) = {
             let mut state = self.state.lock().await;
-            let recovered = attempt_reports_recovery(state.attempt_kind, state.retry_count);
+            if !allowed() {
+                drop(state);
+                return self
+                    .complete_error(generation, ApplicationError::RecoveryDeferred)
+                    .await;
+            }
+            let recovered =
+                started_here && attempt_reports_recovery(state.attempt_kind, state.retry_count);
             let decision = state
                 .coordinator
                 .mark_connected(generation, connection.clone());
@@ -1101,6 +1474,10 @@ impl DesktopConnectionIntent {
                 state.owned_lease_id = Some(connection.lease_id.clone());
                 state.initial_preflight = None;
                 state.pending_redundant_recovery = None;
+                #[cfg(target_os = "macos")]
+                {
+                    state.stall_scope = None;
+                }
             }
             (decision, recovered)
         };
@@ -1112,7 +1489,15 @@ impl DesktopConnectionIntent {
             return Ok(StartCommandResponse::connected(connection));
         }
 
-        self.compensate_stale_success(generation).await?;
+        if started_here {
+            self.compensate_stale_success(generation).await?;
+        } else {
+            self.state
+                .lock()
+                .await
+                .coordinator
+                .complete_compensation(generation);
+        }
         Err(CommandError::new(
             "connection_intent_cancelled",
             "Подключение отменено",
@@ -1172,7 +1557,7 @@ impl DesktopConnectionIntent {
             let next = crate::current_unix_time().saturating_add(1);
             state.next_retry_at_unix = Some(next);
             // This is a power pause, not a failed attempt: retain the intent and
-            // its retry budget. The scheduler gates it until full wake + grace.
+            // its retry budget. The scheduler waits for full wake and panel readiness.
             drop(state);
             self.emit_change(None);
             self.wake.notify_one();
@@ -1222,7 +1607,7 @@ impl DesktopConnectionIntent {
                 update_policy_context(&mut state.policy, &code, decision);
                 state.reconcile_before_attempt =
                     next_reconcile_requirement(state.reconcile_before_attempt, decision);
-                state.repair_before_attempt = matches!(
+                state.repair_before_attempt |= matches!(
                     decision,
                     RecoveryDecision::RetryOnce | RecoveryDecision::RestartLocalTunnel
                 );
@@ -1459,6 +1844,10 @@ where
         return None;
     }
     match result {
+        Err(ApplicationError::RecoveryDeferred) => {
+            state.next_retry_at_unix = Some(now.saturating_add(1));
+            None
+        }
         Err(_) => {
             // Freeze may already have closed traffic. Never arm Start on a lost
             // protected-store ACK: retry the same scope via a fresh frozen status.
@@ -1574,6 +1963,10 @@ fn initialize_episode(
     reserve_requested: bool,
 ) {
     state.pending_redundant_recovery = None;
+    #[cfg(target_os = "macos")]
+    {
+        state.stall_scope = None;
+    }
     state.reserve_requested = reserve_requested;
     state.options = Some(options.normalized_for_layer());
     state.policy = RecoveryPolicyContext::default();
@@ -1839,6 +2232,7 @@ fn stable_error_code(error: &ApplicationError) -> String {
             CoreError::UpdateRequired => "update_required".to_string(),
             CoreError::SavedConnectionUnavailable => "saved_connection_unavailable".to_string(),
             CoreError::StartCancelled => "connection_intent_cancelled".to_string(),
+            CoreError::RecoveryDeferred => "recovery_power_deferred".to_string(),
             CoreError::Storage => "storage_unavailable".to_string(),
             CoreError::Api(error) => api_code(error),
             CoreError::Tunnel(code) | CoreError::SplitTunnel(code) => code.clone(),

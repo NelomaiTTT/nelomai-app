@@ -5,6 +5,8 @@ use crate::{
     runtime::{NativeControl, NativeExitReason, NativeReply, RuntimeAction, TraySnapshot},
     PANEL_BASE,
 };
+#[cfg(target_os = "macos")]
+use nelomai_client_container::desktop::{NATIVE_STALL_REBIND, NATIVE_WAKE_MUTATION};
 #[cfg(not(target_os = "macos"))]
 use nelomai_client_container::host::prepare_host;
 #[cfg(target_os = "macos")]
@@ -17,6 +19,8 @@ use nelomai_client_container::{
     RuntimeForceStop,
 };
 use nelomai_client_tunnel::TunnelController;
+#[cfg(target_os = "macos")]
+use nelomai_client_tunnel::{StallRebindGuard, WakeDispatchGuard, WAKE_DISPATCH_DEFERRED};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use nelomai_unix_service::{Request, ServiceTransport};
 #[cfg(windows)]
@@ -199,6 +203,25 @@ impl NativeStop {
         #[cfg(not(target_os = "macos"))]
         Ok(self.operation.lock().await)
     }
+
+    #[cfg(target_os = "macos")]
+    async fn exchange_wake_mutation(
+        &self,
+        request: Request,
+        guard: WakeDispatchGuard,
+        start_blocked: impl FnOnce() -> io::Result<bool>,
+    ) -> io::Result<Vec<u8>> {
+        let mut operation = match self.runtime_operation().await {
+            Ok(operation) => operation,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return wake_dispatch_deferred()
+            }
+            Err(error) => return Err(error),
+        };
+        operation
+            .exchange_wake_mutation(self.tunnel.transport(), request, guard, start_blocked()?)
+            .await
+    }
 }
 #[derive(Default)]
 struct NativeOperationState {
@@ -243,6 +266,45 @@ impl NativeOperationState {
             .await
             .map_err(|_| io::Error::other("engine unavailable"))?;
         serde_json::to_vec(&response).map_err(Into::into)
+    }
+    #[cfg(target_os = "macos")]
+    async fn exchange_stall_rebind(
+        &mut self,
+        transport: &impl ServiceTransport,
+        guard: StallRebindGuard,
+        start_blocked: bool,
+    ) -> io::Result<Vec<u8>> {
+        self.check_request()?;
+        if !guard.is_current() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        self.begin_start(start_blocked)?;
+        let response = transport
+            .exchange_stall_rebind(guard)
+            .await
+            .map_err(|_| io::Error::other("engine unavailable"))?;
+        serde_json::to_vec(&response).map_err(Into::into)
+    }
+    #[cfg(target_os = "macos")]
+    async fn exchange_wake_mutation(
+        &mut self,
+        transport: &impl ServiceTransport,
+        request: Request,
+        guard: WakeDispatchGuard,
+        start_blocked: bool,
+    ) -> io::Result<Vec<u8>> {
+        self.check_request()?;
+        if !guard.is_current() {
+            return wake_dispatch_deferred();
+        }
+        self.begin_start(start_blocked)?;
+        match transport.exchange_wake_mutation(request, guard).await {
+            Ok(response) => serde_json::to_vec(&response).map_err(Into::into),
+            Err(nelomai_unix_service::ServiceError::WakeDispatchDeferred) => {
+                wake_dispatch_deferred()
+            }
+            Err(_) => Err(io::Error::other("engine unavailable")),
+        }
     }
     fn restart_proof(&self, host: &CommonHost) -> io::Result<()> {
         if !self.observed_helper_stop {
@@ -1018,13 +1080,29 @@ pub(crate) fn show_support_diagnostics(app: tauri::AppHandle) {
 }
 
 fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: NativeStream) {
-    use nelomai_client_container::desktop::{read_native_frame, write_native_frame};
+    use nelomai_client_container::desktop::read_native_frame;
     #[cfg(target_os = "macos")]
     let mut storage_opened = false;
     loop {
         let Ok((tag, body)) = read_native_frame(&mut stream) else {
             break;
         };
+        #[cfg(target_os = "macos")]
+        if matches!(tag, NATIVE_STALL_REBIND | NATIVE_WAKE_MUTATION) {
+            let Ok(peer) = receive_native_guard_peer(&mut stream) else {
+                // A missing ancillary byte leaves the framing uncertain.
+                break;
+            };
+            let reply = if tag == NATIVE_WAKE_MUTATION {
+                tauri::async_runtime::block_on(engine_wake_mutation(&state, &body, peer))
+            } else {
+                tauri::async_runtime::block_on(engine_stall_rebind(&state, &body, peer))
+            };
+            if write_native_reply(&mut stream, tag, reply).is_err() {
+                break;
+            }
+            continue;
+        }
         let mut exit = None;
         #[cfg(target_os = "macos")]
         let mut storage_endpoint = None;
@@ -1151,11 +1229,7 @@ fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: Nati
         } else {
             Err(io::Error::other("native command rejected"))
         };
-        let (response_tag, response) = match reply {
-            Ok(body) => (tag, body),
-            Err(_) => (255, b"common operation failed".to_vec()),
-        };
-        let sent = write_native_frame(&mut stream, response_tag, &response);
+        let sent = write_native_reply(&mut stream, tag, reply);
         // Once validated, explicit shutdown/restart still owns a closed reply.
         if let Some(reason) = exit {
             tauri::async_runtime::block_on(state.finish(app, reason));
@@ -1178,18 +1252,106 @@ fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: Nati
         tauri::async_runtime::block_on(state.finish(app, CommonFinish::RuntimeFailure));
     }
 }
-async fn engine_exchange(state: &CommonState, body: &[u8]) -> io::Result<Vec<u8>> {
-    let request: Request = serde_json::from_slice(body)?;
+
+fn write_native_reply(
+    stream: &mut NativeStream,
+    tag: u8,
+    reply: io::Result<Vec<u8>>,
+) -> io::Result<()> {
+    use nelomai_client_container::desktop::write_native_frame;
+
+    match reply {
+        Ok(body) => write_native_frame(stream, tag, &body),
+        Err(_) => write_native_frame(stream, 255, b"common operation failed"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn receive_native_guard_peer(stream: &mut NativeStream) -> io::Result<NativeStream> {
+    // Bound the extra read even if the child sends a frame without the fd.
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    let peer = crate::macos_storage::receive_endpoint(stream);
+    stream.set_read_timeout(None)?;
+    peer
+}
+
+#[cfg(target_os = "macos")]
+async fn engine_stall_rebind(
+    state: &CommonState,
+    body: &[u8],
+    peer: NativeStream,
+) -> io::Result<Vec<u8>> {
+    let guard = crate::runtime::stall_rebind_guard(body, peer)?;
+    let mut operation = state.stop.runtime_operation().await?;
+    operation
+        .exchange_stall_rebind(
+            state.stop.tunnel.transport(),
+            guard,
+            native_start_blocked(state)?,
+        )
+        .await
+}
+
+#[cfg(target_os = "macos")]
+fn wake_dispatch_deferred() -> io::Result<Vec<u8>> {
+    serde_json::to_vec(&nelomai_unix_service::Response::failure(
+        WAKE_DISPATCH_DEFERRED,
+    ))
+    .map_err(Into::into)
+}
+
+#[cfg(target_os = "macos")]
+async fn engine_wake_mutation(
+    state: &CommonState,
+    body: &[u8],
+    peer: NativeStream,
+) -> io::Result<Vec<u8>> {
+    let (request, guard) = crate::runtime::wake_mutation_request(body, peer)?;
+    if !guard.is_current() {
+        return wake_dispatch_deferred();
+    }
+    let admission = admit_native_start(&request, state.host.before_native_tunnel_start()).await;
+    if !guard.is_current() {
+        return wake_dispatch_deferred();
+    }
+    admission?;
+    state
+        .stop
+        .exchange_wake_mutation(request, guard, || native_start_blocked(state))
+        .await
+}
+
+fn native_start_blocked(state: &CommonState) -> io::Result<bool> {
+    Ok(state
+        .host
+        .native_start_blocked()
+        .map_err(|_| io::Error::other("update state unavailable"))?
+        || (cfg!(any(windows, target_os = "linux"))
+            && state
+                .host
+                .runtime_switch_blocks_native_start()
+                .map_err(|_| io::Error::other("runtime switch state unavailable"))?)
+        || !runtime_is_alive(state))
+}
+
+async fn admit_native_start(
+    request: &Request,
+    admission: impl std::future::Future<Output = Result<(), HostError>>,
+) -> io::Result<()> {
     if matches!(request, Request::Start { .. })
         || cfg!(target_os = "macos")
-            && matches!(&request, Request::Redundant { request, .. } if request.is_start())
+            && matches!(request, Request::Redundant { request, .. } if request.is_start())
     {
-        state
-            .host
-            .before_native_tunnel_start()
+        admission
             .await
             .map_err(|_| io::Error::other("common start rejected"))?;
     }
+    Ok(())
+}
+
+async fn engine_exchange(state: &CommonState, body: &[u8]) -> io::Result<Vec<u8>> {
+    let request: Request = serde_json::from_slice(body)?;
+    admit_native_start(&request, state.host.before_native_tunnel_start()).await?;
     let mut operation = state.stop.runtime_operation().await?;
     // A bound capability query can create an engine.
     // It must share the start fence and cannot reuse an earlier stop receipt.
@@ -1198,18 +1360,7 @@ async fn engine_exchange(state: &CommonState, body: &[u8]) -> io::Result<Vec<u8>
             && (matches!(request, Request::Version { .. })
                 || matches!(&request, Request::Redundant { request, .. } if request.is_start()))
     {
-        operation.begin_start(
-            state
-                .host
-                .native_start_blocked()
-                .map_err(|_| io::Error::other("update state unavailable"))?
-                || (cfg!(any(windows, target_os = "linux"))
-                    && state
-                        .host
-                        .runtime_switch_blocks_native_start()
-                        .map_err(|_| io::Error::other("runtime switch state unavailable"))?)
-                || !runtime_is_alive(state),
-        )?;
+        operation.begin_start(native_start_blocked(state)?)?;
     }
     #[cfg(target_os = "macos")]
     {
@@ -1836,6 +1987,58 @@ mod lifecycle_tests {
     use super::*;
     #[cfg(target_os = "macos")]
     #[tokio::test]
+    async fn common_requires_runtime_admission_for_both_kinds_of_start() {
+        use nelomai_client_tunnel::redundancy::{
+            protocol::{Command, Member},
+            SessionScope, Slot,
+        };
+        let scope = SessionScope {
+            runtime: nelomai_contracts::RuntimeSlot::Latest,
+            runtime_generation: 1,
+            connection_generation: 1,
+            session_id: "11111111-1111-4111-8111-111111111111".into(),
+        };
+        let pair = |request| Request::Redundant {
+            protocol_version: nelomai_unix_service::PROTOCOL_VERSION,
+            request,
+        };
+        let primary = Member {
+            slot: Slot::A,
+            lease_id: "22222222-2222-4222-8222-222222222222".into(),
+            configuration: nelomai_client_tunnel::TunnelConfiguration::new("test".into()),
+            probe: nelomai_contracts::RedundantHealthProbe {
+                kind: nelomai_contracts::HealthProbeKind::DnsA,
+                target_ipv4: [192, 0, 2, 1].into(),
+                query_name: "test.example".into(),
+                timeout_ms: 2000,
+            },
+        };
+        let start = pair(Command::Start {
+            scope: scope.clone(),
+            primary,
+            role_generation: 1,
+            membership_generation: 1,
+            warm_stop_v1: true,
+            options: Default::default(),
+        });
+        for request in [Request::start("test".into()), start] {
+            assert!(
+                admit_native_start(&request, async { Err(HostError::RecoveryRequired) })
+                    .await
+                    .is_err()
+            );
+            admit_native_start(&request, async { Ok(()) })
+                .await
+                .unwrap();
+        }
+        admit_native_start(&pair(Command::PrepareStop { scope }), async {
+            panic!("Stop must remain available during runtime recovery")
+        })
+        .await
+        .unwrap();
+    }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
     async fn pending_installer_rejects_native_frames_without_losing_channel_after_cancel() {
         use nelomai_client_container::desktop::{read_native_frame, write_native_frame};
         use std::{sync::atomic::AtomicUsize, time::Duration};
@@ -1927,6 +2130,162 @@ mod lifecycle_tests {
             )),
             operation,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn common_stall_rebind_uses_guarded_transport_after_native_fences() {
+        use nelomai_unix_service::{Response, ServiceError};
+        use std::{
+            sync::atomic::AtomicUsize,
+            time::{Duration, Instant},
+        };
+
+        #[derive(Default)]
+        struct Transport(AtomicUsize);
+        #[async_trait::async_trait]
+        impl ServiceTransport for Transport {
+            async fn exchange(&self, _: Request) -> Result<Response, ServiceError> {
+                panic!("stall rebind must use the guarded exchange")
+            }
+
+            async fn exchange_stall_rebind(
+                &self,
+                guard: StallRebindGuard,
+            ) -> Result<Response, ServiceError> {
+                assert!(guard.is_current());
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Response::success(None))
+            }
+        }
+
+        let transport = Transport::default();
+        for (start_blocked, broker_replaced, exit_requested, expired) in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ] {
+            let mut operation = NativeOperationState {
+                observed_helper_stop: true,
+                broker_replaced,
+                exit_requested,
+                ..Default::default()
+            };
+            let deadline = if expired {
+                Instant::now()
+            } else {
+                Instant::now() + Duration::from_secs(3)
+            };
+            let guard = StallRebindGuard::new(deadline, || true);
+            assert!(operation
+                .exchange_stall_rebind(&transport, guard, start_blocked)
+                .await
+                .is_err());
+            assert!(operation.observed_helper_stop);
+        }
+        assert_eq!(transport.0.load(Ordering::SeqCst), 0);
+
+        let mut operation = NativeOperationState {
+            observed_helper_stop: true,
+            ..Default::default()
+        };
+        let guard = StallRebindGuard::new(Instant::now() + Duration::from_secs(3), || true);
+        let response = operation
+            .exchange_stall_rebind(&transport, guard, false)
+            .await
+            .unwrap();
+        let response: Response = serde_json::from_slice(&response).unwrap();
+        assert!(response.error_code.is_none());
+        assert!(!operation.observed_helper_stop);
+        assert_eq!(transport.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn common_stall_start_preserves_native_fences_and_relays_dispatch_refusal() {
+        use nelomai_unix_service::{Response, ServiceError};
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Default)]
+        struct Transport(AtomicUsize);
+        #[async_trait::async_trait]
+        impl ServiceTransport for Transport {
+            async fn exchange(&self, _: Request) -> Result<Response, ServiceError> {
+                panic!("ordinary recovery must use the guarded exchange")
+            }
+
+            async fn exchange_wake_mutation(
+                &self,
+                request: Request,
+                guard: WakeDispatchGuard,
+            ) -> Result<Response, ServiceError> {
+                assert!(matches!(request, Request::Start { .. }));
+                assert!(guard.is_current());
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(ServiceError::WakeDispatchDeferred)
+            }
+        }
+
+        let transport = Transport::default();
+        let mut operation = NativeOperationState {
+            observed_helper_stop: true,
+            ..Default::default()
+        };
+        let error = operation
+            .exchange_wake_mutation(
+                &transport,
+                Request::start(String::new()),
+                WakeDispatchGuard::new(None, || true),
+                true,
+            )
+            .await;
+        assert!(error.is_err());
+        let deferred = operation
+            .exchange_wake_mutation(
+                &transport,
+                Request::start(String::new()),
+                WakeDispatchGuard::new(None, || false),
+                false,
+            )
+            .await
+            .unwrap();
+        let deferred: Response = serde_json::from_slice(&deferred).unwrap();
+        assert_eq!(deferred.error_code.as_deref(), Some(WAKE_DISPATCH_DEFERRED));
+        assert!(operation.observed_helper_stop);
+        assert_eq!(transport.0.load(Ordering::SeqCst), 0);
+
+        let deferred = operation
+            .exchange_wake_mutation(
+                &transport,
+                Request::start(String::new()),
+                WakeDispatchGuard::new(None, || true),
+                false,
+            )
+            .await
+            .unwrap();
+        let deferred: Response = serde_json::from_slice(&deferred).unwrap();
+        assert_eq!(deferred.error_code.as_deref(), Some(WAKE_DISPATCH_DEFERRED));
+        assert_eq!(transport.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn busy_common_tunnel_operation_defers_stall_start_before_admission() {
+        let operation = Arc::new(tokio::sync::Mutex::new(NativeOperationState::default()));
+        let stop = stop_fixture(Arc::clone(&operation));
+        let held = operation.lock().await;
+        let body = stop
+            .exchange_wake_mutation(
+                Request::start(String::new()),
+                WakeDispatchGuard::new(None, || true),
+                || panic!("start must not pass a held native-operation gate"),
+            )
+            .await
+            .unwrap();
+        let response: nelomai_unix_service::Response = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response.error_code.as_deref(), Some(WAKE_DISPATCH_DEFERRED));
+        drop(held);
     }
 
     #[cfg(target_os = "macos")]

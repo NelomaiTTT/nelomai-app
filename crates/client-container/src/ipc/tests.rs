@@ -1421,6 +1421,7 @@ async fn legacy_logout_recovers_empty_orphan_scope_but_preserves_operational_sta
     });
     let mut pending = empty.clone();
     pending.pending_compensation_stop = Some(StoredPendingCompensationStop {
+        inferred_release: false,
         operation_id: "synthetic-stop".into(),
         lease_id: "synthetic-lease".into(),
         accept_warm: false,

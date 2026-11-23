@@ -81,6 +81,7 @@ impl TunnelController for Tunnel {
 #[derive(Default)]
 struct Api {
     requests: Mutex<Vec<OperationReconcileRequest>>,
+    reconcile_reply: Mutex<Option<OperationReconcileResponse>>,
     after_reconcile: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     hold: AtomicBool,
     entered: Notify,
@@ -131,6 +132,9 @@ impl CoreApi for Api {
         }
         if let Some(action) = self.after_reconcile.lock().unwrap().take() {
             action();
+        }
+        if let Some(reply) = self.reconcile_reply.lock().unwrap().take() {
+            return Ok(reply);
         }
         Ok(OperationReconcileResponse {
             api_version: ApiVersion::V1,
@@ -224,6 +228,8 @@ fn fixture() -> (Arc<App>, Arc<Store>, Arc<Api>, Arc<Tunnel>) {
     });
     state.pending_start = Some(StoredPendingStart {
         operation_id: "30000000-0000-4000-8000-000000000009".into(),
+        issued_lease_id: None,
+        native_start_attempted: None,
         layer: Layer::Stray,
         tic_connection_mode: TicConnectionMode::Dynamic,
         route_mode: RouteMode::Standalone,
@@ -280,6 +286,44 @@ async fn passive_cancel_replay_preserves_unrelated_retained_pair_native_and_cach
         );
     }
 }
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
+async fn scheduler_and_shutdown_complete_a_retired_stalled_lease_without_a_connection() {
+    for shutdown in [false, true] {
+        let (app, store, api, tunnel) = fixture();
+        let lease = "11111111-1111-4111-8111-111111111111";
+        {
+            let mut state = store.value.lock().unwrap();
+            state.pending_start = None;
+            state.pending_stalled_stop = Some(StoredPendingStalledStop {
+                operation_id: "original-stop".into(),
+                lease_id: lease.into(),
+                contract_version: 1,
+                request_fingerprint:
+                    "9808141ba59407c91cb5e3b96c4b2051387fe876297dcbacde665c5b656d179f".into(),
+            });
+        }
+        *api.reconcile_reply.lock().unwrap() = Some(OperationReconcileResponse {
+            api_version: ApiVersion::V1,
+            request_id: "confirmed".into(),
+            state: OperationState::Terminal,
+            cancel_requested: false,
+            lease_id: Some(lease.into()),
+            lease_status: Some(LeaseStatus::Released),
+            retry_count: 0,
+            next_attempt_at: None,
+        });
+        if shutdown {
+            assert!(app.stop_for_shutdown().await.unwrap().is_none());
+        } else {
+            assert!(app.retry_pending_stop().await.unwrap().is_none());
+        }
+        assert!(store.value.lock().unwrap().pending_stalled_stop.is_none());
+        assert_eq!(api.requests.lock().unwrap().len(), 1);
+        assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+    }
+}
+
 #[tokio::test]
 async fn passive_cancel_replay_without_native_owner_clears_only_original_marker() {
     let (app, store, api, tunnel) = fixture();

@@ -1067,6 +1067,10 @@ impl CommandError {
             CoreError::StartCancelled => {
                 Self::new("connection_intent_cancelled", "Подключение отменено")
             }
+            CoreError::RecoveryDeferred => Self::new(
+                "recovery_power_deferred",
+                "Автоматическое восстановление ждёт готовности сети",
+            ),
             CoreError::Storage => Self::new(
                 "storage_unavailable",
                 "Защищённое хранилище временно недоступно",
@@ -4774,6 +4778,20 @@ fn refresh_installed_applications(
         .collect())
 }
 
+#[cfg(target_os = "macos")]
+async fn schedule_startup_split_tunnel_refresh(
+    _: AppHandle,
+    _: Arc<NativeApplication>,
+    _: Arc<AppDiagnostics>,
+    scheduler: Arc<SplitTunnelScheduler>,
+    _: Bootstrap,
+) {
+    // The background worker uses the same wake and native admission for a
+    // bootstrap refresh as for a periodic refresh, including its wake retry.
+    scheduler.startup_refresh.notify_one();
+}
+
+#[cfg(not(target_os = "macos"))]
 async fn schedule_startup_split_tunnel_refresh(
     app: AppHandle,
     application: Arc<NativeApplication>,

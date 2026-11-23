@@ -830,9 +830,13 @@ async fn engine_cleanup_receipt_cannot_restart_after_logout_signal_before_owner_
     f.app.signal_start_cancellation();
     assert!(matches!(
         f.app
-            .desktop_connection_intent_attempt_at_epoch(options, 1_800_000_001, true, epoch, || {
-                true
-            },)
+            .desktop_connection_intent_attempt_at_epoch(
+                options,
+                1_800_000_001,
+                true,
+                epoch,
+                &|| { true },
+            )
             .await,
         Err(ApplicationError::Core(CoreError::StartCancelled))
     ));
@@ -1010,7 +1014,7 @@ async fn singleton_engine_crash_restarts_the_same_intent_without_a_foreground_po
             1_800_000_001,
             false,
             cancel_epoch,
-            || true,
+            &|| true,
         )
         .await
         .unwrap();
@@ -1048,7 +1052,7 @@ async fn pinned_singleton_engine_crash_resumes_the_selected_peer() {
     };
     let connection = f
         .app
-        .desktop_connection_intent_attempt_at_epoch(options, 1_800_000_001, false, epoch, || true)
+        .desktop_connection_intent_attempt_at_epoch(options, 1_800_000_001, false, epoch, &|| true)
         .await
         .unwrap();
     assert!(connection.pinned);
@@ -1117,7 +1121,7 @@ async fn unbinding_peer_invalidates_a_queued_singleton_restart() {
                 1_800_000_001,
                 false,
                 epoch,
-                || true
+                &|| true
             )
             .await,
         Err(ApplicationError::Core(CoreError::StartCancelled))
@@ -1267,7 +1271,7 @@ async fn engine_crash_restarts_same_intent_only_after_cold_cleanup_retry() {
     f.app.reconcile_pending_operation_for_retry().await.unwrap();
     let connection = f
         .app
-        .desktop_connection_intent_attempt_at_epoch(options, 1_800_000_001, true, epoch, || true)
+        .desktop_connection_intent_attempt_at_epoch(options, 1_800_000_001, true, epoch, &|| true)
         .await
         .unwrap();
     assert_eq!(
@@ -1340,9 +1344,13 @@ async fn engine_cleanup_acceptance_and_changed_member_preserve_recovery() {
         drop(state);
         f.app.reconcile_pending_operation_for_retry().await.unwrap();
         f.app
-            .desktop_connection_intent_attempt_at_epoch(options, 1_800_000_001, true, epoch, || {
-                true
-            })
+            .desktop_connection_intent_attempt_at_epoch(
+                options,
+                1_800_000_001,
+                true,
+                epoch,
+                &|| true,
+            )
             .await
             .unwrap();
         assert_eq!(f.helper.starts.load(Ordering::SeqCst), 1);
@@ -1362,7 +1370,7 @@ async fn queued_engine_restart_cannot_adopt_new_epoch_after_busy_lifecycle_gate(
             1_800_000_001,
             true,
             epoch,
-            || true,
+            &|| true,
         )
         .await
     });
