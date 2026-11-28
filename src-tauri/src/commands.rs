@@ -843,16 +843,13 @@ async fn bootstrap_application_for_startup(
                 error
             }
         };
-        diagnostics.record_named("startup.auth_recovery.begin", None, None, None);
-        // Eligibility comes from the owner and exact runtime admission, not the
-        // presentation error. No error callback clears native protected state.
-        let owner = app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>();
         let recovery = owner.background(nelomai_client_container::ipc::BackgroundAction::Recover);
         // Only a known-not-issued recovery clears its own ticket. A genuinely
         // lost refresh/recovery stays fenced, so this cannot retry its old proof.
         route_android_startup_recovery(
             first_error,
             async {
+                diagnostics.record_named("startup.auth_recovery.begin", None, None, None);
                 observe_private_auth_result(recovery.await, diagnostics, SupportAuthStage::Recover)
                     .map(|_| ())
             },
@@ -897,9 +894,10 @@ async fn route_android_startup_recovery<T>(
     recovery: impl std::future::Future<Output = Result<(), nelomai_client_container::ipc::PrivateError>>,
     ordinary_bootstrap: impl std::future::Future<Output = Result<T, ApplicationError>>,
 ) -> Result<T, CommandError> {
+    // A confirmed signed-out state must reach the login screen directly.
     if !matches!(
         first_error,
-        ApplicationError::Core(CoreError::SignedOut | CoreError::AuthRecoveryRequired)
+        ApplicationError::Core(CoreError::AuthRecoveryRequired)
     ) {
         return Err(first_error.into());
     }
@@ -5245,6 +5243,32 @@ mod tests {
     fn runtime_selection_boolean_maps_only_to_the_verified_slot_enum() {
         assert_eq!(runtime_slot_for_selection(false), RuntimeSlot::Latest);
         assert_eq!(runtime_slot_for_selection(true), RuntimeSlot::Stable);
+    }
+
+    #[tokio::test]
+    async fn android_startup_confirmed_logout_skips_auth_recovery() {
+        use std::cell::Cell;
+
+        let recovery_attempted = Cell::new(false);
+        let bootstrap_attempted = Cell::new(false);
+        let result = route_android_startup_recovery(
+            ApplicationError::Core(CoreError::SignedOut),
+            async {
+                recovery_attempted.set(true);
+                Err(nelomai_client_container::ipc::PrivateError::Cancelled)
+            },
+            async {
+                bootstrap_attempted.set(true);
+                Ok::<_, ApplicationError>(())
+            },
+        )
+        .await;
+        assert_eq!(
+            result.err().map(|error| error.code).as_deref(),
+            Some("signed_out")
+        );
+        assert!(!recovery_attempted.get());
+        assert!(!bootstrap_attempted.get());
     }
 
     #[tokio::test]

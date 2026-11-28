@@ -115,7 +115,11 @@ try {
     executablePath,
     headless: true,
   });
-  if(process.env.UPDATE_REQUIRED_SMOKE){
+  if (process.env.ANDROID_STARTUP_SMOKE) {
+    for (const scenario of ["runtime-pending-android", "signed_out", "server-unavailable"]) {
+      await capture(scenario, { width: 390, height: 844 }, scenario);
+    }
+  } else if(process.env.UPDATE_REQUIRED_SMOKE){
     for(const phase of ["ready", "downloading"]){
       await capture(`update-required-${phase}-desktop`,{width:1280,height:800},`update-required-${phase}`);
       await capture(`update-required-${phase}-mobile`,{width:390,height:844},`update-required-${phase}`);
@@ -137,6 +141,7 @@ try {
   for (const scenario of ["runtime-pending-auto", "runtime-pending-manual", "runtime-pending-logout-failed", "runtime-pending-logout"]) {
     await capture(scenario, { width: 1280, height: 800 }, scenario);
   }
+  await capture("runtime-pending-android", { width: 390, height: 844 }, "runtime-pending-android");
   await capture("sign-in", { width: 390, height: 844 }, "signed_out");
   await capture(
     "bootstrap-error",
@@ -163,6 +168,7 @@ async function capture(name, viewport, scenario) {
     deviceScaleFactor: 1,
     isMobile: viewport.width < 600,
     hasTouch: viewport.width < 600,
+    ...(viewport.width < 600 && { userAgent: "Mozilla/5.0 (Linux; Android 15) Nelomai smoke" }),
   });
   const page = await context.newPage();
   page.setDefaultTimeout(30000);
@@ -223,8 +229,11 @@ async function capture(name, viewport, scenario) {
             return update;
           }
           if (command === "app_bootstrap") {
-            if (currentScenario.startsWith("runtime-pending") &&
-                window.__TAURI_CALLS__.filter((call) => call.command === "app_bootstrap").length === 1) {
+            const attempt = window.__TAURI_CALLS__.filter((call) => call.command === "app_bootstrap").length;
+            if (currentScenario === "runtime-pending-android") {
+              await new Promise((resolve) => { window.__RELEASE_STARTUP__ = resolve; });
+            }
+            if (currentScenario.startsWith("runtime-pending") && attempt === 1) {
               throw { code: "runtime_startup_pending", message: "Подготовка подключения; повторим автоматически" };
             }
             if (currentScenario === "signed_out") {
@@ -276,9 +285,12 @@ async function capture(name, viewport, scenario) {
           }
           if (command === "app_release_history") {
             if (window.__RELEASE_HISTORY_OFFLINE__) throw { code: "release_history_unavailable" };
-            return { api_version: "1", entries: [{ version: "0.2.18", notes: window.__RELEASE_HISTORY_NOTES__ ?? "Текст с панели\n<script>window.changelogInjected = true</script>" }] };
+            return { api_version: "1", platform: fixture.device.platform, entries: [{ version: "0.2.18", notes: window.__RELEASE_HISTORY_NOTES__ ?? "Текст с панели\n<script>window.changelogInjected = true</script>" }] };
           }
           if (command === "app_state") {
+            if (currentScenario === "runtime-pending-android" && !window.__RELEASE_STARTUP_STATE__) {
+              await new Promise((resolve) => { window.__RELEASE_STARTUP_STATE__ = resolve; });
+            }
             return {
               phase: connection ? "connected" : "ready",
               connection,
@@ -531,6 +543,48 @@ async function capture(name, viewport, scenario) {
     const size=await page.evaluate(()=>({scroll:document.documentElement.scrollWidth,width:innerWidth}));if(size.scroll>size.width)throw Error("update dialog overflow");
     await context.close();return;
   }
+  if (scenario === "runtime-pending-android") {
+    const start = page.getByRole("button", { name: /^Старт/ });
+    const connectionPanel = page.locator(".connection-panel");
+    const attempts = (expected) => page.waitForFunction((count) =>
+      window.__TAURI_CALLS__.filter((call) => call.command === "app_bootstrap").length === count &&
+      typeof window.__RELEASE_STARTUP__ === "function", expected);
+    const confirmBlocked = async () => {
+      await connectionPanel.getByRole("heading", { name: "Подключение", exact: true }).waitFor({timeout: 2500});
+      if (!await start.isDisabled()) throw Error("Start enabled before runtime admission");
+      if (await connectionPanel.getByText("Интернет защищён").isVisible() ||
+          await page.getByText("Используемый пир", { exact: true }).isVisible()) {
+        throw Error("Startup displayed an unconfirmed connection or binding");
+      }
+      await start.dispatchEvent("click");
+      const connectionCalls = await page.evaluate(() => window.__TAURI_CALLS__.filter((call) =>
+        ["app_start", "app_prepare_tunnel", "app_bind_peer"].includes(call.command)));
+      if (connectionCalls.length !== 0) throw Error("Pending startup dispatched a tunnel action");
+    };
+    await attempts(1);
+    await confirmBlocked();
+    await page.evaluate(() => { window.__RELEASE_STARTUP__(); window.__RELEASE_STARTUP__ = null; });
+    await connectionPanel.getByRole("button", { name: "Повторить", exact: true }).waitFor();
+    await confirmBlocked();
+    await page.screenshot({ path: `${outputDir}/nelomai-android-startup-pending.png`, fullPage: true });
+    await attempts(2);
+    await confirmBlocked();
+    await page.evaluate(() => window.__RELEASE_STARTUP__());
+    await page.waitForFunction(() => typeof window.__RELEASE_STARTUP_STATE__ === "function");
+    await confirmBlocked();
+    await page.evaluate(() => window.__RELEASE_STARTUP_STATE__());
+    await connectionPanel.getByRole("heading", { name: "Готово к запуску" }).waitFor();
+    await start.click();
+    await connectionPanel.getByRole("heading", { name: "Интернет защищён" }).waitFor();
+    const calls = await page.evaluate(() => window.__TAURI_CALLS__.map((call) => call.command));
+    if (calls.filter((call) => call === "app_start").length !== 1 ||
+        calls.filter((call) => call === "app_bootstrap").length !== 2) {
+      throw Error("Admission duplicated startup or connection");
+    }
+    console.log(`${name}: PASS`);
+    await context.close();
+    return;
+  }
   if (scenario.startsWith("runtime-pending")) {
     await page.getByRole("heading", { name: "Завершаем подготовку приложения" }).waitFor();
     if (scenario.includes("logout")) {
@@ -675,7 +729,7 @@ async function verifyChangelogLifecycle(page) {
   }
 
   await page.screenshot({
-    path: "/tmp/nelomai-changelog-desktop.png",
+    path: `${outputDir}/nelomai-changelog-desktop.png`,
     fullPage: true,
   });
 

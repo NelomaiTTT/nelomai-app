@@ -22,7 +22,7 @@ class StableSourceGenerationTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.output = self.root / "output"
         app_java = self.root / "src-tauri/gen/android/app/src/main/java"
-        for name in ("LatestRuntimeActivity.kt", "BootstrapNetworkMonitor.kt", "StartupDiagnostics.kt", "RuntimeEntrypoint.kt"):
+        for name in ("LatestRuntimeActivity.kt", "BootstrapNetworkMonitor.kt", "StartupDiagnostics.kt", "RuntimeEntrypoint.kt", "VpnNotificationSettings.kt"):
             path = app_java / "ru/nelomai/client" / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("package ru.nelomai.client\n")
@@ -37,6 +37,7 @@ class StableSourceGenerationTest(unittest.TestCase):
         service.write_text(
             "package ru.nelomai.tunnel\n"
             "import ru.nelomai.client.RuntimeDispatchGuard\n"
+            "import ru.nelomai.client.RuntimeSelectionV1\n"
             "import ru.nelomai.client.RuntimeProcessSelection\n"
             "val icon = R.drawable.ic_vpn_notification\n"
             "val pending = RuntimeDispatchGuard.hasPending()\n"
@@ -88,6 +89,11 @@ class StableSourceGenerationTest(unittest.TestCase):
         activity = (self.output / "java/ru/nelomai/runtime/stable/LatestRuntimeActivity.kt").read_text()
         self.assertIn("import ru.nelomai.client.RuntimeUpdateVisibility", activity)
         self.assertNotIn("ru.nelomai.runtime.stable.RuntimeUpdateVisibility", activity)
+
+    def test_notification_settings_and_shared_watch_selection_are_available(self):
+        helper = self.output / "java/ru/nelomai/runtime/stable/VpnNotificationSettings.kt"
+        self.assertTrue(helper.is_file())
+        self.assertIn("import ru.nelomai.client.RuntimeSelectionV1", self.generated)
 
     def test_bootstrap_network_observer_is_included_in_the_runtime_namespace(self):
         observer = self.output / "java/ru/nelomai/runtime/stable/BootstrapNetworkMonitor.kt"

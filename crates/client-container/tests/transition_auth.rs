@@ -435,6 +435,7 @@ struct Panel {
     fail_bootstrap: AtomicUsize,
     fail_refresh: AtomicUsize,
     bound_refresh: AtomicUsize,
+    bound_recovery_bodies: Mutex<Vec<Value>>,
     hold_refresh: AtomicUsize,
     refresh_entered: Notify,
     refresh_release: Notify,
@@ -954,6 +955,19 @@ async fn panel(state: Arc<Panel>) -> (nelomai_client_api::ClientApi, tokio::task
             ),
         )
         .route(
+            "/api/client/v1/auth/refresh-recoverable/runtime-switch",
+            post(
+                |State(state): State<Arc<Panel>>, Json(body): Json<Value>| async move {
+                    state
+                        .bound_recovery_bodies
+                        .lock()
+                        .unwrap()
+                        .push(body.clone());
+                    refresh(State(state), Json(body)).await
+                },
+            ),
+        )
+        .route(
             "/api/client/v1/connections/runtime-switch/reconcile",
             post(reconcile),
         )
@@ -1143,7 +1157,7 @@ async fn clean_supersede_is_protected_replay_and_exposes_only_the_successor_auth
 }
 
 #[tokio::test]
-async fn bound_known_expiry_refreshes_same_source_without_changing_frozen_reconcile() {
+async fn bound_known_expiry_reconciles_without_rotating_or_changing_frozen_request() {
     for accepted in [false, true] {
         let state = Arc::new(Panel::default());
         state.bound_refresh.store(1, Ordering::SeqCst);
@@ -1164,6 +1178,7 @@ async fn bound_known_expiry_refreshes_same_source_without_changing_frozen_reconc
             );
             state.return_retry.store(0, Ordering::SeqCst);
         }
+        let before = store.load().unwrap().unwrap();
         state.reject_reconcile_access.store(1, Ordering::SeqCst);
         assert_eq!(
             broker
@@ -1173,17 +1188,27 @@ async fn bound_known_expiry_refreshes_same_source_without_changing_frozen_reconc
                 .state,
             RuntimeSwitchState::Clean
         );
-        assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 0);
         let auth = store.load().unwrap().unwrap();
         assert_eq!(auth.session_generation, Some(7));
-        assert_eq!(auth.access_token.as_deref(), Some("refreshed-access"));
+        assert_eq!(auth.access_token, before.access_token);
+        assert_eq!(auth.refresh_token, before.refresh_token);
         let authorities = auth.broker.unwrap().transition_authorities;
         assert_eq!(authorities.len(), 1);
         assert_eq!(
             authorities[0].request_fingerprint,
             frozen.request_fingerprint()
         );
-        assert_eq!(authorities[0].resume_refresh_proof, "refreshed-refresh");
+        assert_eq!(
+            authorities[0].resume_refresh_proof,
+            before.refresh_token.unwrap()
+        );
+        assert!(
+            state.headers.lock().unwrap().last().unwrap()["authorization"]
+                .to_str()
+                .unwrap()
+                .starts_with("Refresh ")
+        );
         assert!(state
             .reconcile_bodies
             .lock()
@@ -1278,7 +1303,7 @@ async fn bound_uncertain_dispatch_recovers_without_rotating_its_proof() {
                 broker.reconcile_transition(frozen).await.unwrap().state,
                 RuntimeSwitchState::Clean
             );
-            assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 0);
         } else {
             for _ in 0..2 {
                 state.reject_reconcile_access.store(1, Ordering::SeqCst);
@@ -1309,48 +1334,80 @@ async fn bound_uncertain_dispatch_recovers_without_rotating_its_proof() {
     }
 }
 
+fn stage_interrupted_bound_refresh(
+    store: &Arc<dyn AuthStore>,
+    frozen: &FrozenReconcileRequest,
+) -> BrokerRequestV1 {
+    insert_reconcile_authority(
+        store,
+        frozen,
+        TransitionDispatchStateV1::InvalidAccessRejected,
+    );
+    let mut auth = store.load().unwrap().unwrap();
+    let meta = auth.broker.as_mut().unwrap();
+    meta.next_attempt += 1;
+    let ticket = BrokerRequestV1 {
+        kind: BrokerRequestKind::Refresh,
+        operation_id: uuid::Uuid::new_v4().to_string(),
+        attempt: meta.next_attempt,
+        auth_epoch: auth.auth_epoch,
+        source_identity: auth.confirmed_identity.clone(),
+        source_device_id: meta.confirmed_device_id.clone(),
+        prior_login_outcome_unknown: false,
+        resume: None,
+        refresh: None,
+    };
+    meta.pending_request = Some(ticket.clone());
+    store.save(&auth).unwrap();
+    ticket
+}
+
 #[tokio::test]
-async fn lost_bound_refresh_response_keeps_pending_ticket_and_never_rotates_again() {
+async fn interrupted_bound_refresh_recovers_with_the_same_ticket_after_restart() {
     let state = Arc::new(Panel::default());
     state.bound_refresh.store(1, Ordering::SeqCst);
-    state.reject_reconcile_access.store(1, Ordering::SeqCst);
     state.fail_refresh.store(1, Ordering::SeqCst);
     let (api, server) = panel(state.clone()).await;
     let store = enrolled_store();
     let broker = AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop)).unwrap();
     let source = broker.transition_source().await.unwrap();
     let frozen = FrozenReconcileRequest::new(reconcile_request(&source), &source).unwrap();
-    assert!(broker.reconcile_transition(frozen.clone()).await.is_err());
-    drop(broker);
+    let ticket = stage_interrupted_bound_refresh(&store, &frozen);
     let before = store.load().unwrap().unwrap();
-    assert!(
-        before
-            .broker
-            .as_ref()
-            .unwrap()
-            .pending_request
-            .as_ref()
-            .unwrap()
-            .refresh
-            .is_none(),
-        "transition-specific legacy HTTP must never be labelled as an ordinary idempotent request"
-    );
-    assert_eq!(
-        before
-            .broker
-            .as_ref()
-            .unwrap()
-            .pending_request
-            .as_ref()
-            .unwrap()
-            .kind,
-        BrokerRequestKind::Refresh
-    );
+    assert!(broker.reconcile_transition(frozen.clone()).await.is_err());
+    assert_eq!(store.load().unwrap().unwrap(), before);
+    drop(broker);
+
     state.fail_refresh.store(0, Ordering::SeqCst);
     let broker = AuthBroker::new(api, store.clone(), Arc::new(Stop)).unwrap();
-    assert!(broker.reconcile_transition(frozen).await.is_err());
-    assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(before, store.load().unwrap().unwrap());
+    assert_eq!(
+        broker
+            .reconcile_transition(frozen.clone())
+            .await
+            .unwrap()
+            .state,
+        RuntimeSwitchState::Clean
+    );
+    let auth = store.load().unwrap().unwrap();
+    assert_eq!(auth.auth_epoch, before.auth_epoch);
+    assert_eq!(auth.session_generation, Some(7));
+    assert_eq!(auth.refresh_token.as_deref(), Some("refreshed-refresh"));
+    let meta = auth.broker.unwrap();
+    assert!(meta.pending_request.is_none());
+    assert_eq!(
+        meta.transition_authorities[0].resume_refresh_proof,
+        "refreshed-refresh"
+    );
+    let requests = state.bound_recovery_bodies.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+    assert_eq!(requests[0]["mode"], "recover_legacy_pending");
+    assert_eq!(requests[0]["operation_id"], ticket.operation_id);
+    assert_eq!(
+        requests[0]["reconcile_operation_id"],
+        frozen.request().operation_id
+    );
+    assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 2);
     server.abort();
 }
 
@@ -1359,12 +1416,12 @@ async fn logout_fences_late_bound_transition_refresh_and_new_family_replay() {
     let state = Arc::new(Panel::default());
     state.bound_refresh.store(1, Ordering::SeqCst);
     state.hold_refresh.store(1, Ordering::SeqCst);
-    state.reject_reconcile_access.store(1, Ordering::SeqCst);
     let (api, server) = panel(state.clone()).await;
     let store = enrolled_store();
     let broker = Arc::new(AuthBroker::new(api, store.clone(), Arc::new(Stop)).unwrap());
     let source = broker.transition_source().await.unwrap();
     let frozen = FrozenReconcileRequest::new(reconcile_request(&source), &source).unwrap();
+    stage_interrupted_bound_refresh(&store, &frozen);
     let pending = {
         let broker = broker.clone();
         let frozen = frozen.clone();

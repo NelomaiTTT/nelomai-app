@@ -20,12 +20,24 @@ class RuntimeSelectionStore @JvmOverloads constructor(
     private val context: Context,
     private val readOffMain: Boolean = false,
 ) : AutoCloseable {
+    private var vpnProcessToken: IBinder? = null
+
+    // Runtimes compiled against the earlier Kotlin default constructor still use this ABI.
+    @Suppress("UNUSED_PARAMETER")
+    constructor(context: Context, allowOwnerOomManagement: Boolean = true, readOffMain: Boolean = false) :
+        this(context, readOffMain)
+
+    constructor(context: Context, vpnProcessToken: IBinder) :
+        this(context, readOffMain = true) {
+        this.vpnProcessToken = vpnProcessToken
+    }
+
     var updateProtocol: Int = 1
         private set
     private val handler = Handler(Looper.getMainLooper())
     @Volatile private var remote: IBinder? = null
-    // Android requires unbind even when bindService returns false or throws.
-    private var bindingAttempted = false
+    private var connection: ServiceConnection? = null
+    private var rebindAttempted = false
     private var unfrozenBindingAttempted = false
     private var ownerConnectionObserver: ((RuntimeSelectionV1) -> Unit)? = null
     private val pending = PendingSelectionReads<RuntimeSelectionV1>(8)
@@ -35,13 +47,22 @@ class RuntimeSelectionStore @JvmOverloads constructor(
     ) else null
     private var reading = false
     private var readVersion = 0L
+    private val retryBinding = Runnable {
+        if (remote == null && (pending.size() != 0 || ownerConnectionObserver != null)) {
+            rebindAttempted = true
+            invalidateBinding()
+            bind()
+        }
+    }
     private val timeout = Runnable {
         readVersion++
+        if (remote == null && ownerConnectionObserver == null) invalidateBinding()
         complete(Result.failure(IllegalStateException("runtime_owner_unavailable")))
     }
-    private val connection = object : ServiceConnection {
+    private fun newConnection() = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
-            if (!bindingAttempted || !unfrozenBindingAttempted) return
+            if (connection !== this || !unfrozenBindingAttempted) return
+            handler.removeCallbacks(retryBinding)
             readVersion++
             remote = binder
             if (readOffMain) {
@@ -49,20 +70,27 @@ class RuntimeSelectionStore @JvmOverloads constructor(
             } else {
                 val result = runCatching { snapshot() }
                 if (result.exceptionOrNull() is DeadObjectException) {
-                    // Keep the pending reads and their deadline for the next Binder.
                     remote = null
+                    scheduleBindingRetry()
                     return
                 }
+                if (result.isSuccess) rebindAttempted = false
                 complete(result)
                 if (remote === binder) result.onSuccess { ownerConnectionObserver?.invoke(it) }
             }
         }
-        override fun onServiceDisconnected(name: ComponentName?) { readVersion++; remote = null }
+        override fun onServiceDisconnected(name: ComponentName?) {
+            if (connection !== this) return
+            readVersion++
+            remote = null
+        }
         override fun onNullBinding(name: ComponentName?) {
+            if (connection !== this) return
             invalidateBinding()
             complete(Result.failure(IllegalStateException("runtime_owner_unavailable")))
         }
         override fun onBindingDied(name: ComponentName?) {
+            if (connection !== this) return
             invalidateBinding()
             complete(Result.failure(IllegalStateException("runtime_owner_unavailable")))
         }
@@ -89,8 +117,7 @@ class RuntimeSelectionStore @JvmOverloads constructor(
                 callback(result)
                 return
             }
-            // A transaction can observe death before onServiceDisconnected.
-            // Let the existing binding deliver the replacement to queued readers.
+            // Queue the reader before scheduling reconnection.
             remote = null
         }
         val startOfBatch = pending.size() == 0
@@ -98,25 +125,40 @@ class RuntimeSelectionStore @JvmOverloads constructor(
             callback(Result.failure(IllegalStateException("runtime_owner_queue_full")))
             return
         }
-        if (bindingAttempted) {
-            if (startOfBatch) handler.postDelayed(timeout, READ_TIMEOUT_MILLIS)
-            if (readOffMain) readPending()
-            return
+        if (startOfBatch) {
+            rebindAttempted = false
+            handler.postDelayed(timeout, READ_TIMEOUT_MILLIS)
         }
+        when {
+            connection == null -> bind()
+            startOfBatch && remote == null -> scheduleBindingRetry()
+            readOffMain -> readPending()
+        }
+    }
+
+    private fun scheduleBindingRetry() {
+        // Give AMS time to reconnect. A transaction can fail on a live broker
+        // without an Android disconnect, so refresh the binding once per batch.
+        if (rebindAttempted || (pending.size() == 0 && ownerConnectionObserver == null)) return
+        handler.removeCallbacks(retryBinding)
+        handler.postDelayed(retryBinding, REBIND_DELAY_MILLIS)
+    }
+
+    private fun bind() {
+        val next = newConnection()
+        connection = next
         val intent = Intent().setClassName(context.packageName, "ru.nelomai.client.RuntimeAuthBrokerService")
-        val ready = runCatching {
-            bindingAttempted = true
-            if (context.bindService(intent, connection, Context.BIND_AUTO_CREATE)) {
+        val bound = try {
+            if (context.bindService(intent, next, Context.BIND_AUTO_CREATE) && connection === next) {
                 unfrozenBindingAttempted = true
-                context.bindService(intent, unfrozenConnection,
-                    Context.BIND_AUTO_CREATE or Context.BIND_WAIVE_PRIORITY)
+                context.bindService(intent, unfrozenConnection, Context.BIND_AUTO_CREATE or Context.BIND_WAIVE_PRIORITY)
             } else false
-        }.getOrDefault(false)
-        if (!ready) {
+        } catch (_: RuntimeException) {
+            false
+        }
+        if (!bound && connection === next) {
             invalidateBinding()
             complete(Result.failure(IllegalStateException("runtime_owner_unavailable")))
-        } else if (startOfBatch && pending.size() != 0) {
-            handler.postDelayed(timeout, READ_TIMEOUT_MILLIS)
         }
     }
 
@@ -140,7 +182,10 @@ class RuntimeSelectionStore @JvmOverloads constructor(
                     if (remote === binder && readVersion == version) {
                         when {
                             android.os.SystemClock.uptimeMillis() - startedAt >= READ_TIMEOUT_MILLIS -> timeout.run()
-                            result.exceptionOrNull() is DeadObjectException -> remote = null
+                            result.exceptionOrNull() is DeadObjectException -> {
+                                remote = null
+                                scheduleBindingRetry()
+                            }
                             else -> {
                                 val ready = pending.take(batchSize)
                                 if (pending.size() == 0) handler.removeCallbacks(timeout)
@@ -175,7 +220,26 @@ class RuntimeSelectionStore @JvmOverloads constructor(
         }
     }
 
+    private var watchedBy: IBinder? = null
+
     private fun snapshotFrom(binder: IBinder): RuntimeSelectionV1 {
+        // The VPN dispatcher uses the serial selection worker. A synchronous call lets the
+        // broker identify the token's real caller PID, which Android hides for one-way calls.
+        if (vpnProcessToken != null && watchedBy !== binder) {
+            val data = Parcel.obtain()
+            val reply = Parcel.obtain()
+            try {
+                data.writeInterfaceToken(RuntimeOwnerProtocol.DESCRIPTOR)
+                data.writeStrongBinder(vpnProcessToken)
+                // A false transaction means this broker does not implement the optional watch.
+                if (binder.transact(RuntimeOwnerProtocol.WATCH_VPN_PROCESS, data, reply, 0)) reply.readException()
+                watchedBy = binder
+            } catch (error: Exception) {
+                // The mandatory selection below determines whether the connection is usable.
+                // Retry the watch on the next read if this broker is still alive.
+                android.util.Log.w("NelomaiStartup", "VPN process observer unavailable", error)
+            } finally { data.recycle(); reply.recycle() }
+        }
         val startedAt = android.os.SystemClock.uptimeMillis()
         return transact(binder, RuntimeOwnerProtocol.SELECTION) { _, reply ->
             decode(requireNotNull(reply.readString())).apply { brokerVerifiedAtUptimeMillis = startedAt }
@@ -237,16 +301,17 @@ class RuntimeSelectionStore @JvmOverloads constructor(
 
     private fun complete(result: Result<RuntimeSelectionV1>) {
         handler.removeCallbacks(timeout)
+        handler.removeCallbacks(retryBinding)
         pending.complete(result)
     }
 
     private fun invalidateBinding() {
         readVersion++
         remote = null
-        if (bindingAttempted) {
-            bindingAttempted = false
-            runCatching { context.unbindService(connection) }
-        }
+        handler.removeCallbacks(retryBinding)
+        val old = connection
+        connection = null
+        if (old != null) runCatching { context.unbindService(old) }
         if (unfrozenBindingAttempted) {
             unfrozenBindingAttempted = false
             runCatching { context.unbindService(unfrozenConnection) }
@@ -262,17 +327,27 @@ class RuntimeSelectionStore @JvmOverloads constructor(
     }
 
     companion object {
+        private const val REBIND_DELAY_MILLIS = 250L
         private const val READ_TIMEOUT_MILLIS = 10_000L
         fun decode(value: String): RuntimeSelectionV1 {
             return RuntimeSelectionCodec.decode(value)
         }
-        fun encode(value: RuntimeSelectionV1): String = JSONObject().apply {
+        fun encodeVpnRecoveryOwner(value: RuntimeSelectionV1): String = encodeFields(value).apply {
+            value.vpnAuthorization?.let { authorization ->
+                put("vpn_authorization", JSONObject().put("scope", authorization.scope ?: JSONObject.NULL)
+                    .put("blocked", authorization.blocked).put("logout_epoch", authorization.logoutEpoch ?: JSONObject.NULL))
+            }
+        }.toString()
+
+        fun encode(value: RuntimeSelectionV1): String = encodeFields(value).toString()
+
+        private fun encodeFields(value: RuntimeSelectionV1): JSONObject = JSONObject().apply {
             put("slot", value.slot); put("runtime_version", value.runtimeVersion)
             put("container_version", value.containerVersion)
             put("session_generation", value.sessionGeneration ?: JSONObject.NULL)
             put("pending_slot", value.pendingSlot ?: JSONObject.NULL)
             put("incarnation", value.incarnation)
-        }.toString()
+        }
     }
 }
 
@@ -281,4 +356,5 @@ object RuntimeOwnerProtocol {
     const val SELECTION = IBinder.FIRST_CALL_TRANSACTION
     const val ATTACH = IBinder.FIRST_CALL_TRANSACTION + 1
     const val UPDATE_VISIBILITY = IBinder.FIRST_CALL_TRANSACTION + 2
+    const val WATCH_VPN_PROCESS = IBinder.FIRST_CALL_TRANSACTION + 3
 }

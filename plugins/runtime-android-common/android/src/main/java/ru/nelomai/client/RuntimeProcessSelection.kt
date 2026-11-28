@@ -5,6 +5,12 @@ object RuntimeProcessSelection {
     private var loaded: RuntimeSelectionV1? = null
     private var admitted = false
     private var vpnOwner: RuntimeSelectionV1? = null
+    // Cold tile clicks have no verified runtime yet. This process-local
+    // revision survives dispatcher destruction. Latest advances it on a durable Start, stable at admission.
+    @Volatile var vpnStartRevision = java.util.UUID.randomUUID().leastSignificantBits
+        private set
+    @Synchronized fun recordVpnStart() { vpnStartRevision++ }
+
     @Synchronized fun markAdmitted() { check(loaded != null); admitted = true }
     @Synchronized fun hasAdmission(selected: RuntimeSelectionV1): Boolean = admitted && !needsExit(selected)
     @Synchronized fun needsExit(selected: RuntimeSelectionV1): Boolean =
@@ -22,6 +28,7 @@ object RuntimeProcessSelection {
 
     @Synchronized fun clearVpnOwner() { vpnOwner = null }
     @Synchronized fun hasVpnOwner(): Boolean = vpnOwner != null
+    @Synchronized fun tileOwner(): RuntimeSelectionV1? = vpnOwner ?: loaded
     @Synchronized fun vpnOwnerForStop(): RuntimeSelectionV1? = vpnOwner
     @Synchronized fun sameVpnImage(selected: RuntimeSelectionV1): Boolean =
         vpnOwner?.let { RuntimeDispatchPolicy.sameVpnImage(it, selected) } == true

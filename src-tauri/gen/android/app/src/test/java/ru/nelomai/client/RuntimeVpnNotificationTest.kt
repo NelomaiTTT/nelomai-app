@@ -37,6 +37,17 @@ class RuntimeVpnNotificationTest {
         controller.destroy()
     }
 
+    @Test fun aDirectTaskRemovalCommandDoesNotPromoteAnUnverifiedRuntime() {
+        val controller = Robolectric.buildService(RuntimeVpnDispatcherService::class.java).create()
+        val service = controller.get()
+        val command = Intent("ru.nelomai.tunnel.TASK_REMOVAL_LIVENESS")
+            .putExtra("ru.nelomai.runtime.v1.FOREGROUND_START", true)
+
+        assertEquals(Service.START_NOT_STICKY, service.onStartCommand(command, 0, 9))
+        assertEquals(0, service.getSystemService(NotificationManager::class.java).activeNotifications.size)
+        controller.destroy()
+    }
+
     @Test fun statusPollingDoesNotShowVpnNotification() {
         repeat(3) {
             val controller = Robolectric.buildService(RuntimeVpnDispatcherService::class.java).create()

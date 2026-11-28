@@ -13,6 +13,18 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 class RedundantConnectionCoordinatorTest {
+    @Test fun regularHealthTickRecoversAfterFirstOwnerResumeCouldNotReadItsRecord() {
+        val backend = CoordinatorRecordBackend()
+        val panel = FakePanel()
+        val coordinator = testRedundantCoordinator(store(transaction(), backend), panel, FakeNative())
+        backend.failReads = true
+        assertFalse(coordinator.resume())
+        assertEquals(0, panel.recoverCalls)
+        backend.failReads = false
+        coordinator.tick()
+        assertEquals(1, panel.recoverCalls)
+    }
+
     @Test
     fun protectionReadinessFailureCannotPublishRunning() {
         val outcomes = mutableListOf<String>()

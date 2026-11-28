@@ -3058,7 +3058,11 @@ async fn private_access_during_refresh(stale_request: bool, fail: bool) {
 }
 
 fn recovered_response() -> nelomai_client_api::TokenResponse {
-    serde_json::from_value(serde_json::json!({"api_version":"1","request_id":"synthetic","token_type":"Bearer","access_token":"recovered-access","access_expires_in":900,"refresh_token":"recovered-refresh","refresh_expires_in":3600,"access":{"state":"active","can_login":true,"can_connect":true,"expires_at":null},"device":{"id":"device","name":"synthetic","platform":"macos","container_version":"0.2.16","runtime_version":"0.2.16","runtime_contract_version":1,"runtime_slot":"stable","session_generation":1}})).unwrap()
+    serde_json::from_value(recovered_response_json()).unwrap()
+}
+
+fn recovered_response_json() -> serde_json::Value {
+    serde_json::json!({"api_version":"1","request_id":"synthetic","token_type":"Bearer","access_token":"recovered-access","access_expires_in":900,"refresh_token":"recovered-refresh","refresh_expires_in":3600,"access":{"state":"active","can_login":true,"can_connect":true,"expires_at":null},"device":{"id":"device","name":"synthetic","platform":"macos","container_version":"0.2.16","runtime_version":"0.2.16","runtime_contract_version":1,"runtime_slot":"stable","session_generation":1}})
 }
 #[async_trait::async_trait]
 impl PrivateBackgroundDispatcher for Recover {
@@ -3174,6 +3178,317 @@ async fn closed_restart_recovers_only_matching_persisted_scope_after_lost_refres
         }
         server.abort();
     }
+}
+
+#[tokio::test]
+async fn interrupted_native_ticket_replays_before_runtime_transition() {
+    interrupted_source_refresh_replays_before_runtime_transition(false).await;
+}
+
+#[tokio::test]
+async fn interrupted_legacy_refresh_alone_replays_before_runtime_transition() {
+    interrupted_source_refresh_replays_before_runtime_transition(true).await;
+}
+
+async fn interrupted_source_refresh_replays_before_runtime_transition(legacy_only: bool) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let observed = requests.clone();
+    let router = axum::Router::new().route(
+        "/api/client/v1/auth/refresh-recoverable/runtime-switch",
+        axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+            let mut calls = observed.lock().unwrap();
+            calls.push(request);
+            let status = if calls.len() == 1 {
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                axum::http::StatusCode::OK
+            };
+            async move { (status, axum::Json(recovered_response_json())) }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let fixture = Fixture::new(api.clone(), true);
+    let store = fixture.auth.clone();
+    let mut auth = store.load().unwrap().unwrap();
+    let meta = auth.broker.as_mut().unwrap();
+    meta.confirmed_device_id = Some("device".into());
+    if legacy_only {
+        meta.next_attempt += 1;
+        meta.pending_request = Some(BrokerRequestV1 {
+            kind: BrokerRequestKind::Refresh,
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            attempt: meta.next_attempt,
+            auth_epoch: auth.auth_epoch,
+            source_identity: auth.confirmed_identity.clone(),
+            source_device_id: meta.confirmed_device_id.clone(),
+            prior_login_outcome_unknown: false,
+            resume: None,
+            refresh: None,
+        });
+    }
+    store.save(&auth).unwrap();
+    let native_ticket = if legacy_only {
+        None
+    } else {
+        Some(fixture.broker.begin_background_recovery().await.unwrap())
+    };
+    let stop = fixture.parent.clone();
+    drop(fixture);
+    let native = Recover(AtomicUsize::new(0));
+    let deadline = || Instant::now() + REQUEST_BUDGET;
+    let reopened = AuthBroker::new(api.clone(), store.clone(), stop.clone()).unwrap();
+    assert!(matches!(
+        reopened
+            .recover_interrupted_native_auth(&native, deadline())
+            .await,
+        Err(crate::BrokerError::RefreshPending)
+    ));
+    let saved = store.load().unwrap().unwrap().broker.unwrap();
+    let ticket = saved.pending_recovery.unwrap();
+    if let Some(native_ticket) = native_ticket {
+        assert_eq!(ticket, native_ticket);
+    }
+    assert_eq!(saved.pending_request.is_some(), legacy_only);
+    assert!(reopened.transition_source().await.is_err());
+    drop(reopened);
+
+    let reopened = AuthBroker::new(api, store.clone(), stop).unwrap();
+    reopened
+        .recover_interrupted_native_auth(&native, deadline())
+        .await
+        .unwrap();
+    let source = reopened.transition_source().await.unwrap();
+    assert_eq!(source.identity(), Some(&ticket.identity));
+    assert_eq!(source.family(), ticket.family);
+    assert_eq!(source.device_id(), "device");
+    assert!(matches!(
+        reopened
+            .accept_background_recovery(&ticket, recovered_response())
+            .await,
+        Err(crate::BrokerError::Cancelled)
+    ));
+    reopened
+        .recover_interrupted_native_auth(&native, deadline())
+        .await
+        .unwrap();
+    assert_eq!(native.0.load(Ordering::SeqCst), 0);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+    assert_eq!(requests[0]["operation_id"], ticket.operation_id);
+    assert_eq!(requests[0]["device_id"], "device");
+    assert_eq!(
+        requests[0]["mode"],
+        if legacy_only {
+            "recover_legacy_pending"
+        } else {
+            "refresh"
+        }
+    );
+    let mut identity = serde_json::to_value(&ticket.identity).unwrap();
+    identity["runtime_slot"] = identity.as_object_mut().unwrap().remove("slot").unwrap();
+    assert_eq!(requests[0]["source_identity"], identity);
+    let saved = store.load().unwrap().unwrap().broker.unwrap();
+    assert!(saved.pending_recovery.is_none() && saved.pending_request.is_none());
+    server.abort();
+}
+
+#[tokio::test]
+async fn interrupted_native_recovery_advances_expired_refresh_replay() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let observed = requests.clone();
+    let router = axum::Router::new().route(
+        "/api/client/v1/auth/refresh-recoverable/runtime-switch",
+        axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+            let mut calls = observed.lock().unwrap();
+            calls.push(request);
+            let mut response = recovered_response_json();
+            if calls.len() == 1 {
+                response["access_expires_in"] = 0.into();
+            } else {
+                response["access_token"] = "fresh-access".into();
+            }
+            async move { axum::Json(response) }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let fixture = Fixture::new(api, true);
+    let mut auth = fixture.auth.load().unwrap().unwrap();
+    auth.broker.as_mut().unwrap().confirmed_device_id = Some("device".into());
+    fixture.auth.save(&auth).unwrap();
+    let original = fixture.broker.begin_background_recovery().await.unwrap();
+    let native = Recover(AtomicUsize::new(0));
+    let run = || {
+        fixture
+            .broker
+            .recover_interrupted_native_auth(&native, Instant::now() + REQUEST_BUDGET)
+    };
+    assert!(matches!(
+        run().await,
+        Err(crate::BrokerError::RefreshPending)
+    ));
+    assert!(fixture.broker.transition_source().await.is_err());
+    run().await.unwrap();
+    assert_eq!(
+        fixture
+            .broker
+            .access_token(None)
+            .await
+            .unwrap()
+            .access_token(),
+        "fresh-access"
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["operation_id"], original.operation_id);
+    assert_ne!(requests[1]["operation_id"], requests[0]["operation_id"]);
+    assert_eq!(requests[1]["refresh_token"], "recovered-refresh");
+    assert_eq!(native.0.load(Ordering::SeqCst), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn interrupted_native_recovery_uses_fresh_attempt_after_rejected_old_refresh() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let observed = requests.clone();
+    let router = axum::Router::new().route(
+        "/api/client/v1/auth/refresh-recoverable/runtime-switch",
+        axum::routing::post(move |axum::Json(request): axum::Json<serde_json::Value>| {
+            let mut calls = observed.lock().unwrap();
+            calls.push(request);
+            let (status, response) = match calls.len() {
+                1 => (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    serde_json::json!({
+                        "request_id": "synthetic", "code": "invalid_refresh_recovery", "message": "rejected"
+                    }),
+                ),
+                2 => (axum::http::StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({})),
+                _ => {
+                    let mut protected = recovered_response_json();
+                    protected["access_token"] = "protected-access".into();
+                    (axum::http::StatusCode::OK, protected)
+                }
+            };
+            async move { (status, axum::Json(response)) }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let fixture = Fixture::new(api.clone(), true);
+    let store = fixture.auth.clone();
+    let mut auth = store.load().unwrap().unwrap();
+    auth.broker.as_mut().unwrap().confirmed_device_id = Some("device".into());
+    store.save(&auth).unwrap();
+    let original = fixture.broker.begin_background_recovery().await.unwrap();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let native = HeldNative {
+        request: Mutex::new(None),
+        response: tokio::sync::Mutex::new(Some(receiver)),
+    };
+
+    let recovery = fixture
+        .broker
+        .recover_interrupted_native_auth(&native, Instant::now() + REQUEST_BUDGET);
+    let late_reply = async {
+        tokio::time::timeout(REQUEST_BUDGET, async {
+            while native.request.lock().unwrap().is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("native recovery was not dispatched");
+        {
+            let held = native.request.lock().unwrap();
+            let new = &held.as_ref().unwrap().ticket;
+            assert!(new.attempt > original.attempt);
+            assert_eq!(new.identity, original.identity);
+            assert_eq!(new.device_id, original.device_id);
+            assert_eq!(new.auth_epoch, original.auth_epoch);
+        }
+        assert!(matches!(
+            fixture
+                .broker
+                .accept_background_recovery(&original, recovered_response())
+                .await,
+            Err(crate::BrokerError::Cancelled)
+        ));
+        assert!(sender.send(recovered_response()).is_ok());
+    };
+    let (result, ()) = tokio::join!(recovery, late_reply);
+    assert!(matches!(result, Err(crate::BrokerError::RefreshPending)));
+    assert!(fixture.broker.transition_source().await.is_err());
+    let stop = fixture.parent.clone();
+    drop(fixture);
+    let dormant_native = Recover(AtomicUsize::new(0));
+    let reopened = AuthBroker::new(api, store, stop).unwrap();
+    reopened
+        .recover_interrupted_native_auth(&dormant_native, Instant::now() + REQUEST_BUDGET)
+        .await
+        .unwrap();
+    let source = reopened.transition_source().await.unwrap();
+    assert_eq!(source.identity(), Some(&original.identity));
+    assert_eq!(
+        reopened.access_token(None).await.unwrap().access_token(),
+        "protected-access"
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0]["operation_id"], original.operation_id);
+    assert_ne!(requests[1]["operation_id"], requests[0]["operation_id"]);
+    assert_eq!(requests[1]["refresh_token"], "recovered-refresh");
+    assert_eq!(requests[2], requests[1]);
+    assert_eq!(dormant_native.0.load(Ordering::SeqCst), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn interrupted_native_recovery_does_not_use_unfenced_panel_route() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let old_route_calls = calls.clone();
+    let router = axum::Router::new().route(
+        "/api/client/v1/auth/refresh-recoverable",
+        axum::routing::post(move || {
+            old_route_calls.fetch_add(1, Ordering::SeqCst);
+            async { axum::Json(recovered_response_json()) }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let fixture = Fixture::new(api, true);
+    let mut auth = fixture.auth.load().unwrap().unwrap();
+    auth.broker.as_mut().unwrap().confirmed_device_id = Some("device".into());
+    fixture.auth.save(&auth).unwrap();
+    let pending = fixture.broker.begin_background_recovery().await.unwrap();
+    let native = Recover(AtomicUsize::new(0));
+    assert!(matches!(
+        fixture
+            .broker
+            .recover_interrupted_native_auth(&native, Instant::now() + REQUEST_BUDGET)
+            .await,
+        Err(crate::BrokerError::RefreshPending)
+    ));
+    assert!(fixture.broker.transition_source().await.is_err());
+    assert_eq!(
+        fixture
+            .auth
+            .load()
+            .unwrap()
+            .unwrap()
+            .broker
+            .unwrap()
+            .pending_recovery,
+        Some(pending),
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(native.0.load(Ordering::SeqCst), 0);
+    server.abort();
 }
 
 struct TemporaryRecovery;

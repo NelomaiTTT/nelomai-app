@@ -646,12 +646,21 @@ internal class RedundantConnectionCoordinator(
         }
     }
 
+    private fun transactionForRecovery(): AndroidRedundantTransaction? {
+        val recovery = store.read()
+        if (recovery is RecoveryStoreResult.Failure && !recoveryStarted && recoveryRetryAtUnix == null) {
+            // The installed owner's normal health tick retries when the record is readable.
+            recoveryRetryAtUnix = currentUnixSeconds()
+        }
+        return ownedTransactionLocked(recovery)
+    }
+
     private fun recoverUsing(
         fetch: (AndroidRedundantTransaction) -> RedundantRecoveryResponse,
         freshStart: Boolean = false,
     ): Boolean = synchronized(gate) {
         if (totalLossCommandEmitted) return@synchronized false
-        val transaction = status() ?: return@synchronized false
+        val transaction = transactionForRecovery() ?: return@synchronized false
         if (!transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE) {
             return@synchronized false
         }
@@ -816,7 +825,7 @@ internal class RedundantConnectionCoordinator(
 
     override fun resume(): Boolean = synchronized(gate) {
         if (totalLossCommandEmitted) return@synchronized false
-        val transaction = status() ?: return@synchronized false
+        val transaction = transactionForRecovery() ?: return@synchronized false
         if (!transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE) {
             return@synchronized revoke()
         }

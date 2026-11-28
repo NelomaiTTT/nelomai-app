@@ -1,5 +1,8 @@
 package ru.nelomai.tunnel
 
+import android.app.ActivityManager
+import android.app.ApplicationExitInfo
+import android.app.Application
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -11,6 +14,7 @@ import android.os.ResultReceiver
 import org.amnezia.awg.backend.GoBackend
 import org.amnezia.awg.backend.Tunnel
 import org.amnezia.awg.util.SharedLibraryLoader
+import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -21,8 +25,14 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.Implementation
 import org.robolectric.annotation.Implements
 import org.robolectric.annotation.LooperMode
+import org.robolectric.shadows.ShadowActivityManager
+import org.robolectric.shadows.ShadowSystemClock
 import org.robolectric.util.ReflectionHelpers
+import ru.nelomai.client.RuntimeProcessSelection
+import ru.nelomai.client.RuntimeSelectionStore
+import ru.nelomai.client.RuntimeSelectionV1
 import ru.nelomai.runtime.v1.RuntimeVpnHostV1
+import java.time.Duration
 import java.util.concurrent.AbstractExecutorService
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Delayed
@@ -590,6 +600,304 @@ class NativeLocalRestartCompletionTest {
         f.work.runNext()
     }
 
+    @Test fun tileStartFencesTheOldHotStandbyWhenAndroidInterruptedStopBeforeItsMarker() = withTileRuntime { f ->
+        val old = f.beginHotStandby()
+        assertTrue(f.coordinator.cancelCurrent() is AndroidCoordinatorResult.Accepted)
+        assertFalse(f.envelope().intent.desiredActive)
+        assertTrue(requireNotNull(f.envelope().redundantTransaction).desiredActive)
+
+        val commits = mutableListOf<AndroidRecoveryEnvelope>()
+        f.record.onCommit = { commits += AndroidRecoveryEnvelopeCodec.decode(it) }
+        f.firstTapAfterSystemStop(SessionState.STOPPING)
+
+        // A process kill can leave the very first accepted write as the only durable state.
+        val accepted = commits.first { it.pendingQuickStart != null }
+        val fenced = requireNotNull(accepted.redundantTransaction)
+        assertEquals(old.startOperationId, fenced.startOperationId)
+        assertFalse("the old session must no longer be eligible for recovery", fenced.desiredActive)
+        assertEquals(RedundantStopState.PENDING, fenced.retry.stopState)
+        assertNotNull(fenced.stopOperationId)
+        assertNotNull(f.envelope().pendingQuickStart)
+    }
+
+    @Test fun offTileQueuesNextStartWhileTheOldRemoteStopIsPending() = withTileRuntime { f ->
+        val oldStop = f.preparePendingHotStandbyStop()
+
+        f.firstTapAfterSystemStop(SessionState.STOPPED)
+
+        val saved = f.envelope()
+        assertNotNull("the first Off-tile tap must start the next connection", saved.pendingQuickStart)
+        assertEquals(oldStop.stopOperationId, saved.redundantTransaction?.stopOperationId)
+        assertFalse(saved.intent.desiredActive)
+        assertTrue(f.backgroundWork.jobs.isEmpty())
+    }
+
+    @Test fun delayedOffTileStartCannotStopReplacementInSameGeneration() = withTileRuntime { f ->
+        val old = f.preparePendingHotStandbyStop()
+        val command = f.offTileStartCommand(SessionState.STOPPED)
+        f.completeOldStop(old)
+        f.prepareQuick()
+        val replacement = f.beginHotStandby("newer-session")
+        val before = f.envelope()
+
+        f.service.onStartCommand(command, 0, 2)
+        f.drainImmediateWork()
+
+        assertTrue("late tap stopped the replacement", CompletionPanel.redundantStops.isEmpty())
+        assertEquals(before, f.envelope())
+        assertEquals(replacement, f.envelope().redundantTransaction)
+    }
+
+    @Test fun systemStopAfterDurableStartBeforeTileUpdatePreventsPassiveResume() =
+        checkColdSystemStop(NelomaiVpnService.ACTION_ENSURE_RUNNING, SessionState.STOPPED)
+
+    @Test fun stopForwardedBeforeReplacementCommitCannotCancelReplacementOnDelivery() = withTileRuntime { f ->
+        val old = f.beginHotStandby("old-session")
+        val stop = ru.nelomai.runtime.v1.RuntimeServiceIntents.quickStopVpn(f.context)
+            .putExtra(ru.nelomai.runtime.v1.RuntimeServiceIntents.EXTRA_TILE_CLICK_REVISION, RuntimeProcessSelection.vpnStartRevision)
+        assertTrue(f.store.cancelRedundantIntentAndDeferStop("old-stop", old.startOperationId) is RecoveryStoreResult.Success)
+        f.completeOldStop(requireNotNull(f.envelope().redundantTransaction))
+        f.prepareQuick()
+        val replacement = old.copy(startOperationId = "replacement-session")
+        assertTrue(f.store.beginRedundant(replacement) is RecoveryStoreResult.Success)
+        f.service.onStartCommand(stop, 0, 2)
+        f.drainImmediateWork()
+        assertTrue(f.envelope().intent.desiredActive)
+        assertEquals("replacement-session", f.envelope().redundantTransaction?.startOperationId)
+        assertTrue(CompletionPanel.redundantStops.isEmpty())
+        val current = Intent(stop).putExtra(ru.nelomai.runtime.v1.RuntimeServiceIntents.EXTRA_TILE_CLICK_REVISION,
+            RuntimeProcessSelection.vpnStartRevision)
+        f.service.onStartCommand(current, 0, 3)
+        f.drainImmediateWork()
+        assertEquals(listOf("replacement-session"), CompletionPanel.redundantStops.map { it.startOperationId })
+    }
+
+    @Test fun newOffTapAfterAnotherSystemStopStartsOnce() = repeatAndroidStop(true)
+
+    @Test fun noOffTapAfterAnotherSystemStopStaysOff() = repeatAndroidStop(false)
+
+    @Test fun freshOffTapAfterPassiveRemovalOfOldRequestStartsOnce() = repeatAndroidStop(true, true)
+
+    private fun Fixture.captureActualOffTileCommand(): Intent {
+        val owner = requireNotNull(RuntimeProcessSelection.vpnOwnerForStop())
+        requireNotNull(LatestRuntimeQuickActionsV1().prepareStart(context, RuntimeSelectionStore.encodeVpnRecoveryOwner(owner))).run()
+        return requireNotNull(shadowOf(context.applicationContext as Application).nextStartedService)
+    }
+
+    private fun repeatAndroidStop(newTap: Boolean, consumeBeforeTap: Boolean = false) {
+        val record = Record()
+        val firstTime = System.currentTimeMillis() - 10_000
+        withTileRuntime(record) { f ->
+            f.preparePendingHotStandbyStop()
+            f.recordSystemStop(SessionState.STOPPING, firstTime - 1000)
+            val request = f.captureActualOffTileCommand().putExtra("quick_start_requested_at", firstTime)
+            f.service.onStartCommand(request, 0, 1)
+            assertEquals(firstTime, f.envelope().pendingQuickStart?.requestedAtMillis)
+            assertEquals(RedundantStopState.PENDING, f.envelope().redundantTransaction?.retry?.stopState)
+        }
+        withTileRuntime(record) { f ->
+            val sample = f.prepareQuick()
+            f.recordSystemStop(SessionState.STOPPING)
+            assertEquals(firstTime, f.envelope().pendingQuickStart?.requestedAtMillis)
+            var starts = 0
+            CompletionPanel.onStart = {
+                starts++
+                BackgroundStartResult(sample.configuration, sample.quickConnection!!, sample.options)
+            }
+            if (consumeBeforeTap) {
+                f.service.onStartCommand(Intent(NelomaiVpnService.ACTION_ENSURE_RUNNING), 0, 1)
+                shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(2))
+                f.drainImmediateWork()
+                assertNull(f.envelope().pendingQuickStart)
+            }
+            val cmd = if (newTap) f.captureActualOffTileCommand() else Intent(NelomaiVpnService.ACTION_ENSURE_RUNNING)
+            if (newTap) assertTrue(cmd.getLongExtra("quick_start_requested_at", 0) > firstTime)
+            f.service.onStartCommand(cmd, 0, 2)
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(2))
+            f.drainImmediateWork()
+            assertEquals(1, CompletionPanel.redundantStops.size)
+            assertEquals(if (newTap) 1 else 0, starts)
+            assertEquals(if (newTap) Tunnel.State.UP else Tunnel.State.DOWN, f.backend.getState(f.tunnel))
+        }
+    }
+
+    @Test fun delayedOffTileStartStillStartsOnceAfterItsOwnCleanup() = withTileRuntime { f ->
+        val old = f.preparePendingHotStandbyStop()
+        val command = f.offTileStartCommand(SessionState.STOPPED)
+        f.completeOldStop(old)
+        val sample = f.prepareQuick()
+
+        f.service.onStartCommand(command, 0, 2)
+        f.service.onStartCommand(command, 0, 3)
+        f.assertFreshQuickStart(sample)
+        val started = f.envelope()
+        f.service.onStartCommand(command, 0, 4)
+        f.drainImmediateWork()
+        assertEquals(started, f.envelope())
+        assertEquals(Tunnel.State.UP, f.backend.getState(f.tunnel))
+    }
+
+    @Test fun delayedOffTileStartCannotRestartAfterAnotherSessionCompleted() = withTileRuntime { f ->
+        val old = f.preparePendingHotStandbyStop()
+        val command = f.offTileStartCommand(SessionState.STOPPED)
+        f.completeOldStop(old)
+        f.completeOldStop(f.preparePendingHotStandbyStop())
+        f.prepareQuick()
+        val before = f.envelope()
+
+        f.service.onStartCommand(command, 0, 2)
+        f.drainImmediateWork()
+
+        assertEquals(before, f.envelope())
+        assertTrue(CompletionNative.events.isEmpty())
+    }
+
+    @Test fun oldUnscopedStartAfterInterruptedStopCannotStopCurrentSession() = withTileRuntime { f ->
+        f.beginHotStandby()
+        f.prepareQuick()
+        val before = f.envelope()
+        val oldCommand = Intent(NelomaiVpnService.ACTION_QUICK_TOGGLE)
+            .putExtra(NelomaiVpnService.EXTRA_START_AFTER_INTERRUPTED_STOP, true)
+
+        f.service.onStartCommand(oldCommand, 0, 2)
+        f.drainImmediateWork()
+
+        assertEquals(before, f.envelope())
+        assertTrue(CompletionPanel.redundantStops.isEmpty())
+    }
+
+    @Test fun stickyRestartFinishesInterruptedHotStandbyStopBeforeAnyTap() =
+        checkInterruptedStopBeforeTap(null)
+
+    @Test fun ensureRunningFinishesInterruptedHotStandbyStopBeforeAnyTap() =
+        checkInterruptedStopBeforeTap(NelomaiVpnService.ACTION_ENSURE_RUNNING)
+
+    @Test fun clientStatusCannotRecoverHotStandbyDuringInterruptedStop() =
+        checkInterruptedStopBeforeTap(NelomaiVpnService.ACTION_CLIENT_STATUS)
+
+    @Test fun clientMetricsCannotRecoverHotStandbyDuringInterruptedStop() =
+        checkInterruptedStopBeforeTap(NelomaiVpnService.ACTION_CLIENT_METRICS)
+
+    private fun checkInterruptedStopBeforeTap(action: String?) {
+        val record = Record()
+        val startId = java.util.UUID.randomUUID().toString()
+        withTileRuntime(record) { f ->
+            f.beginHotStandby(startId)
+            assertTrue(f.coordinator.cancelCurrent() is AndroidCoordinatorResult.Accepted)
+            assertTrue(QuickTunnelController.updateState(f.context, SessionState.STOPPING))
+        }
+        withTileRuntime(record) { f ->
+            assertFalse(f.envelope().intent.desiredActive)
+            assertTrue(requireNotNull(f.envelope().redundantTransaction).desiredActive)
+            f.prepareQuick()
+            val command = action?.let { Intent(it).putExtra(EXTRA_API_VERSION, TUNNEL_API_VERSION) }
+            f.service.onStartCommand(command, 0, 1)
+            f.drainImmediateWork()
+
+            assertTrue("unexpected panel recovery: ${CompletionPanel.redundantRecoveries}",
+                CompletionPanel.redundantRecoveries.isEmpty())
+            val stop = CompletionPanel.redundantStops.single()
+            assertEquals(startId, stop.startOperationId)
+            assertFalse(stop.desiredActive)
+            assertEquals(RedundantStopState.PENDING, stop.retry.stopState)
+            assertNotNull(stop.stopOperationId)
+            val saved = f.envelope()
+            assertNull(saved.redundantTransaction)
+            assertNull(saved.pendingQuickStart)
+            assertFalse(saved.intent.desiredActive)
+            assertTrue(CompletionNative.events.isEmpty())
+        }
+    }
+
+    @Test fun stickyRestartContinuesFirstTileTapAfterCleanup() =
+        checkTileStartAfterRecreation(null)
+
+    @Test fun ensureRunningContinuesFirstTileTapAfterCleanup() =
+        checkTileStartAfterRecreation(Intent(NelomaiVpnService.ACTION_ENSURE_RUNNING))
+
+    private fun checkTileStartAfterRecreation(restart: Intent?) {
+        val record = Record()
+        withTileRuntime(record) { f ->
+            f.preparePendingHotStandbyStop()
+            f.firstTapAfterSystemStop(SessionState.STOPPING)
+        }
+
+        // Reopen both the recovery record and the local Stop marker. The new
+        // engine must finish the original panel operation before the next Start.
+        withTileRuntime(record) { f ->
+            assertEquals("old-stop", f.envelope().redundantTransaction?.stopOperationId)
+            val sample = f.prepareQuick()
+            f.service.onStartCommand(restart, 0, 2)
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(2))
+            f.assertFreshQuickStart(sample)
+            assertEquals("old-stop", CompletionPanel.redundantStops.single().stopOperationId)
+            assertNull(f.envelope().pendingQuickStart)
+        }
+    }
+
+    @Test fun rejectedLegacyCleanupKeepsTheFirstTapDuringHotStandbyStop() = withTileRuntime { f ->
+        f.preparePendingHotStandbyStop()
+        f.firstTapAfterSystemStop(SessionState.STOPPING)
+        val requested = requireNotNull(f.envelope().pendingQuickStart)
+        var rejection: String? = null
+        val cleanup = Intent(NelomaiVpnService.ACTION_CLIENT_STOP)
+            .putExtra(EXTRA_API_VERSION, TUNNEL_API_VERSION)
+            .putExtra(EXTRA_LEGACY_STOP_ONLY, true)
+            .putExtra(EXTRA_RESULT_RECEIVER, Receiver { code, data ->
+                assertEquals(SERVICE_RESULT_ERROR, code)
+                rejection = data?.getString(EXTRA_ERROR_CODE)
+            })
+        f.service.onStartCommand(cleanup, 0, 2)
+        // No remote credential is configured, so the earlier Stop stays unacknowledged.
+        repeat(f.lookupWork.jobs.size) { f.lookupWork.runNext() }
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals("redundant_session_service_owned", rejection)
+        assertEquals("old-stop", f.envelope().redundantTransaction?.stopOperationId)
+        assertEquals(requested, f.envelope().pendingQuickStart)
+    }
+
+    @Test fun explicitClientStopCancelsTheQueuedFirstTap() = withTileRuntime { f ->
+        f.preparePendingHotStandbyStop()
+        f.firstTapAfterSystemStop(SessionState.STOPPING)
+        assertNotNull(f.envelope().pendingQuickStart)
+
+        f.service.onStartCommand(Intent(NelomaiVpnService.ACTION_CLIENT_STOP)
+            .putExtra(EXTRA_API_VERSION, TUNNEL_API_VERSION), 0, 2)
+
+        val cancelled = f.envelope()
+        assertNull(cancelled.pendingQuickStart)
+        assertFalse(cancelled.intent.desiredActive)
+        assertEquals("old-stop", cancelled.redundantTransaction?.stopOperationId)
+    }
+
+    @Test fun queuedFirstTapCannotStartVpnForAnotherAccountAfterServiceRecreation() {
+        val record = Record()
+        withTileRuntime(record) { f ->
+            f.preparePendingHotStandbyStop()
+            f.firstTapAfterSystemStop(SessionState.STOPPING)
+            assertNotNull(f.envelope().pendingQuickStart)
+        }
+        // The runtime version, process incarnation and broker generation stay the same.
+        withTileRuntime(record, accountScope = "b".repeat(64)) { f ->
+            f.service.onStartCommand(null, 0, 2)
+
+            val fenced = f.envelope()
+            assertNull(fenced.pendingQuickStart)
+            assertFalse(fenced.intent.desiredActive)
+            assertEquals("old-stop", fenced.redundantTransaction?.stopOperationId)
+            assertTrue(f.backgroundWork.jobs.isEmpty())
+        }
+    }
+
+    @Test fun firstTapRestartsLegacyTunnelWhenAndroidStoppedItWithoutALeaseRecord() = withTileRuntime { f ->
+        val sample = f.prepareQuick()
+        assertTrue(f.store.setDesiredActive(0, true) is RecoveryStoreResult.Success)
+        assertNull(f.envelope().leaseTransaction)
+        f.firstTapAfterSystemStop(SessionState.RUNNING)
+        f.assertFreshQuickStart(sample)
+    }
+
     @Test fun delayedLegacyQuickStartResponseCannotReopenAfterQuickOffCompletes() = withRuntime { f ->
         val sample = f.prepareQuick()
         var rejected = false
@@ -743,12 +1051,577 @@ class NativeLocalRestartCompletionTest {
         f.coordinator.completeLocalRestart()
     }
 
-    private fun withRuntime(retainTunDescriptor: Boolean = false, test: (Fixture) -> Unit) {
+    @Test fun statusAfterSystemStopDuringRunningOnlyFinishesTheOldSession() =
+        checkColdSystemStop(NelomaiVpnService.ACTION_CLIENT_STATUS)
+
+    @Test fun metricsAfterSystemStopDuringRunningOnlyFinishesTheOldSession() =
+        checkColdSystemStop(NelomaiVpnService.ACTION_CLIENT_METRICS)
+
+    @Test fun passiveEnsureAfterSystemStopDoesNotRearmOrRecover() =
+        checkColdSystemStop(NelomaiVpnService.ACTION_ENSURE_RUNNING)
+
+    @Test fun stickyAfterSystemStopDoesNotRearmOrRecover() = checkColdSystemStop(null)
+
+    @Test fun systemStopRetriesUnreadableIntentBeforeProcessingPassiveRequests() =
+        retriesUnreadableStoppedIntent(SessionState.RUNNING)
+
+    @Test fun systemStopRetriesUnreadableUnpublishedStart() = retriesUnreadableStoppedIntent(SessionState.STOPPED)
+
+    private fun retriesUnreadableStoppedIntent(lastPublished: SessionState) {
+        val record = Record()
+        val operation = java.util.UUID.randomUUID().toString()
+        withTileRuntime(record) { f ->
+            f.beginHotStandby(operation)
+            f.recordSystemStop(lastPublished)
+        }
+        withTileRuntime(record) { f ->
+            f.prepareQuick()
+            val status = Intent(NelomaiVpnService.ACTION_CLIENT_STATUS)
+                .putExtra(EXTRA_API_VERSION, TUNNEL_API_VERSION)
+            record.readFails = true
+            assertEquals(android.app.Service.START_NOT_STICKY, f.service.onStartCommand(status, 0, 1))
+            assertTrue(CompletionPanel.redundantRecoveries.isEmpty())
+            assertTrue(CompletionPanel.redundantStops.isEmpty())
+            record.readFails = false
+            f.service.onStartCommand(status, 0, 2)
+            f.drainImmediateWork()
+            assertEquals(listOf(operation), CompletionPanel.redundantStops.map { it.startOperationId })
+            assertTrue(CompletionPanel.redundantRecoveries.isEmpty())
+            assertFalse(f.envelope().intent.desiredActive)
+        }
+    }
+
+    private fun checkColdSystemStop(action: String?, lastPublished: SessionState = SessionState.RUNNING) {
+        val record = Record()
+        val operation = java.util.UUID.randomUUID().toString()
+        withTileRuntime(record) { f ->
+            f.beginHotStandby(operation)
+            f.recordSystemStop(lastPublished)
+        }
+        withTileRuntime(record) { f ->
+            f.prepareQuick()
+            val cmd = action?.let { Intent(it).putExtra(EXTRA_API_VERSION, TUNNEL_API_VERSION) }
+            f.service.onStartCommand(cmd, 0, 1)
+            f.drainImmediateWork()
+            assertTrue("passive command recovered old session: ${CompletionPanel.redundantRecoveries}",
+                CompletionPanel.redundantRecoveries.isEmpty())
+            assertEquals(listOf(operation), CompletionPanel.redundantStops.map { it.startOperationId })
+            assertFalse(f.envelope().intent.desiredActive)
+            assertEquals("stopped", QuickTunnelController.state(f.context))
+            assertTrue(CompletionNative.events.isEmpty())
+        }
+    }
+
+    @Test fun admittedForegroundReplacementOnlyTransfersItsWatchWhileColdRecoveryResumesHotStandby() =
+        withTileRuntime { f ->
+            f.beginHotStandby()
+            val original = f.envelope()
+            val pid = 772
+            org.robolectric.shadows.ShadowProcess.setPid(pid)
+            val owner = RuntimeSelectionStore.encodeVpnRecoveryOwner(requireNotNull(RuntimeProcessSelection.vpnOwnerForStop()))
+            val watch = TaskRemovalVpnWatch(pid + 1, System.currentTimeMillis(), true, owner)
+            registerTestVpnWatch(f.context, watch)
+            val command = taskRemovalVpnIntent(f.context, watch)
+            val foregroundKey = ru.nelomai.runtime.v1.RuntimeServiceIntents.TASK_REMOVAL_FOREGROUND_PID
+            f.service.onStartCommand(command.putExtra(foregroundKey, pid), 0, 1)
+            val jobs = f.context.getSystemService(android.app.job.JobScheduler::class.java)
+            val transferred = TaskRemovalVpnWatch.fromJob(jobs.allPendingJobs.single().extras)
+            assertEquals(watch.copy(pid = pid, waitedForExit = false), transferred)
+            assertEquals(original, f.envelope())
+            assertTrue("a live transfer must not recover the lease again", f.lookupWork.jobs.isEmpty())
+
+            f.service.onStartCommand(taskRemovalVpnIntent(f.context, requireNotNull(transferred)), 0, 2)
+            assertEquals("a cold delivery must queue Hot Standby recovery", 1, f.lookupWork.jobs.size)
+        }
+
+    @Test fun watchKeepsHandoffUntilTheColdStoreCanBeRead() = withTileRuntime { f ->
+        f.beginHotStandby()
+        org.robolectric.shadows.ShadowProcess.setPid(772)
+        val watch = TaskRemovalVpnWatch(47, System.currentTimeMillis())
+        val initialJob = registerTestVpnWatch(f.context, watch)
+        val command = taskRemovalVpnIntent(f.context, watch)
+        val jobs = f.context.getSystemService(android.app.job.JobScheduler::class.java)
+        f.record.readFails = true
+        assertEquals(android.app.Service.START_NOT_STICKY, f.service.onStartCommand(command, 0, 1))
+        assertEquals(initialJob, jobs.allPendingJobs.single())
+        assertTrue(f.lookupWork.jobs.isEmpty())
+        f.record.readFails = false
+        assertEquals(android.app.Service.START_STICKY, f.service.onStartCommand(command, 0, 2))
+        assertEquals(1, jobs.allPendingJobs.size)
+        assertEquals(1, f.lookupWork.jobs.size)
+    }
+
+    @Test fun coldHandoffRetriesAReadFailureInsideTheRecoveryWorker() = withTileRuntime { f ->
+        f.beginHotStandby()
+        org.robolectric.shadows.ShadowProcess.setPid(772)
+        val watch = TaskRemovalVpnWatch(47, System.currentTimeMillis())
+        registerTestVpnWatch(f.context, watch)
+        val command = taskRemovalVpnIntent(f.context, watch)
+        f.service.onStartCommand(command, 0, 1)
+        f.record.readFails = true
+        f.lookupWork.runNext()
+        shadowOf(Looper.getMainLooper()).idle()
+        f.record.readFails = false
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(3))
+        assertEquals("the original worker lost its read and must be replaced", 1, f.lookupWork.jobs.size)
+    }
+
+    @Test @Config(shadows = [CompletionExitHistory::class])
+    fun queuedOffTileStartSurvivesTemporaryHistoryFailure() = checkQueuedStartAfterHistoryReturns(false)
+
+    @Test @Config(shadows = [CompletionExitHistory::class])
+    fun queuedOffTileStartSurvivesTheWholeHistoryBackoff() = checkQueuedStartAfterHistoryReturns(true)
+
+    private fun checkQueuedStartAfterHistoryReturns(longOutage: Boolean) = withTileRuntime { f ->
+        val old = f.preparePendingHotStandbyStop()
+        val command = f.offTileStartCommand(SessionState.STOPPED)
+        f.completeOldStop(old)
+        val sample = f.prepareQuick()
+        f.record.onCommit = { bytes ->
+            if (JSONObject(String(bytes)).has("pendingQuickStart")) {
+                CompletionExitHistory.unavailable = true
+                f.record.onCommit = null
+            }
+        }
+        try {
+            f.service.onStartCommand(command, 0, 2)
+            assertTrue(CompletionExitHistory.unavailable)
+            if (longOutage) {
+                shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMinutes(8))
+                assertTrue(CompletionNative.events.isEmpty())
+            }
+            assertNotNull(f.envelope().pendingQuickStart)
+        } finally {
+            CompletionExitHistory.unavailable = false
+        }
+        shadowOf(Looper.getMainLooper()).idleFor(if (longOutage) Duration.ofMinutes(5) else Duration.ofSeconds(3))
+        f.assertFreshQuickStart(sample)
+    }
+
+    @Test @Config(shadows = [CompletionExitHistory::class])
+    fun preparedOffTapIsKeptWhenHistoryReadFailsAtDelivery() = withTileRuntime { f ->
+        val old = f.preparePendingHotStandbyStop()
+        val command = f.offTileStartCommand(SessionState.STOPPED)
+        f.completeOldStop(old)
+        val sample = f.prepareQuick()
+        CompletionExitHistory.unavailable = true
+        try {
+            f.service.onStartCommand(command, 0, 1)
+            assertNotNull(f.envelope().pendingQuickStart)
+            assertTrue(CompletionNative.events.isEmpty())
+        } finally {
+            CompletionExitHistory.unavailable = false
+        }
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(3))
+        f.assertFreshQuickStart(sample)
+    }
+
+    @Test @Config(shadows = [CompletionExitHistory::class])
+    fun coldUiStopCancelsSavedQuickStartWhileHistoryIsUnavailable() {
+        val record = Record()
+        withTileRuntime(record) { f ->
+            f.preparePendingHotStandbyStop()
+            f.firstTapAfterSystemStop(SessionState.STOPPING)
+            assertNotNull(f.envelope().pendingQuickStart)
+        }
+        withTileRuntime(record) { f ->
+            f.prepareQuick()
+            CompletionExitHistory.unavailable = true
+            try {
+                f.service.onStartCommand(Intent(NelomaiVpnService.ACTION_CANCEL_CURRENT_CONNECTION_INTENT), 0, 1)
+                assertNull(f.envelope().pendingQuickStart)
+            } finally {
+                CompletionExitHistory.unavailable = false
+            }
+            f.service.onStartCommand(Intent(NelomaiVpnService.ACTION_ENSURE_RUNNING), 0, 2)
+            f.drainImmediateWork()
+            assertFalse(f.envelope().intent.desiredActive)
+            assertTrue(CompletionNative.events.isEmpty())
+        }
+    }
+
+    @Test fun swipeKeepsWatchForInstalledHotStandbyWithUnreadableStore() = withTileRuntime { f ->
+        val transaction = f.beginHotStandby()
+        val owner = java.lang.reflect.Proxy.newProxyInstance(RedundantVpnProcessOwner::class.java.classLoader,
+            arrayOf(RedundantVpnProcessOwner::class.java)) { _, method, _ -> method.returnType == Boolean::class.javaPrimitiveType }
+            as RedundantVpnProcessOwner
+        f.service.installRedundantVpnOwner(owner, transaction.startOperationId)
+        try {
+            assertEquals(SessionState.STOPPED, TunnelRuntime.state())
+            org.robolectric.shadows.ShadowProcess.setPid(772)
+            f.record.readFails = true
+            f.service.onTaskRemoved(null)
+            val jobs = f.context.getSystemService(android.app.job.JobScheduler::class.java)
+            assertNotNull(TaskRemovalVpnWatch.fromJob(jobs.allPendingJobs.single().extras))
+        } finally {
+            f.record.readFails = false
+            f.service.installRedundantVpnOwner(null)
+        }
+    }
+
+    @Test fun firstStatusAfterSystemStopCannotAdvertiseTheOldQueuedStart() {
+        val record = Record()
+        val oldTap = System.currentTimeMillis() - 2_000
+        withTileRuntime(record) { f ->
+            val old = f.preparePendingHotStandbyStop()
+            f.recordSystemStop(SessionState.STOPPING, oldTap - 500)
+            f.service.onStartCommand(f.captureActualOffTileCommand().putExtra("quick_start_requested_at", oldTap), 0, 1)
+            f.completeOldStop(old)
+            assertNotNull(f.envelope().pendingQuickStart)
+        }
+        withTileRuntime(record) { f ->
+            f.recordSystemStop(SessionState.STOPPED, oldTap + 500)
+            f.service.onStartCommand(Intent(NelomaiVpnService.ACTION_CLIENT_STATUS)
+                .putExtra(EXTRA_API_VERSION, TUNNEL_API_VERSION), 0, 1)
+            assertNull(f.envelope().pendingQuickStart)
+            assertEquals("none", connectionIntentServiceStatus(f.envelope()).status)
+        }
+    }
+
+    @Test fun lateJobDoesNotStopOrRestartTheStickyRecoveryAlreadyInProgress() = withTileRuntime { f ->
+        f.beginHotStandby()
+        org.robolectric.shadows.ShadowProcess.setPid(772)
+        val owner = requireNotNull(RuntimeProcessSelection.vpnOwnerForStop())
+        val old = TaskRemovalVpnWatch(771, System.currentTimeMillis(), deathSignalled = true,
+            runtime = RuntimeSelectionStore.encodeVpnRecoveryOwner(owner))
+        val job = registerTestVpnWatch(f.context, old)
+        f.service.onStartCommand(null, 0, 1)
+        val scheduler = f.context.getSystemService(android.app.job.JobScheduler::class.java)
+        assertEquals(old.forCurrentProcess(), TaskRemovalVpnWatch.fromJob(requireNotNull(scheduler.getPendingJob(job.id)).extras))
+        assertEquals(1, f.lookupWork.jobs.size)
+        f.service.onStartCommand(taskRemovalVpnIntent(f.context, old), 0, 2)
+        val host = ReflectionHelpers.getField<RuntimeVpnHostV1>(f.service, "runtimeHost").service
+        assertNotEquals("the delayed job must not stop its successor", 2, shadowOf(host).stopSelfResultId)
+        assertEquals("only the original restore runs", 1, f.lookupWork.jobs.size)
+    }
+
+    @Test fun delayedWatchAfterAnotherSwipeCannotStopTheCurrentRecovery() = withTileRuntime { f ->
+        f.beginHotStandby()
+        org.robolectric.shadows.ShadowProcess.setPid(772)
+        val owner = requireNotNull(RuntimeProcessSelection.vpnOwnerForStop())
+        val old = TaskRemovalVpnWatch(771, System.currentTimeMillis() - 2_000, deathSignalled = true,
+            runtime = RuntimeSelectionStore.encodeVpnRecoveryOwner(owner))
+        val job = registerTestVpnWatch(f.context, old)
+        f.service.onStartCommand(null, 0, 1)
+        f.service.onTaskRemoved(null)
+        val scheduler = f.context.getSystemService(android.app.job.JobScheduler::class.java)
+        fun current() = requireNotNull(TaskRemovalVpnWatch.fromJob(requireNotNull(scheduler.getPendingJob(job.id)).extras))
+        val newer = current()
+        assertEquals(772, newer.pid)
+        assertTrue(newer.sinceMillis > old.sinceMillis)
+        f.service.onStartCommand(taskRemovalVpnIntent(f.context, old), 0, 2)
+        assertNotEquals(2, f.stoppedStartId())
+        assertEquals(newer, current())
+        assertEquals(1, f.lookupWork.jobs.size)
+    }
+
+    @Test fun lateUnreadableWatchDoesNotStopTheAcceptedJobBeforeItsWorkerRuns() = withTileRuntime { f ->
+        f.beginHotStandby()
+        org.robolectric.shadows.ShadowProcess.setPid(772)
+        val old = TaskRemovalVpnWatch(771, System.currentTimeMillis())
+        registerTestVpnWatch(f.context, old)
+        f.service.onStartCommand(taskRemovalVpnIntent(f.context, old), 0, 1)
+        assertEquals(1, f.lookupWork.jobs.size)
+        f.record.readFails = true
+        try {
+            f.service.onStartCommand(taskRemovalVpnIntent(f.context, old), 0, 2)
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(500))
+            assertNotEquals(2, f.stoppedStartId())
+            assertEquals(1, f.lookupWork.jobs.size)
+        } finally {
+            f.record.readFails = false
+        }
+    }
+
+    @Test fun rejectedWatchPreservesAnIdleStopAndUsesTheNewestAndroidStartId() = withTileRuntime { f ->
+        f.service.onStartCommand(Intent(NelomaiVpnService.ACTION_ENSURE_RUNNING), 0, 1)
+        val main = shadowOf(Looper.getMainLooper())
+        main.idleFor(Duration.ofMillis(250))
+        f.record.readFails = true
+        try {
+            val watch = TaskRemovalVpnWatch(771, System.currentTimeMillis())
+            f.service.onStartCommand(taskRemovalVpnIntent(f.context, watch), 0, 2)
+            assertNotEquals("the pending idle check owns shutdown", 2, f.stoppedStartId())
+        } finally {
+            f.record.readFails = false
+        }
+        main.idleFor(Duration.ofMillis(151))
+        assertEquals("an idle service must still leave foreground", 2, f.stoppedStartId())
+    }
+
+    @Test fun consecutiveColdRejectedWatchesReleaseTheLastStart() = withTileRuntime { f ->
+        f.beginHotStandby()
+        val command = taskRemovalVpnIntent(f.context, TaskRemovalVpnWatch(771, System.currentTimeMillis()))
+        for (id in 1..2) {
+            f.service.onStartCommand(command, 0, id)
+            assertEquals(id, f.stoppedStartId())
+        }
+        assertTrue(f.lookupWork.jobs.isEmpty())
+    }
+
+    private fun Fixture.stoppedStartId(): Int {
+        val host = ReflectionHelpers.getField<RuntimeVpnHostV1>(service, "runtimeHost").service
+        return shadowOf(host).stopSelfResultId
+    }
+
+    @Test fun stickyRestartRetriesHotStandbyAfterTemporaryStoreFailureWithoutAWatchWakeup() = withTileRuntime { f ->
+        f.beginHotStandby()
+        val owner = requireNotNull(RuntimeProcessSelection.vpnOwnerForStop())
+        org.robolectric.shadows.ShadowProcess.setPid(772)
+        val watch = TaskRemovalVpnWatch(android.os.Process.myPid() + 1, System.currentTimeMillis(),
+            runtime = RuntimeSelectionStore.encodeVpnRecoveryOwner(owner))
+        val job = registerTestVpnWatch(f.context, watch)
+        val scheduler = f.context.getSystemService(android.app.job.JobScheduler::class.java)
+        fun current() = TaskRemovalVpnWatch.fromJob(requireNotNull(scheduler.getPendingJob(job.id)).extras)
+        f.record.readFails = true
+        f.service.onStartCommand(null, 0, 1)
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(watch, current())
+        f.record.readFails = false
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(3))
+        assertEquals("a live service must resume the saved Hot Standby itself", 1, f.lookupWork.jobs.size)
+        assertEquals("a recovered service watches its next death", watch.copy(pid = android.os.Process.myPid()), current())
+    }
+
+    @Test @Config(shadows = [DeferredFailureDiagnostics::class])
+    fun queuedStartWithNoSavedPlanFinishesOnceAndAllowsAnotherFreshTap() = withTileRuntime { f ->
+        val old = f.preparePendingHotStandbyStop()
+        val command = f.offTileStartCommand(SessionState.STOPPED)
+        f.completeOldStop(old)
+        val sample = f.prepareQuick()
+        val originalPlan = CompletionQuickPlan.template
+        CompletionQuickPlan.template = null
+        f.service.onStartCommand(command, 0, 1)
+        f.drainImmediateWork()
+        assertNull(f.envelope().pendingQuickStart)
+        assertFalse(f.envelope().intent.desiredActive)
+        assertTrue(CompletionNative.events.isEmpty())
+        val finishOldReport = requireNotNull(DeferredFailureDiagnostics.finish)
+        DeferredFailureDiagnostics.finish = null
+        CompletionQuickPlan.template = originalPlan
+        f.service.onStartCommand(f.captureActualOffTileCommand(), 0, 2)
+        f.assertFreshQuickStart(sample)
+        val host = ReflectionHelpers.getField<RuntimeVpnHostV1>(f.service, "runtimeHost").service
+        finishOldReport(null)
+        shadowOf(Looper.getMainLooper()).idle()
+        assertNotEquals("the completed report must not stop the new VPN service", 2, shadowOf(host).stopSelfResultId)
+        assertEquals(Tunnel.State.UP, f.backend.getState(f.tunnel))
+    }
+
+    @Test fun failedClearOfRejectedTapRetriesOnlyTheClear() = withTileRuntime { f ->
+        val old = f.preparePendingHotStandbyStop()
+        val command = f.offTileStartCommand(SessionState.STOPPED)
+        f.completeOldStop(old)
+        f.prepareQuick()
+        val validPlan = CompletionQuickPlan.template
+        CompletionQuickPlan.template = null
+        f.record.onCommit = { bytes ->
+            if (JSONObject(String(bytes)).has("pendingQuickStart")) f.record.writeFails = true
+        }
+        f.service.onStartCommand(command, 0, 1)
+        f.drainImmediateWork()
+        assertNotNull(f.envelope().pendingQuickStart)
+        CompletionQuickPlan.template = validPlan
+        f.record.writeFails = false
+        f.record.onCommit = null
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(6))
+        f.drainImmediateWork()
+        assertNull(f.envelope().pendingQuickStart)
+        assertFalse(f.envelope().intent.desiredActive)
+        assertTrue(CompletionNative.events.isEmpty())
+    }
+
+    private fun Fixture.rejectTapDuringWriteFailure(): StartTunnelArgs {
+        val old = preparePendingHotStandbyStop()
+        val command = offTileStartCommand(SessionState.STOPPED)
+        completeOldStop(old)
+        val sample = prepareQuick()
+        val validPlan = CompletionQuickPlan.template
+        CompletionQuickPlan.template = null
+        record.onCommit = { bytes ->
+            if (JSONObject(String(bytes)).has("pendingQuickStart")) record.writeFails = true
+        }
+        service.onStartCommand(command, 0, 1)
+        drainImmediateWork()
+        assertNotNull(envelope().pendingQuickStart)
+        assertTrue(CompletionNative.events.isEmpty())
+        record.onCommit = null
+        record.writeFails = false
+        CompletionQuickPlan.template = validPlan
+        return sample
+    }
+
+    @Test @Config(shadows = [DeferredFailureDiagnostics::class])
+    fun recreatedServiceDoesNotStartRejectedTapWhenThePlanReturns() {
+        val original = Record()
+        val crashedJournal = Record()
+        val credentialRecord = Record()
+        val crashedCredentials = Record()
+        lateinit var sample: StartTunnelArgs
+        withTileRuntime(original, credentialRecord = credentialRecord) { f ->
+            sample = f.rejectTapDuringWriteFailure()
+            // Capture exactly what a newly created process could read. Callbacks
+            // draining on the old fixture during teardown cannot mutate these bytes.
+            assertTrue(crashedJournal.write(requireNotNull(original.read())))
+            assertTrue(crashedCredentials.write(requireNotNull(credentialRecord.read())))
+            assertNotNull("credential in the crash snapshot", BackgroundCredentialStore(crashedCredentials).read().let {
+                (it as? CredentialStoreResult.Success)?.value?.active
+            })
+        }
+        withTileRuntime(crashedJournal, credentialRecord = crashedCredentials) { f ->
+            val request = requireNotNull(f.envelope().pendingQuickStart)
+            assertFalse(VpnTaskRemovalLiveness.systemStoppedSince(f.context, request.requestedAtMillis))
+            CompletionQuickPlan.template = QuickTunnelTemplate(sample.options, sample.quickConnection!!)
+            val restored = AndroidBackgroundCredentialStores.open(f.context)
+            val read = restored.read()
+            assertSame("recreated service reads the captured credential backend", crashedCredentials,
+                ReflectionHelpers.getField<EncryptedRecordBackend>(restored, "backend"))
+            assertTrue("restored credential: " + when (read) {
+                is CredentialStoreResult.Success -> "revision=" + read.value.revision + ", active=" + (read.value.active != null)
+                is CredentialStoreResult.Failure -> read.code
+            }, read is CredentialStoreResult.Success && read.value.active != null)
+            var panelStarts = 0
+            CompletionPanel.onStart = {
+                panelStarts++
+                BackgroundStartResult(sample.configuration, sample.quickConnection!!, sample.options)
+            }
+            f.service.onStartCommand(null, 0, 1)
+            f.drainImmediateWork()
+            assertEquals("the rejected tap must not allocate a new session", 0, panelStarts)
+            assertNull(f.envelope().pendingQuickStart)
+            assertFalse(f.envelope().intent.desiredActive)
+            assertTrue(CompletionNative.events.isEmpty())
+        }
+    }
+
+    @Test fun freshTapBeforeRejectedTapCleanupStartsOnce() = withTileRuntime { f ->
+        val sample = f.rejectTapDuringWriteFailure()
+        f.service.onStartCommand(f.captureActualOffTileCommand(), 0, 2)
+        f.assertFreshQuickStart(sample)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(6))
+        f.drainImmediateWork()
+        assertTrue(f.envelope().intent.desiredActive)
+        assertEquals(listOf("up"), CompletionNative.events)
+    }
+
+    @Test fun interruptedStopTileChecksV2CapabilityOnceBeforeCommittingTheNewStart() = withTileRuntime { f ->
+        val old = f.preparePendingHotStandbyStop()
+        val command = f.offTileStartCommand(SessionState.STOPPED)
+        f.completeOldStop(old)
+        f.prepareQuick().quickConnection!!.reserveEnabled = true
+        var requests = 0
+        CompletionPanel.onCapabilities = {
+            requests++
+            BackgroundCapabilitySnapshot(2, true, Long.MAX_VALUE, reserveEnabled = true)
+        }
+        f.service.onStartCommand(command, 0, 1)
+        f.drainImmediateWork()
+        assertTrue(f.envelope().intent.desiredActive)
+        assertEquals(2, f.envelope().leaseTransaction?.replay?.contractVersion)
+        assertEquals("one live authorization for this explicit Hot Standby start", 1, requests)
+    }
+
+    @Test fun freshTapDuringRejectedTapCompletionStartsOnce() = withTileRuntime { f ->
+        val old = f.preparePendingHotStandbyStop()
+        val first = f.offTileStartCommand(SessionState.STOPPED)
+        val firstTime = first.getLongExtra("quick_start_requested_at", 0)
+        f.completeOldStop(old)
+        val sample = f.prepareQuick()
+        // The disabled recovery capability rejects this v2 plan before it starts.
+        sample.quickConnection!!.reserveEnabled = true
+        val prefs = f.context.getSharedPreferences(
+            AndroidRuntimeNamespace.record("nelomai-quick-tunnel-state"), Context.MODE_PRIVATE,
+        )
+        assertTrue(prefs.edit().remove("rejected-tile-tap").commit())
+        var replacementQueued = false
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == "rejected-tile-tap" && !replacementQueued) {
+                val rejected = requireNotNull(f.envelope().pendingQuickStart)
+                assertTrue(QuickTunnelController.wasRejectedTap(f.context, rejected))
+                f.record.writeFails = false
+                f.record.onCommit = null
+                sample.quickConnection!!.reserveEnabled = null
+                val replacement = f.captureActualOffTileCommand()
+                    .putExtra("quick_start_requested_at", firstTime + 1)
+                f.service.onStartCommand(replacement, 0, 2)
+                assertEquals(firstTime + 1, f.envelope().pendingQuickStart?.requestedAtMillis)
+                replacementQueued = true
+            }
+        }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        try {
+            f.record.onCommit = { bytes ->
+                if (JSONObject(String(bytes)).has("pendingQuickStart")) f.record.writeFails = true
+            }
+            var starts = 0
+            CompletionPanel.onStart = {
+                starts++
+                BackgroundStartResult(sample.configuration, sample.quickConnection!!, sample.options)
+            }
+            f.service.onStartCommand(first, 0, 1)
+            f.drainImmediateWork()
+            assertTrue("the new tap must overlap the old rejection", replacementQueued)
+            assertEquals("only the new tap allocates a connection", 1, starts)
+            assertTrue(f.envelope().intent.desiredActive)
+            assertEquals(Tunnel.State.UP, f.backend.getState(f.tunnel))
+            val host = ReflectionHelpers.getField<RuntimeVpnHostV1>(f.service, "runtimeHost").service
+            assertNotEquals("the old failure must not stop the new request", 2, shadowOf(host).stopSelfResultId)
+        } finally {
+            prefs.unregisterOnSharedPreferenceChangeListener(listener)
+            f.record.onCommit = null
+            f.record.writeFails = false
+        }
+    }
+
+    @Test fun coldWatchCompletesOnlyTheInterruptedStop() {
+        val record = Record()
+        var operation = ""
+        withTileRuntime(record) { f -> operation = f.preparePendingHotStandbyStop().startOperationId }
+        withTileRuntime(record) { f ->
+            f.prepareQuick()
+            val watch = TaskRemovalVpnWatch(47, System.currentTimeMillis())
+            f.service.onStartCommand(taskRemovalVpnIntent(f.context, watch), 0, 1)
+            f.drainImmediateWork()
+            assertEquals(listOf(operation), CompletionPanel.redundantStops.map { it.startOperationId })
+            assertNull(f.envelope().redundantTransaction)
+            assertFalse(f.envelope().intent.desiredActive)
+            assertTrue(CompletionPanel.redundantRecoveries.isEmpty())
+            assertTrue(CompletionNative.events.isEmpty())
+            assertTrue(f.context.getSystemService(android.app.job.JobScheduler::class.java).allPendingJobs.isEmpty())
+        }
+    }
+
+    @Test fun retriedWatchEndsWhenTheLatestDurableIntentHasStopped() = withTileRuntime { f ->
+        val watch = TaskRemovalVpnWatch(47, System.currentTimeMillis())
+        f.service.onStartCommand(taskRemovalVpnIntent(f.context, watch), 0, 1)
+        assertNull(f.envelope().redundantTransaction)
+        assertFalse(f.envelope().intent.desiredActive)
+        assertTrue(f.context.getSystemService(android.app.job.JobScheduler::class.java).allPendingJobs.isEmpty())
+        assertTrue(f.lookupWork.jobs.isEmpty())
+    }
+
+    private fun withTileRuntime(record: Record = Record(), accountScope: String = "a".repeat(64),
+        credentialRecord: Record = Record(), retainTunDescriptor: Boolean = false, test: (Fixture) -> Unit) {
+        val selection = RuntimeSelectionV1("latest", BuildConfig.RUNTIME_VERSION, BuildConfig.RUNTIME_VERSION,
+            7L, null, "tile-test")
+        val brokerReply = JSONObject(RuntimeSelectionStore.encode(selection)).put("vpn_authorization",
+            JSONObject().put("scope", accountScope).put("blocked", false))
+        RuntimeProcessSelection.rememberVpnOwner(RuntimeSelectionStore.decode(brokerReply.toString()))
+        try {
+            withRuntime(record, credentialRecord) { fixture ->
+                fixture.service.onCreate()
+                test(fixture)
+            }
+        } finally {
+            RuntimeProcessSelection.clearVpnOwner()
+        }
+    }
+
+    private fun withRuntime(record: Record = Record(), credentialRecord: Record = Record(), retainTunDescriptor: Boolean = false, test: (Fixture) -> Unit) {
         val controller = Robolectric.buildService(VpnService::class.java).create()
         val host = controller.get()
         if (retainTunDescriptor) OwnershipBuilder.directory = host.cacheDir
-        val record = Record()
-        val store = AndroidRecoveryStore(record, BootIdentityProvider { 1 })
+        val store = AndroidRecoveryStore(record, BootIdentityProvider { 1 }) { System.currentTimeMillis() - 2_000 }
         val coordinator = AndroidConnectionIntentCoordinator(store)
         val service = NelomaiVpnService(object : RuntimeVpnHostV1 {
             override val service = host
@@ -787,7 +1660,7 @@ class NativeLocalRestartCompletionTest {
             CompletionNative.events.clear(); CompletionNative.onUp = {}; CompletionNative.failNextUp = false
             org.robolectric.shadows.ShadowVpnService.setPrepareResult(null)
             field(AndroidRecoveryStores, "instance", store)
-            field(AndroidBackgroundCredentialStores, "instance", BackgroundCredentialStore(Record()))
+            field(AndroidBackgroundCredentialStores, "instance", BackgroundCredentialStore(credentialRecord))
             field(service, "recoveryStore", store)
             field(service, "connectionIntentCoordinator", coordinator)
             field(service, "connectionIntentLifecycle", ConnectionIntentServiceLifecycle(coordinator, schedule = {}))
@@ -832,8 +1705,11 @@ class NativeLocalRestartCompletionTest {
             saved.asReversed().forEach { it() }
             CompletionNative.onUp = {}
             CompletionQuickPlan.template = null
+            CompletionPanel.onCapabilities = null
             CompletionPanel.onStart = null
             CompletionPanel.stopped.clear()
+            CompletionPanel.redundantStops.clear()
+            CompletionPanel.redundantRecoveries.clear()
             timers.shutdownNow()
             controller.destroy()
         }
@@ -844,6 +1720,85 @@ class NativeLocalRestartCompletionTest {
         val backend: GoBackend, val tunnel: Tunnel, val work: Work,
         val credentialsWork: Work, val backgroundWork: Work, val lookupWork: Work, val record: Record, val timers: DormantTimers) {
         fun envelope() = (store.read() as RecoveryStoreResult.Success).value
+        fun beginHotStandby(startOperationId: String = java.util.UUID.randomUUID().toString()): AndroidRedundantTransaction {
+            val transaction = AndroidRedundantTransaction(
+                desiredActive = true,
+                template = AndroidIntentTemplate("11111111-1111-4111-8111-111111111111", "account",
+                    "stray", "dynamic", "standalone", "ipv4", true),
+                sessionId = "22222222-2222-4222-8222-222222222222",
+                slotALeaseId = "lease-a", slotBLeaseId = null, localActiveLeaseId = "lease-a",
+                standbyDesired = true, roleGeneration = 1, membershipGeneration = 1,
+                startOperationId = startOperationId, startRequestFingerprint = "fingerprint",
+            )
+            assertTrue(store.beginRedundant(transaction) is RecoveryStoreResult.Success)
+            return transaction
+        }
+
+        fun preparePendingHotStandbyStop(): AndroidRedundantTransaction {
+            val old = beginHotStandby()
+            assertTrue(store.cancelRedundantIntentAndDeferStop("old-stop", old.startOperationId,
+                retainActivePeer = true) is RecoveryStoreResult.Success)
+            return requireNotNull(envelope().redundantTransaction)
+        }
+
+        fun completeOldStop(old: AndroidRedundantTransaction) {
+            assertTrue(store.updateRedundant(old.startOperationId) {
+                it.copy(retry = it.retry.copy(stopState = RedundantStopState.ACKNOWLEDGED))
+            } is RecoveryStoreResult.Success)
+            assertTrue(store.completeRedundantStop(requireNotNull(old.stopOperationId), old.startOperationId)
+                is RecoveryStoreResult.Success)
+        }
+
+        fun firstTapAfterSystemStop(lastPublished: SessionState) {
+            service.onStartCommand(offTileStartCommand(lastPublished), 0, 1)
+        }
+
+        fun recordSystemStop(lastPublished: SessionState, exitAt: Long = System.currentTimeMillis() - 1_000) {
+            assertTrue(QuickTunnelController.updateState(context, lastPublished))
+            // ExitInfo and the tap use wall time. Robolectric's paused looper
+            // clock does not advance the JVM's System.currentTimeMillis().
+            context.getSharedPreferences(AndroidRuntimeNamespace.record("nelomai-quick-tunnel-state"), Context.MODE_PRIVATE)
+                .edit().putLong("state-updated-at-millis", exitAt - 1).commit()
+            val exit = ShadowActivityManager.ApplicationExitInfoBuilder.newBuilder()
+                .setPid(android.os.Process.myPid()).setProcessName(context.packageName + ":vpn")
+                .setTimestamp(exitAt)
+                .setReason(ApplicationExitInfo.REASON_USER_REQUESTED)
+                .setDescription("[STOP APP] fully stop").build()
+            shadowOf(context.getSystemService(ActivityManager::class.java)).addApplicationExitInfo(exit)
+            ShadowSystemClock.advanceBy(Duration.ofSeconds(1))
+            assertEquals("stopped", QuickTunnelController.state(context))
+        }
+
+        fun offTileStartCommand(lastPublished: SessionState): Intent {
+            recordSystemStop(lastPublished)
+            assertTrue(QuickTunnelController.requestToggle(context))
+            return requireNotNull(shadowOf(context.applicationContext as Application).nextStartedService)
+        }
+
+        fun assertFreshQuickStart(sample: StartTunnelArgs) {
+            var starts = 0
+            CompletionPanel.onStart = {
+                starts++
+                assertNull("old Stop must complete before allocation", envelope().redundantTransaction)
+                BackgroundStartResult(sample.configuration, sample.quickConnection!!, sample.options)
+            }
+            drainImmediateWork()
+            assertEquals("fresh panel allocation from one tap", 1, starts)
+            assertEquals(Tunnel.State.UP, backend.getState(tunnel))
+            assertTrue(envelope().intent.desiredActive)
+        }
+
+        fun drainImmediateWork() {
+            // Workers are deterministic; draining only immediate callbacks leaves timers paused.
+            for (step in 1..24) {
+                shadowOf(Looper.getMainLooper()).idle()
+                val next = listOf(lookupWork, credentialsWork, backgroundWork, work)
+                    .firstOrNull { it.jobs.isNotEmpty() } ?: return
+                next.runNext()
+            }
+            fail("service work did not settle")
+        }
+
         fun beginReplacement(): AndroidRecoveryEnvelope {
             assertTrue(coordinator.begin(AndroidIntentTemplate(
                 "11111111-1111-4111-8111-111111111111", "scope",
@@ -872,6 +1827,7 @@ class NativeLocalRestartCompletionTest {
                 ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType!!, TUNNEL_API_VERSION),
                 ReflectionHelpers.ClassParameter.from(ResultReceiver::class.java, receiver),
                 ReflectionHelpers.ClassParameter.from(Boolean::class.javaPrimitiveType!!, true),
+                ReflectionHelpers.ClassParameter.from(String::class.java, null),
                 ReflectionHelpers.ClassParameter.from(String::class.java, null))
         }
         fun stopFromUi() {
@@ -885,7 +1841,8 @@ class NativeLocalRestartCompletionTest {
             ReflectionHelpers.callInstanceMethod<Unit>(service, "applyBackgroundToggleResult",
                 ReflectionHelpers.ClassParameter.from(RecoveryStoreResult::class.java,
                     coordinator.quickToggle(dispatch, stopOnly)),
-                ReflectionHelpers.ClassParameter.from(ResultReceiver::class.java, receiver))
+                ReflectionHelpers.ClassParameter.from(ResultReceiver::class.java, receiver),
+                ReflectionHelpers.ClassParameter.from(AndroidPendingQuickStart::class.java, null))
         }
         fun cancelClientStart(operationId: String) {
             ReflectionHelpers.callInstanceMethod<Unit>(service, "handleCancelClientStart",
@@ -914,11 +1871,18 @@ class NativeLocalRestartCompletionTest {
     private class Record : EncryptedRecordBackend {
         private var bytes: ByteArray? = null
         var readFails = false
+        var writeFails = false
+        var onCommit: ((ByteArray) -> Unit)? = null
         override fun read(): ByteArray? {
             check(!readFails)
             return bytes?.copyOf()
         }
-        override fun write(plaintext: ByteArray): Boolean { bytes = plaintext.copyOf(); return true }
+        override fun write(plaintext: ByteArray): Boolean {
+            if (writeFails) return false
+            bytes = plaintext.copyOf()
+            onCommit?.invoke(plaintext)
+            return true
+        }
     }
     private class Work : AbstractExecutorService() {
         val jobs = ArrayDeque<Runnable>()
@@ -974,17 +1938,33 @@ internal class CompletionQuickPlan {
 
 @Implements(BackgroundConnectionClient::class)
 internal class CompletionPanel {
-    @Implementation fun capabilities(credential: BackgroundCredential) = capability
+    @Implementation fun capabilities(credential: BackgroundCredential) = onCapabilities?.invoke() ?: capability
     @Implementation fun start(
         context: Context, credential: BackgroundCredential, template: QuickTunnelTemplate,
     ): BackgroundStartResult = requireNotNull(onStart)()
     @Implementation fun stop(
         credential: BackgroundCredential, leaseId: String, operationId: String, failureCode: String?,
     ) { stopped += leaseId }
+    @Implementation fun recoverRedundant(
+        credential: BackgroundCredential, transaction: AndroidRedundantTransaction,
+    ): BackgroundRedundantRecoveryTransport {
+        redundantRecoveries += transaction.startOperationId
+        throw java.io.IOException("panel recovery unavailable")
+    }
+    @Implementation fun stopRedundant(
+        credential: BackgroundCredential, transaction: AndroidRedundantTransaction, leaseId: String,
+    ): JSONObject {
+        redundantStops += transaction
+        return JSONObject().put("connection", JSONObject().put("lease_id", leaseId)
+            .put("status", "released").put("session_id", JSONObject.NULL))
+    }
     companion object {
+        internal var onCapabilities: (() -> BackgroundCapabilitySnapshot)? = null
         internal val capability = BackgroundCapabilitySnapshot(1, false, Long.MAX_VALUE)
         internal var onStart: (() -> BackgroundStartResult)? = null
         val stopped = mutableListOf<String>()
+        val redundantStops = mutableListOf<AndroidRedundantTransaction>()
+        val redundantRecoveries = mutableListOf<String>()
     }
 }
 
@@ -1032,4 +2012,25 @@ class CompletionVpnBuilder {
 @Implements(ParcelFileDescriptor::class)
 class CompletionFileDescriptor : org.robolectric.shadows.ShadowParcelFileDescriptor() {
     @Implementation fun detachFd() = 7
+}
+
+@Implements(ActivityManager::class)
+class CompletionExitHistory : ShadowActivityManager() {
+    @Implementation
+    override fun getHistoricalProcessExitReasons(packageName: String?, pid: Int, maxNum: Int): MutableList<*> {
+        check(!unavailable) { "history unavailable while the start is queued" }
+        return super.getHistoricalProcessExitReasons(packageName, pid, maxNum)
+    }
+
+    companion object { var unavailable = false }
+}
+
+@Implements(AutomaticDiagnostics::class)
+class DeferredFailureDiagnostics {
+    @Implementation
+    fun onConnectionStartFailed(context: Context, deviceId: String, errorCode: String, onComplete: (Throwable?) -> Unit) {
+        finish = onComplete
+    }
+
+    companion object { var finish: ((Throwable?) -> Unit)? = null }
 }

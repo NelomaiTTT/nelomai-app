@@ -14,8 +14,8 @@ spec.loader.exec_module(gates)
 # This successful candidate retains the original stable set under confirmed-stable/.
 # Its source is provenance for the carrier only; stable identity/signature/hash pins
 # remain unchanged in release-candidate-gates.py.
-STABLE_ARCHIVE_RUN_ID = "42123287698"
-STABLE_ARCHIVE_SOURCE = "a5c64b5159eaa8a05648307f875cadbbc797eeaf"
+STABLE_ARCHIVE_RUN_ID = "43317076057"
+STABLE_ARCHIVE_SOURCE = "44cad72fc9579012d7fbb26c174ffbc50f12660c"
 
 
 def download(output, public_key):

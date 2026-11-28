@@ -29,6 +29,15 @@ class RuntimeAuthBrokerService : Service() {
                 throw SecurityException("runtime_binder_rejected")
             }
             data.enforceInterface(DESCRIPTOR)
+            if (code == RuntimeOwnerProtocol.WATCH_VPN_PROCESS) {
+                val token = requireNotNull(data.readStrongBinder())
+                require(data.dataAvail() == 0)
+                val context = applicationContext
+                val pid = Binder.getCallingPid()
+                VpnProcessDeaths.observe(token) { ru.nelomai.tunnel.signalWatchedVpnProcessDeath(context, pid) }
+                reply.writeNoException()
+                return true
+            }
             check(host != 0L) { "runtime_owner_unavailable" }
             return when (code) {
                 SELECTION -> {
@@ -100,5 +109,24 @@ class RuntimeAuthBrokerService : Service() {
         const val DESCRIPTOR = RuntimeOwnerProtocol.DESCRIPTOR
         const val SELECTION = RuntimeOwnerProtocol.SELECTION
         const val ATTACH = RuntimeOwnerProtocol.ATTACH
+    }
+}
+
+// A service binding may go away with its client. Keep the death recipient for the process lifetime.
+internal object VpnProcessDeaths {
+    private val watched = mutableMapOf<IBinder, IBinder.DeathRecipient>()
+
+    @Synchronized
+    fun observe(token: IBinder, onDeath: () -> Unit) {
+        if (token in watched) return
+        val recipient = IBinder.DeathRecipient {
+            if (synchronized(this) { watched.remove(token) } != null) onDeath()
+        }
+        watched[token] = recipient
+        try {
+            token.linkToDeath(recipient, 0)
+        } catch (_: android.os.RemoteException) {
+            recipient.binderDied()
+        }
     }
 }

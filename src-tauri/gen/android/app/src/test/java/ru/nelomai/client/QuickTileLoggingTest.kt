@@ -1,3 +1,5 @@
+@file:Suppress("INVISIBLE_MEMBER", "INVISIBLE_REFERENCE")
+
 package ru.nelomai.client
 
 import android.content.Context
@@ -7,18 +9,30 @@ import android.os.Looper
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
+import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.Implementation
 import org.robolectric.annotation.Implements
 import org.robolectric.shadows.ShadowLog
 import org.robolectric.shadows.ShadowService
 import org.robolectric.util.ReflectionHelpers
+import ru.nelomai.tunnel.AndroidIntentTemplate
+import ru.nelomai.tunnel.AndroidRecoveryStore
+import ru.nelomai.tunnel.AndroidRecoveryStores
+import ru.nelomai.tunnel.AndroidRedundantTransaction
+import ru.nelomai.tunnel.BootIdentityProvider
+import ru.nelomai.tunnel.EncryptedRecordBackend
+import ru.nelomai.tunnel.RecoveryStoreResult
+import ru.nelomai.tunnel.RedundantStopState
 
 @RunWith(RobolectricTestRunner::class)
 @Config(
@@ -27,12 +41,191 @@ import org.robolectric.util.ReflectionHelpers
 )
 class QuickTileLoggingTest {
     @Before fun setUp() {
+        RuntimeProcessSelection.clearVpnOwner()
+        ReflectionHelpers.setStaticField(RuntimeProcessSelection::class.java, "loaded", null)
         TileSelectionShadow.result = Result.success(selection)
         TileSelectionShadow.pending = null
         LoggingTileServiceShadow.tile = ReflectionHelpers.callConstructor(Tile::class.java)
+        LoggingTileServiceShadow.locked = false
+        LoggingTileServiceShadow.afterUnlock = null
         LoggingTileShadow.updates = 0
         ShadowLog.clear()
         engineState("running")
+    }
+
+    @Test fun onTileTapAtLockCannotIssueStartAfterStopCompletes() {
+        val broker = org.json.JSONObject(RuntimeSelectionStore.encode(selection))
+            .put("vpn_authorization", org.json.JSONObject().put("scope", "a".repeat(64)).put("blocked", false))
+        val owner = RuntimeSelectionStore.decode(broker.toString())
+        var bytes: ByteArray? = null
+        val backendClass = EncryptedRecordBackend::class.java
+        val record = java.lang.reflect.Proxy.newProxyInstance(backendClass.classLoader, arrayOf(backendClass)) { _, method, args ->
+            when (method.name) {
+                "read" -> bytes?.copyOf()
+                "write" -> {
+                    bytes = (args.single() as ByteArray).copyOf()
+                    true
+                }
+                else -> error("Unexpected recovery record method ${method.name}")
+            }
+        } as EncryptedRecordBackend
+        val store = AndroidRecoveryStore(record, BootIdentityProvider { 7 })
+        val old = AndroidRedundantTransaction(true,
+            AndroidIntentTemplate("11111111-1111-4111-8111-111111111111", "account", "stray",
+                "dynamic", "standalone", "ipv4", true),
+            "22222222-2222-4222-8222-222222222222", "lease-a", null, "lease-a", true, 1, 1, "old-start", "fp")
+        ReflectionHelpers.setField(AndroidRecoveryStores, "instance", store)
+        assertTrue(store.beginRedundant(old) is RecoveryStoreResult.Success)
+
+        RuntimeProcessSelection.rememberVpnOwner(owner)
+        TileSelectionShadow.result = Result.success(owner)
+        val controller = Robolectric.buildService(NelomaiQuickTileService::class.java).create()
+        try {
+            val service = controller.get()
+            engineState("running")
+            service.onStartListening()
+            assertEquals(Tile.STATE_ACTIVE, LoggingTileServiceShadow.tile?.state)
+            LoggingTileServiceShadow.locked = true
+            service.onClick()
+            val unlock = requireNotNull(LoggingTileServiceShadow.afterUnlock)
+            assertNull(shadowOf(RuntimeEnvironment.getApplication()).nextStartedService)
+            assertTrue(store.cancelRedundantIntentAndDeferStop("prior-stop", "old-start") is RecoveryStoreResult.Success)
+            assertTrue(store.updateRedundant("old-start") { it.copy(retry = it.retry.copy(stopState = RedundantStopState.ACKNOWLEDGED)) } is RecoveryStoreResult.Success)
+            assertTrue(store.completeRedundantStop("prior-stop","old-start") is RecoveryStoreResult.Success)
+            engineState("stopped")
+            LoggingTileServiceShadow.locked = false
+            service.onStartListening()
+            assertEquals(Tile.STATE_INACTIVE, LoggingTileServiceShadow.tile?.state)
+            unlock.run()
+            val cmd = shadowOf(RuntimeEnvironment.getApplication()).nextStartedService
+            val stopOnly = cmd?.getBooleanExtra(ru.nelomai.runtime.v1.RuntimeServiceIntents.EXTRA_QUICK_STOP_ONLY,false)
+            assertTrue("tap on active tile may only Stop or do nothing", cmd == null || stopOnly == true)
+        } finally {
+            controller.destroy()
+            RuntimeProcessSelection.clearVpnOwner()
+            ReflectionHelpers.setField(AndroidRecoveryStores, "instance", null)
+        }
+    }
+
+    @Test fun offClickCapturesOldStopBeforeTileSelectionReply() = delayedOffClick(ClickRace.REPLACEMENT)
+
+    @Test fun offClickCannotTransferToDifferentAccountInTileSelectionReply() = delayedOffClick(ClickRace.OTHER_ACCOUNT)
+
+    @Test fun offClickCapturesOldStopBeforeScreenUnlock() = delayedOffClick(ClickRace.UNLOCK)
+
+    @Test fun coldOffClickStartsWithoutPriorTileSnapshot() = delayedOffClick(ClickRace.COLD)
+
+    @Test fun coldOffClickCannotRestartReplacementThatAlreadyStopped() = delayedOffClick(ClickRace.COLD_REPLACEMENT)
+
+    @Test fun coldOffClickCannotRestartReplacementAfterDispatcherDestruction() =
+        delayedOffClick(ClickRace.COLD_REPLACEMENT_DESTROYED)
+
+    @Test fun coldOffClickSurvivesPassiveDispatcherAdmission() = delayedOffClick(ClickRace.COLD_STATUS)
+
+    private enum class ClickRace { REPLACEMENT, OTHER_ACCOUNT, UNLOCK, COLD, COLD_STATUS, COLD_REPLACEMENT, COLD_REPLACEMENT_DESTROYED }
+
+    private fun delayedOffClick(race: ClickRace) {
+        val coldReplacement = race == ClickRace.COLD_REPLACEMENT || race == ClickRace.COLD_REPLACEMENT_DESTROYED
+        val cold = race == ClickRace.COLD || race == ClickRace.COLD_STATUS || coldReplacement
+        val locked = race == ClickRace.UNLOCK
+        val broker = org.json.JSONObject(RuntimeSelectionStore.encode(selection))
+            .put("vpn_authorization", org.json.JSONObject().put("scope", "a".repeat(64)).put("blocked", false))
+        val owner = RuntimeSelectionStore.decode(broker.toString())
+        var bytes: ByteArray? = null
+        val backendClass = EncryptedRecordBackend::class.java
+        val record = java.lang.reflect.Proxy.newProxyInstance(backendClass.classLoader, arrayOf(backendClass)) { _, method, args ->
+            when (method.name) {
+                "read" -> bytes?.copyOf()
+                "write" -> {
+                    bytes = (args.single() as ByteArray).copyOf()
+                    true
+                }
+                else -> error("Unexpected recovery record method ${method.name}")
+            }
+        } as EncryptedRecordBackend
+        val store = AndroidRecoveryStore(record, BootIdentityProvider { 7 })
+        val old = AndroidRedundantTransaction(true,
+            AndroidIntentTemplate("11111111-1111-4111-8111-111111111111", "account", "stray",
+                "dynamic", "standalone", "ipv4", true),
+            "22222222-2222-4222-8222-222222222222", "lease-a", null, "lease-a", true, 1, 1, "old-start", "fp")
+        ReflectionHelpers.setField(AndroidRecoveryStores, "instance", store)
+        assertTrue(store.beginRedundant(old) is RecoveryStoreResult.Success)
+        assertTrue(store.cancelRedundantIntentAndDeferStop("old-stop", "old-start") is RecoveryStoreResult.Success)
+        engineState("stopped")
+        TileSelectionShadow.result = Result.success(owner)
+        val controller = Robolectric.buildService(NelomaiQuickTileService::class.java).create()
+        try {
+            val service = controller.get()
+            if (cold) LoggingTileServiceShadow.tile?.state = Tile.STATE_INACTIVE else service.onStartListening()
+            assertEquals(Tile.STATE_INACTIVE, LoggingTileServiceShadow.tile?.state)
+            LoggingTileServiceShadow.locked = locked
+            TileSelectionShadow.pending = mutableListOf()
+            service.onClick()
+            if (locked) {
+                assertTrue(TileSelectionShadow.pending!!.isEmpty())
+                assertNull(shadowOf(RuntimeEnvironment.getApplication()).nextStartedService)
+            }
+            if (race == ClickRace.COLD_STATUS) RuntimeProcessSelection.rememberVpnOwner(owner)
+            if (race != ClickRace.COLD && race != ClickRace.COLD_STATUS) {
+                assertTrue(store.updateRedundant("old-start") {
+                    it.copy(retry = it.retry.copy(stopState = RedundantStopState.ACKNOWLEDGED))
+                } is RecoveryStoreResult.Success)
+                assertTrue(store.completeRedundantStop("old-stop", "old-start") is RecoveryStoreResult.Success)
+                assertTrue(store.beginRedundant(old.copy(startOperationId = "replacement")) is RecoveryStoreResult.Success)
+                engineState("running")
+            }
+            if (coldReplacement) {
+                RuntimeProcessSelection.rememberVpnOwner(owner)
+                assertTrue(store.cancelRedundantIntentAndDeferStop("replacement-stop", "replacement") is RecoveryStoreResult.Success)
+                assertTrue(store.updateRedundant("replacement") {
+                    it.copy(retry = it.retry.copy(stopState = RedundantStopState.ACKNOWLEDGED))
+                } is RecoveryStoreResult.Success)
+                assertTrue(store.completeRedundantStop("replacement-stop", "replacement") is RecoveryStoreResult.Success)
+                engineState("stopped")
+                if (race == ClickRace.COLD_REPLACEMENT_DESTROYED) {
+                    Robolectric.buildService(RuntimeVpnDispatcherService::class.java).create().destroy()
+                    assertNull(RuntimeProcessSelection.vpnOwnerForStop())
+                }
+            }
+            if (locked) {
+                TileSelectionShadow.pending = null
+                service.onStartListening()
+                assertEquals(Tile.STATE_ACTIVE, LoggingTileServiceShadow.tile?.state)
+                TileSelectionShadow.pending = mutableListOf()
+                requireNotNull(LoggingTileServiceShadow.afterUnlock).run()
+            }
+            val reply = TileSelectionShadow.pending!!.removeAt(0)
+            if (race == ClickRace.OTHER_ACCOUNT) broker.getJSONObject("vpn_authorization").put("scope", "b".repeat(64))
+            reply(Result.success(RuntimeSelectionStore.decode(broker.toString())))
+
+            val command = shadowOf(RuntimeEnvironment.getApplication()).nextStartedService
+            if (race == ClickRace.OTHER_ACCOUNT || coldReplacement) {
+                assertNull("stale click dispatched a new command", command)
+            } else assertEquals("old-start", command?.getStringExtra("client_operation_id"))
+        } finally {
+            controller.destroy()
+            RuntimeProcessSelection.clearVpnOwner()
+            ReflectionHelpers.setField(AndroidRecoveryStores, "instance", null)
+        }
+    }
+
+    @Test fun supersededLockedStopRefreshesTheActiveTile() {
+        val controller = Robolectric.buildService(NelomaiQuickTileService::class.java).create()
+        try {
+            val tile = controller.get()
+            RuntimeProcessSelection.rememberVpnOwner(selection)
+            tile.onStartListening()
+            assertEquals(Tile.STATE_ACTIVE, LoggingTileServiceShadow.tile?.state)
+            LoggingTileServiceShadow.locked = true
+            tile.onClick()
+            RuntimeProcessSelection.recordVpnStart()
+            requireNotNull(LoggingTileServiceShadow.afterUnlock).run()
+            assertNull(shadowOf(RuntimeEnvironment.getApplication()).nextStartedService)
+            assertEquals(Tile.STATE_ACTIVE, LoggingTileServiceShadow.tile?.state)
+        } finally {
+            controller.destroy()
+            RuntimeProcessSelection.clearVpnOwner()
+        }
     }
 
     @Test fun repeatedStateLogsOnceButStillPublishesEveryRefresh() {
@@ -106,6 +299,73 @@ class QuickTileLoggingTest {
         controller.destroy()
     }
 
+    @Test fun unreadableRecoveryAfterAnOlderAndroidStopIsUnavailableUntilItCanBeRead() {
+        var failRead = false
+        var bytes: ByteArray? = null
+        val type = EncryptedRecordBackend::class.java
+        val record = java.lang.reflect.Proxy.newProxyInstance(type.classLoader, arrayOf(type)) { _, method, args ->
+            when (method.name) {
+                "read" -> { check(!failRead); bytes?.copyOf() }
+                "write" -> { bytes = (args.single() as ByteArray).copyOf(); true }
+                else -> error(method.name)
+            }
+        } as EncryptedRecordBackend
+        val store = AndroidRecoveryStore(record, BootIdentityProvider { 7 })
+        val controller = Robolectric.buildService(NelomaiQuickTileService::class.java).create()
+        ReflectionHelpers.setField(AndroidRecoveryStores, "instance", store)
+        try {
+            val service = controller.get()
+            val exit = org.robolectric.shadows.ShadowActivityManager.ApplicationExitInfoBuilder.newBuilder()
+                .setTimestamp(System.currentTimeMillis() - 10_000).setPid(321)
+                .setProcessName(service.packageName + ":vpn")
+                .setReason(android.app.ApplicationExitInfo.REASON_USER_REQUESTED)
+                .setDescription("[STOP APP] fully stop").build()
+            shadowOf(service.getSystemService(android.app.ActivityManager::class.java)).addApplicationExitInfo(exit)
+            assertTrue(store.setDesiredActive(0, true) is RecoveryStoreResult.Success)
+            failRead = true
+            service.onStartListening()
+            assertEquals(Tile.STATE_UNAVAILABLE, LoggingTileServiceShadow.tile?.state)
+            failRead = false
+            shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(5))
+            assertEquals(Tile.STATE_ACTIVE, LoggingTileServiceShadow.tile?.state)
+        } finally {
+            controller.destroy()
+            ReflectionHelpers.setField(AndroidRecoveryStores, "instance", null)
+        }
+    }
+
+    @Test fun failedSelectionDuringTapRefreshesTheSameOpenTileWhenBrokerReturns() {
+        val controller = Robolectric.buildService(NelomaiQuickTileService::class.java).create()
+        val service = controller.get()
+        service.onStartListening()
+        assertEquals(Tile.STATE_ACTIVE, LoggingTileServiceShadow.tile?.state)
+        TileSelectionShadow.result = Result.failure(IllegalStateException("runtime_owner_unavailable"))
+        service.onClick()
+        assertEquals(Tile.STATE_UNAVAILABLE, LoggingTileServiceShadow.tile?.state)
+        TileSelectionShadow.result = Result.success(selection)
+        shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(5))
+        assertEquals(Tile.STATE_ACTIVE, LoggingTileServiceShadow.tile?.state)
+        controller.destroy()
+    }
+
+    @Test fun unavailableEngineStateDoesNotPresentAWorkingTunnelAsOff() {
+        val controller = Robolectric.buildService(NelomaiQuickTileService::class.java).create()
+        val service = controller.get()
+        service.onStartListening()
+        assertEquals(Tile.STATE_ACTIVE, LoggingTileServiceShadow.tile?.state)
+        val slot = ru.nelomai.tunnel.BuildConfig.RUNTIME_SLOT
+        val version = ru.nelomai.tunnel.BuildConfig.RUNTIME_VERSION
+        val prefs = service.getSharedPreferences("runtime.$slot.state.$version.nelomai-quick-tunnel-state", Context.MODE_PRIVATE)
+        prefs.edit().putInt("state", 1).commit()
+        stateChanged()
+        idle()
+        assertEquals(Tile.STATE_UNAVAILABLE, LoggingTileServiceShadow.tile?.state)
+        engineState("running")
+        shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(5))
+        assertEquals(Tile.STATE_ACTIVE, LoggingTileServiceShadow.tile?.state)
+        controller.destroy()
+    }
+
     @Test fun listeningTilePublishesAsyncStopAndStartWithoutAnotherListeningCallback() {
         val controller = Robolectric.buildService(NelomaiQuickTileService::class.java).create()
         val handler = ReflectionHelpers.getField<Handler>(controller.get(), "mHandler")
@@ -113,7 +373,7 @@ class QuickTileLoggingTest {
         idle()
         assertEquals(Tile.STATE_ACTIVE, LoggingTileServiceShadow.tile?.state)
         for ((state, tile) in listOf("stopping" to Tile.STATE_UNAVAILABLE,
-                "stopped" to Tile.STATE_INACTIVE, "starting" to Tile.STATE_UNAVAILABLE,
+                "stopped" to Tile.STATE_INACTIVE, "failed" to Tile.STATE_INACTIVE, "starting" to Tile.STATE_UNAVAILABLE,
                 "running" to Tile.STATE_ACTIVE)) {
             engineState(state)
             stateChanged()
@@ -186,7 +446,7 @@ class QuickTileLoggingTest {
         val service = controller.get()
         service.onStartListening()
         TileSelectionShadow.pending = mutableListOf()
-        ReflectionHelpers.callInstanceMethod<Void>(service, "dispatchOrOpen")
+        service.onClick()
         val old = TileSelectionShadow.pending!!.removeAt(0)
         service.onStopListening()
         TileSelectionShadow.pending = null
@@ -197,6 +457,27 @@ class QuickTileLoggingTest {
         assertEquals(before, LoggingTileShadow.updates)
         assertEquals(Tile.STATE_ACTIVE, LoggingTileServiceShadow.tile?.state)
         controller.destroy()
+    }
+
+    @Test fun pinnedStableStateChangesReachTheOpenShadeWithoutAnotherListeningCallback() {
+        assumeTrue("Requires the linked stable runtime AAR",
+            java.lang.Boolean.getBoolean("nelomai.test.hasStableRuntimeAar"))
+        val stable = selection.copy(slot = "stable", runtimeVersion = "0.2.21")
+        TileSelectionShadow.result = Result.success(stable)
+        val controller = Robolectric.buildService(NelomaiQuickTileService::class.java).create()
+        try {
+            controller.get().onStartListening()
+            val type = Class.forName("ru.nelomai.runtime.stable.tunnel.QuickTunnelController")
+            val write = type.declaredMethods.single { it.name.startsWith("updateState") && it.parameterCount == 4 }
+            val states = Class.forName("ru.nelomai.runtime.stable.tunnel.SessionState").enumConstants
+            for ((state, expected) in listOf("RUNNING" to Tile.STATE_ACTIVE, "STOPPED" to Tile.STATE_INACTIVE)) {
+                assertEquals(true, write.invoke(type.getField("INSTANCE").get(null),
+                    RuntimeEnvironment.getApplication(), states.single { (it as Enum<*>).name == state }, null, false))
+                idle()
+                assertEquals(state.lowercase(), RuntimeAdapters.quick(stable).state(RuntimeEnvironment.getApplication()))
+                assertEquals(messages().joinToString(), expected, LoggingTileServiceShadow.tile?.state)
+            }
+        } finally { controller.destroy() }
     }
 
     @Test fun realProducerRefreshesListeningTileWithoutUiChangeFlag() {
@@ -261,7 +542,13 @@ class TileSelectionShadow {
 @Implements(TileService::class)
 class LoggingTileServiceShadow : ShadowService() {
     @Implementation fun getQsTile(): Tile? = tile
-    companion object { var tile: Tile? = null }
+    @Implementation fun isLocked(): Boolean = locked
+    @Implementation fun unlockAndRun(action: Runnable) { afterUnlock = action }
+    companion object {
+        var tile: Tile? = null
+        var locked = false
+        var afterUnlock: Runnable? = null
+    }
 }
 
 @Implements(Tile::class)

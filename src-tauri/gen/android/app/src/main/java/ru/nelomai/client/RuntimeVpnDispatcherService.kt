@@ -1,7 +1,5 @@
 package ru.nelomai.client
 
-import android.app.NotificationChannel
-import android.app.NotificationManager
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
@@ -16,6 +14,7 @@ import android.os.Messenger
 import android.os.Message
 import android.os.ResultReceiver
 import android.os.SystemClock
+import java.util.UUID
 import org.json.JSONObject
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -24,6 +23,7 @@ import ru.nelomai.runtime.v1.RuntimeVpnHostV1
 import ru.nelomai.runtime.v1.RuntimeVpnAuthorityV1
 import ru.nelomai.runtime.v1.RuntimeVpnTransportV1
 import ru.nelomai.runtime.v1.RuntimeServiceIntents
+import ru.nelomai.runtime.v1.VpnNotificationChannel
 
 class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAuthorityV1 {
     private companion object {
@@ -31,16 +31,28 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
         // A destroyed Service does not prove that every old engine executor
         // has exited. Only physical :vpn process exit resets this marker.
         var engineWasLoaded = false
+        val processToken = android.os.Binder()
     }
     override val service: VpnService get() = this
     private lateinit var selection: RuntimeSelectionStore
     @Volatile private var engine: RuntimeVpnEngineV1? = null
     @Volatile private var destroyed = false
     private var selectionVerificationInFlight = false
+    private class TaskRemovalAdmission(
+        val token: String,
+        val owner: RuntimeSelectionV1,
+        val stopRevision: Long,
+        val respond: (Int) -> Unit,
+        var delivered: Boolean = false,
+    )
+
+    private var taskRemovalAdmission: TaskRemovalAdmission? = null
     private var lastStartId = 0
+    private var lastCommandStartId = 0
     private var lastEngineStartId = 0
     private var pendingStartReads = 0
     private var stopRevision = 0L
+    private var pendingStableTileStart: Long? = null
     private val waitingStartsAndToggles = mutableSetOf<Intent>()
     @Volatile private var lastBrokerVerificationAt = 0L
     @Volatile private var retirementStarted = false
@@ -70,14 +82,13 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
 
     override fun onCreate() {
         super.onCreate()
-        selection = RuntimeSelectionStore(this, readOffMain = true)
+        selection = RuntimeSelectionStore(this, vpnProcessToken = processToken)
         handler.post(verifySelection)
     }
 
     private fun promoteToForeground() {
-        if (Build.VERSION.SDK_INT >= 26) getSystemService(NotificationManager::class.java).createNotificationChannel(
-            NotificationChannel("runtime_dispatcher", "VPN", NotificationManager.IMPORTANCE_LOW))
-        ServiceCompat.startForeground(this, 1701, NotificationCompat.Builder(this, "runtime_dispatcher")
+        VpnNotificationChannel.create(this)
+        ServiceCompat.startForeground(this, 1701, NotificationCompat.Builder(this, VpnNotificationChannel.ID)
             .setSmallIcon(R.drawable.ic_quick_tile).setContentTitle("Nelomai VPN").setOngoing(true).build(),
             if (Build.VERSION.SDK_INT >= 34) android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED else 0)
     }
@@ -85,7 +96,29 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         lastStartId = startId
         val action = tunnelAction(intent)
-        if (invalidatesWaitingStarts(intent)) stopRevision++
+        val liveness = action == RuntimeServiceIntents.TASK_REMOVAL_LIVENESS
+        val preparedRecovery = if (liveness) taskRemovalAdmission?.takeIf {
+            !it.delivered && it.token == intent?.getStringExtra(RuntimeServiceIntents.TASK_REMOVAL_START_ID)
+        } else null
+        if (liveness && preparedRecovery == null) {
+            // AMS can retry a start prepared in a process that has since died.
+            // Its ID advances even though it has no authority to start an engine.
+            if (engine == null && taskRemovalAdmission == null && pendingStartReads == 0) {
+                stopSelf(startId)
+                return START_NOT_STICKY
+            }
+            (engine as? RuntimeVpnTransportV1)?.retiredStartRejected(startId)
+            return START_STICKY
+        }
+        lastCommandStartId = startId
+        preparedRecovery?.delivered = true
+        val scopedClick = intent?.hasExtra(RuntimeServiceIntents.EXTRA_TILE_CLICK_REVISION) == true
+        val admittedOwner = RuntimeProcessSelection.tileOwner()
+        if (isTeardownCommand(intent) && !tileClickIsCurrent(intent, admittedOwner)) {
+            if (engine == null) stopSelf(androidStartId(startId))
+            return START_NOT_STICKY
+        }
+        if (invalidatesWaitingStarts(intent) && (!scopedClick || admittedOwner != null)) stopRevision++
         val waitingCommand = intent?.takeIf {
             action == "ru.nelomai.tunnel.CLIENT_START" ||
                 (action == RuntimeServiceIntents.QUICK_TOGGLE && !isTeardownCommand(it))
@@ -100,8 +133,8 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
         }
         val admissionRevision = stopRevision
         // A status/read request is not a foreground-service launch.
-        val foregroundRequested = intent == null ||
-            intent.getBooleanExtra(RuntimeServiceIntents.EXTRA_FOREGROUND_START, false)
+        val foregroundRequested = !liveness && (intent == null ||
+            intent.getBooleanExtra(RuntimeServiceIntents.EXTRA_FOREGROUND_START, false))
         val current = engine
         if (current == null && action == "ru.nelomai.tunnel.BEGIN_BACKGROUND_LOGOUT") {
             // The broker persisted Logout before delivering this command.
@@ -109,7 +142,8 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
             selection.invalidatePendingSnapshot()
         }
         if (!foregroundRequested && current != null &&
-            (RuntimeProcessSelection.hasVpnOwner() || action == RuntimeServiceIntents.CLIENT_STOP) &&
+            (RuntimeProcessSelection.hasVpnOwner() || action == RuntimeServiceIntents.CLIENT_STOP ||
+                (scopedClick && admittedOwner?.slot == "stable")) &&
             isTeardownCommand(intent) && !current.requiresStartAdmission(intent)
         ) {
             // These commands can only tear down state already owned by this
@@ -134,21 +168,45 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
             action != "ru.nelomai.tunnel.ENSURE_RUNNING"
         ) {
             rejectStart(intent, "vpn_permission_required")
-            if (retirementStarted) settleRetiredStartIds() else stopSelf(startId)
+            if (retirementStarted) settleRetiredStartIds() else stopSelf(androidStartId(startId))
             return START_NOT_STICKY
         }
         if (waitingCommand != null) waitingStartsAndToggles += waitingCommand
         pendingStartReads++
         selection.read { result ->
+            var recoveryResult = RuntimeServiceIntents.TASK_REMOVAL_REJECTED
             try {
                 val cancelled = waitingCommand != null && !waitingStartsAndToggles.remove(waitingCommand)
                 if (destroyed) return@read
                 val active = result.getOrElse {
+                    if (preparedRecovery?.stopRevision == stopRevision && vpnOwnerNotRetired()) {
+                        recoveryResult = RuntimeServiceIntents.TASK_REMOVAL_RETRY
+                    }
                     rejectStart(intent, "runtime_owner_unavailable")
-                    if (!retirementStarted && !RuntimeProcessSelection.hasVpnOwner()) stopSelf(startId)
+                    if (!retirementStarted && !RuntimeProcessSelection.hasVpnOwner()) stopSelf(androidStartId(startId))
                     return@read
                 }
                 try {
+                    if (preparedRecovery != null &&
+                        (preparedRecovery.stopRevision != stopRevision || VpnService.prepare(this) != null ||
+                            !RuntimeDispatchPolicy.mayRecoverLatestVpn(preparedRecovery.owner, active))
+                    ) {
+                        if (engine == null) stopSelf(androidStartId(startId))
+                        return@read
+                    }
+                    if (!tileClickIsCurrent(intent, active)) {
+                        if (engine == null) stopSelf(androidStartId(startId))
+                        return@read
+                    }
+                    if (intent?.hasExtra(RuntimeServiceIntents.EXTRA_QUICK_START_OWNER) == true) {
+                        val owner = runCatching { RuntimeSelectionStore.decode(requireNotNull(
+                            intent.getStringExtra(RuntimeServiceIntents.EXTRA_QUICK_START_OWNER))) }.getOrNull()
+                        if (owner == null || !RuntimeDispatchPolicy.mayRecoverLatestVpn(owner, active)) {
+                            rejectStart(intent, "runtime_start_cancelled")
+                            if (engine == null) stopSelf(androidStartId(startId))
+                            return@read
+                        }
+                    }
                     if (!acceptSelection(active)) { rejectStart(intent); return@read }
                     val selectedEngine = engine ?: run {
                         if (active.slot == "stable" && !engineWasLoaded) {
@@ -173,6 +231,9 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
                     }
                     val requiresStartAdmission = selectedEngine.requiresStartAdmission(intent)
                     if (!vpnAuthorityCurrent() && !isTeardownCommand(intent)) {
+                        if (preparedRecovery != null && vpnOwnerNotRetired()) {
+                            recoveryResult = RuntimeServiceIntents.TASK_REMOVAL_RETRY
+                        }
                         rejectStart(intent, "runtime_vpn_authority_retired")
                         return@read
                     }
@@ -184,27 +245,51 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
                     }
                     if (foregroundPromotionFailed && requiresStartAdmission) {
                         rejectStart(intent, "vpn_permission_required")
-                        stopSelf(startId)
+                        stopSelf(androidStartId(startId))
                         return@read
                     }
                     if (requiresStartAdmission && !RuntimeDispatchPolicy.mayStartVpn(active)) {
                         rejectStart(intent)
-                        if (foregroundRequested && !RuntimeProcessSelection.hasVpnOwner()) stopSelf(startId)
+                        if (foregroundRequested && !RuntimeProcessSelection.hasVpnOwner()) stopSelf(androidStartId(startId))
                         return@read
                     }
+                    if (active.slot == "stable" && scopedClick && action == RuntimeServiceIntents.QUICK_TOGGLE &&
+                        (!requiresStartAdmission || pendingStableTileStart != null)) return@read
+                    if (active.slot == "stable" && requiresStartAdmission && (action == RuntimeServiceIntents.QUICK_TOGGLE ||
+                            action == "ru.nelomai.tunnel.CLIENT_START" || action == "ru.nelomai.tunnel.BEGIN_CONNECTION_INTENT")) {
+                        // The pinned stable engine predates the container's tile revision.
+                        RuntimeProcessSelection.recordVpnStart()
+                    }
                     RuntimeProcessSelection.rememberVpnOwner(active)
-                    startEngine(selectedEngine, intent, flags, startId)
+                    val result = startEngine(selectedEngine, intent, flags, startId)
+                    // A cold latest engine can refuse the handoff before arming the
+                    // next watch (e.g. an unreadable recovery record). The job still owns it.
+                    recoveryResult = if (result == START_NOT_STICKY) RuntimeServiceIntents.TASK_REMOVAL_RETRY
+                        else RuntimeServiceIntents.TASK_REMOVAL_ACCEPTED
                 } catch (_: SecurityException) {
+                    if (preparedRecovery != null && VpnService.prepare(this) == null) {
+                        recoveryResult = RuntimeServiceIntents.TASK_REMOVAL_RETRY
+                    }
                     rejectStart(intent, "vpn_permission_required")
-                    stopSelf(startId)
-                } catch (_: Exception) { stopSelf(startId) }
+                    if (preparedRecovery == null || engine == null) stopSelf(androidStartId(startId))
+                } catch (_: Exception) {
+                    recoveryResult = RuntimeServiceIntents.TASK_REMOVAL_RETRY
+                    if (preparedRecovery == null || engine == null) stopSelf(androidStartId(startId))
+                }
             } finally {
+                if (preparedRecovery != null && taskRemovalAdmission === preparedRecovery) {
+                    taskRemovalAdmission = null
+                    preparedRecovery.respond(recoveryResult)
+                }
                 pendingStartReads--
                 settleRetiredStartIds()
             }
         }
         return if (foregroundPromotionFailed) START_NOT_STICKY else START_STICKY
     }
+
+    // Only the last real command may cover subsequent ignored watch deliveries.
+    private fun androidStartId(startId: Int): Int = if (startId == lastCommandStartId) lastStartId else startId
 
     private fun settleRetiredStartIds() {
         if (!retirementStarted || destroyed || pendingStartReads != 0 || lastStartId <= lastEngineStartId) return
@@ -223,12 +308,109 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
         }.onSuccess { lastEngineStartId = maxOf(lastEngineStartId, startId) }
     }
 
-    private fun startEngine(target: RuntimeVpnEngineV1, intent: Intent?, flags: Int, startId: Int) {
+    private fun startEngine(target: RuntimeVpnEngineV1, intent: Intent?, flags: Int, startId: Int): Int {
         // Teardown may overtake an earlier request awaiting Binder. The old
         // callback must not roll the engine's stopSelfResult identifier back.
-        lastEngineStartId = maxOf(lastEngineStartId, startId)
-        target.start(intent, flags, lastEngineStartId)
+        lastEngineStartId = maxOf(lastEngineStartId, androidStartId(startId))
+        if (intent?.hasExtra(RuntimeServiceIntents.EXTRA_TILE_CLICK_REVISION) != true ||
+            RuntimeProcessSelection.tileOwner()?.slot != "stable") {
+            return target.start(intent, flags, lastEngineStartId)
+        }
+        val revision = RuntimeProcessSelection.vpnStartRevision
+        when (tunnelAction(intent)) {
+            "ru.nelomai.tunnel.CANCEL_CURRENT_CONNECTION_INTENT" -> {
+                pendingStableTileStart = null
+                // The pinned ABI cancels and schedules lease cleanup. Its legacy
+                // transport without a lease needs the same fallback as UI Stop.
+                intent.putExtra("result_receiver", object : ResultReceiver(null) {
+                    override fun onReceiveResult(code: Int, data: Bundle?) {
+                        if (code == 1 && data != null && data.getString("lease_phase") == null &&
+                            !destroyed && target === engine && tileClickIsCurrent(intent, RuntimeProcessSelection.tileOwner())) {
+                            target.start(Intent("ru.nelomai.runtime.stable.tunnel.CLIENT_STOP")
+                                .putExtra("api_version", RuntimeServiceIntents.VPN_API_VERSION), flags, lastEngineStartId)
+                        }
+                    }
+                })
+            }
+            RuntimeServiceIntents.QUICK_TOGGLE -> {
+                pendingStableTileStart = revision
+                // A second Off click can reach us before stable saves its Start.
+                intent.putExtra("result_receiver", object : ResultReceiver(handler) {
+                    override fun onReceiveResult(code: Int, data: Bundle?) {
+                        if (pendingStableTileStart == revision) pendingStableTileStart = null
+                    }
+                })
+            }
+        }
+        return try {
+            target.start(intent, flags, lastEngineStartId)
+        } catch (error: Exception) {
+            if (pendingStableTileStart == revision) pendingStableTileStart = null
+            throw error
+        }
     }
+
+    private val taskRemovalPreparation = Messenger(Handler(Looper.getMainLooper()) { message ->
+        if (message.sendingUid != Process.myUid()) return@Handler true
+        val reply = message.replyTo ?: return@Handler true
+        fun respond(code: Int) {
+            try { reply.send(Message.obtain(null, code)) } catch (_: android.os.RemoteException) { }
+        }
+        val extras = message.data
+        val expected = extras.getString(RuntimeServiceIntents.TASK_REMOVAL_RUNTIME)?.let {
+            runCatching { RuntimeSelectionStore.decode(it) }.getOrNull()
+        }
+        if (expected == null) {
+            respond(RuntimeServiceIntents.TASK_REMOVAL_REJECTED)
+            return@Handler true
+        }
+        val revision = stopRevision
+        val foregroundPid = message.arg1
+        selection.read { result ->
+            val active = result.getOrNull()
+            if (active == null) {
+                respond(RuntimeServiceIntents.TASK_REMOVAL_RETRY)
+                return@read
+            }
+            // Preparation only queues a delivery. Delivery checks fresh broker proof before starting the engine.
+            if (!vpnOwnerNotRetired() || revision != stopRevision || !RuntimeDispatchPolicy.mayRecoverLatestVpn(expected, active) ||
+                VpnService.prepare(this) != null
+            ) {
+                respond(RuntimeServiceIntents.TASK_REMOVAL_REJECTED)
+                return@read
+            }
+            if (RuntimeProcessSelection.needsExit(active)) {
+                respond(RuntimeServiceIntents.TASK_REMOVAL_RETRY)
+                // A running engine owns its retirement. A cold stale image can exit immediately.
+                if (engine == null) terminateProcess()
+                return@read
+            }
+            val previous = taskRemovalAdmission
+            if (previous?.delivered == true) {
+                respond(RuntimeServiceIntents.TASK_REMOVAL_RETRY)
+                return@read
+            }
+            previous?.respond?.invoke(RuntimeServiceIntents.TASK_REMOVAL_RETRY)
+            // startService only queues delivery. The job keeps responsibility until the verified engine takes it.
+            val admission = TaskRemovalAdmission(UUID.randomUUID().toString(), active, revision, ::respond)
+            val intent = RuntimeServiceIntents.vpn(this).setAction(RuntimeServiceIntents.TASK_REMOVAL_LIVENESS)
+                .putExtras(extras).putExtra(RuntimeServiceIntents.TASK_REMOVAL_START_ID, admission.token)
+            intent.removeExtra(RuntimeServiceIntents.TASK_REMOVAL_FOREGROUND_PID)
+            if (foregroundPid == Process.myPid() && engine != null && RuntimeProcessSelection.hasVpnOwner()) {
+                intent.putExtra(RuntimeServiceIntents.TASK_REMOVAL_FOREGROUND_PID, foregroundPid)
+            }
+            taskRemovalAdmission = admission
+            try {
+                if (engine == null) promoteToForeground()
+                checkNotNull(startService(intent))
+            } catch (_: Exception) {
+                taskRemovalAdmission = null
+                if (engine == null) ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                respond(RuntimeServiceIntents.TASK_REMOVAL_RETRY)
+            }
+        }
+        true
+    })
 
     private val backgroundPreparation = Messenger(Handler(Looper.getMainLooper()) { message ->
         // Messenger supplies the Binder caller UID; this is container-private IPC.
@@ -272,10 +454,11 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
         true
     })
 
-    override fun onBind(intent: Intent?): IBinder? =
-        if (intent?.action == ru.nelomai.runtime.v1.RuntimeServiceIntents.PREPARE_STABLE_BACKGROUND)
-            backgroundPreparation.binder
-        else super.onBind(intent)
+    override fun onBind(intent: Intent?): IBinder? = when (intent?.action) {
+        RuntimeServiceIntents.TASK_REMOVAL_LIVENESS -> taskRemovalPreparation.binder
+        RuntimeServiceIntents.PREPARE_STABLE_BACKGROUND -> backgroundPreparation.binder
+        else -> super.onBind(intent)
+    }
 
     private fun tunnelAction(intent: Intent?): String? = intent?.action?.let { action ->
         val stablePrefix = "ru.nelomai.runtime.stable.tunnel."
@@ -301,6 +484,15 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
         "ru.nelomai.tunnel.CLEAR_QUICK_PLAN" -> true
         RuntimeServiceIntents.QUICK_TOGGLE -> intent?.getBooleanExtra(RuntimeServiceIntents.EXTRA_QUICK_STOP_ONLY, false) == true
         else -> false
+    }
+
+    private fun tileClickIsCurrent(intent: Intent?, active: RuntimeSelectionV1?): Boolean {
+        if (intent?.hasExtra(RuntimeServiceIntents.EXTRA_TILE_CLICK_REVISION) != true) return true
+        if (intent.getLongExtra(RuntimeServiceIntents.EXTRA_TILE_CLICK_REVISION, 0L) !=
+            RuntimeProcessSelection.vpnStartRevision) return false
+        val expected = runCatching { RuntimeSelectionStore.decode(requireNotNull(
+            intent.getStringExtra(RuntimeServiceIntents.EXTRA_TILE_CLICK_OWNER))) }.getOrNull() ?: return false
+        return active == null || RuntimeDispatchPolicy.sameTileOwner(expected, active)
     }
 
     private fun invalidatesWaitingStarts(intent: Intent?): Boolean = when (tunnelAction(intent)) {
@@ -439,6 +631,11 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
     override fun onDestroy() {
         if (destroyed) return
         destroyed = true
+        taskRemovalAdmission?.let {
+            it.respond(if (stopRevision == it.stopRevision) RuntimeServiceIntents.TASK_REMOVAL_RETRY
+                else RuntimeServiceIntents.TASK_REMOVAL_REJECTED)
+        }
+        taskRemovalAdmission = null
         beginRetirement()
         RuntimeProcessSelection.clearVpnOwner()
         waitingStartsAndToggles.clear()

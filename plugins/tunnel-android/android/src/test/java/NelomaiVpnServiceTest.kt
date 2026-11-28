@@ -17,6 +17,29 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 class NelomaiVpnServiceTest {
+    @Test
+    fun candidateSelectionDependsOnWhetherThePanelAlreadyIssuedTheLease() {
+        for (reserve in listOf<Boolean?>(null, true)) {
+            for (state in listOf("not_found", "pending", "applied")) {
+                val backend = ServiceRecoveryBackend()
+                val store = recoveryStore(backend)
+                coordinator(store).begin(template().copy(reserveEnabled = reserve))
+                val response = if (reserve == true) redundantResult(store.load()) else startResult("primary")
+                val panel = ServicePanelFake().apply {
+                    reconcileResults += reconcile(state, leaseId = "primary".takeIf { state == "applied" })
+                    startResults += Result.success(response)
+                }
+                coordinator(recoveryStore(backend)).runOnce(panel, ServiceRuntimeFake())
+                assertEquals("$reserve/$state", listOf(state == "applied"), panel.alreadyIssuedRequests)
+                if (reserve == null) {
+                    panel.startResults += Result.success(startResult("primary"))
+                    coordinator(recoveryStore(backend)).runOnce(panel, ServiceRuntimeFake())
+                    assertEquals(listOf(state == "applied", true), panel.alreadyIssuedRequests)
+                }
+            }
+        }
+    }
+
     @Test fun deferredServerStartReplaysExactOperationInsteadOfPollingPendingForever() {
         for (reserve in listOf<Boolean?>(null, false, true)) for (reconcileAction in listOf(false, true)) {
             val backend = ServiceRecoveryBackend()
@@ -96,6 +119,7 @@ class NelomaiVpnServiceTest {
             }.apply { start() }
             try {
                 assertTrue(entered.await(2, TimeUnit.SECONDS))
+                assertEquals(listOf(true), panel.alreadyIssuedRequests)
                 assertTrue(coordinator.cancel(pending.generation - 1) is AndroidCoordinatorResult.Failure)
                 assertFalse(signal.get().isDone)
                 backend.writeSucceeds = false
@@ -1564,10 +1588,16 @@ class NelomaiVpnServiceTest {
 
     @Test
     fun delayedRedundantWorkerRejectsCleanupDisarmedAndReplacementTransactions() {
-        val active = serviceV2Envelope()
+        val active = serviceV2Envelope().let { it.copy(intent = it.intent.copy(desiredActive = true)) }
         val startOperationId = requireNotNull(active.redundantTransaction).startOperationId
         var actions = 0
 
+        assertNull(activeRedundantTransactionForWork(
+            recovery = RecoveryStoreResult.Success(active.copy(intent = active.intent.copy(desiredActive = false))),
+            expectedStartOperationId = startOperationId,
+            pendingStop = false,
+            tombstoneUnreadable = false,
+        ))
         assertNull(activeRedundantTransactionForWork(
             recovery = RecoveryStoreResult.Success(active),
             expectedStartOperationId = startOperationId,
@@ -8148,22 +8178,17 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
-    fun taskRemovalLivenessOnlySchedulesForAnActivePossiblyDesiredTunnel() {
+    fun taskRemovalLivenessHonorsExplicitStopAndKeepsLegacyFallback() {
         assertTrue(shouldScheduleTaskRemovalLiveness(true, SessionState.RUNNING))
         assertTrue(shouldScheduleTaskRemovalLiveness(null, SessionState.STARTING))
         assertFalse(shouldScheduleTaskRemovalLiveness(false, SessionState.RUNNING))
-        assertFalse(shouldScheduleTaskRemovalLiveness(true, SessionState.STOPPED))
-        assertFalse(shouldScheduleTaskRemovalLiveness(true, SessionState.FAILED))
+        assertFalse(shouldScheduleTaskRemovalLiveness(false, SessionState.STOPPED))
+        assertFalse(shouldScheduleTaskRemovalLiveness(null, SessionState.STOPPED))
     }
 
     @Test
-    fun scheduledTaskRemovalLivenessDoesNotTrustAProcessLocalDesiredSnapshot() {
-        var dispatches = 0
-
-        val result = dispatchScheduledTaskRemovalLiveness { dispatches += 1 }
-
-        assertTrue(result.isSuccess)
-        assertEquals(1, dispatches)
+    fun taskRemovalLivenessSchedulesForDesiredHotStandbyWithIdleLegacyBackend() {
+        assertTrue(shouldScheduleTaskRemovalLiveness(true, SessionState.STOPPED))
     }
 
     @Test
@@ -8450,6 +8475,7 @@ private class ServicePanelFake : AndroidConnectionIntentPanel {
     val bindingSyncResults = ArrayDeque<Result<Unit>>()
     val stopResults = ArrayDeque<Result<Unit>>()
     val startOperationIds = mutableListOf<String>()
+    val alreadyIssuedRequests = mutableListOf<Boolean>()
     val bindingSyncTemplates = mutableListOf<AndroidIntentTemplate>()
     val stopOperationIds = mutableListOf<String?>()
     val stopLeaseIds = mutableListOf<String>()
@@ -8484,8 +8510,10 @@ private class ServicePanelFake : AndroidConnectionIntentPanel {
     override fun start(
         template: AndroidIntentTemplate,
         transaction: AndroidLeaseTransaction,
+        alreadyIssued: Boolean,
         cancellation: CompletableFuture<Unit>,
     ): BackgroundStartResult {
+        alreadyIssuedRequests += alreadyIssued
         startOperationIds += transaction.startOperationId
         onCancellableStart(cancellation)
         onStart()

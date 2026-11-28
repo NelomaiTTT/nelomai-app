@@ -39,6 +39,10 @@ macro_rules! command {
 const COMMAND_SIZES: &[(&str, usize, bool)] = &[
     command!(app_state, return_size_4, true),
     command!(app_preferences, return_size_1, false),
+    command!(app_kill_switch_status, return_size_1, true),
+    command!(app_set_kill_switch_preference, return_size_3, true),
+    command!(app_stop_protection, return_size_1, true),
+    command!(app_retry_protected_connection, return_size_1, true),
     command!(app_set_close_to_tray, return_size_2, false),
     command!(app_set_dns_provider, return_size_4, false),
     command!(app_set_tic_egress_mode, return_size_3, false),
@@ -94,7 +98,7 @@ const COMMAND_SIZES: &[(&str, usize, bool)] = &[
     command!(app_logout, return_size_4, true),
 ];
 
-const _: () = assert!(COMMAND_SIZES.len() == 51);
+const _: () = assert!(COMMAND_SIZES.len() == 55);
 
 #[test]
 fn all_ipc_command_futures_fit_stack_budget() {
@@ -144,5 +148,5 @@ fn stack_inventory_covers_registered_ipc_commands() {
             .map(|&(name, _, _)| name)
             .collect::<Vec<_>>()
     );
-    assert_eq!(names.len(), 51);
+    assert_eq!(names.len(), 55);
 }

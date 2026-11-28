@@ -21,6 +21,11 @@ interface RuntimeQuickActionsV1 {
     fun toggle(context: Context): Boolean
 }
 
+/** An Off-tile click can outlive its owner-selection Binder read. */
+interface RuntimeQuickStartV1 {
+    fun prepareStart(context: Context, owner: String): Runnable?
+}
+
 interface RuntimeNativeResultV1 {
     fun success(value: String)
     fun failure(code: String)
@@ -50,6 +55,7 @@ interface RuntimeVpnAuthorityV1 {
 
 interface RuntimeVpnTransportV1 {
     fun localTransportClosed(): Boolean
+    /** Record the Android start ID of a rejected delivery. A retiring engine also checks for idle shutdown. */
     fun retiredStartRejected(startId: Int)
 }
 
@@ -59,8 +65,18 @@ object RuntimeServiceIntents {
     const val CLIENT_STOP = "ru.nelomai.tunnel.CLIENT_STOP"
     const val VPN_API_VERSION = 2
     const val QUICK_TOGGLE = "ru.nelomai.tunnel.QUICK_TOGGLE"
+    const val EXTRA_QUICK_START_OWNER = "ru.nelomai.runtime.v1.QUICK_START_OWNER"
+    const val EXTRA_TILE_CLICK_REVISION = "ru.nelomai.runtime.v1.TILE_CLICK_REVISION"
+    const val EXTRA_TILE_CLICK_OWNER = "ru.nelomai.runtime.v1.TILE_CLICK_OWNER"
     const val EXTRA_QUICK_STOP_ONLY = "ru.nelomai.runtime.v1.QUICK_STOP_ONLY"
     const val EXTRA_FOREGROUND_START = "ru.nelomai.runtime.v1.FOREGROUND_START"
+    const val TASK_REMOVAL_LIVENESS = "ru.nelomai.tunnel.TASK_REMOVAL_LIVENESS"
+    const val TASK_REMOVAL_RUNTIME = "ru.nelomai.runtime.v1.TASK_REMOVAL_RUNTIME"
+    const val TASK_REMOVAL_START_ID = "ru.nelomai.runtime.v1.TASK_REMOVAL_START_ID"
+    const val TASK_REMOVAL_FOREGROUND_PID = "ru.nelomai.runtime.v1.TASK_REMOVAL_FOREGROUND_PID"
+    const val TASK_REMOVAL_ACCEPTED = 1
+    const val TASK_REMOVAL_REJECTED = 2
+    const val TASK_REMOVAL_RETRY = 3
     const val PREPARE_STABLE_BACKGROUND = "ru.nelomai.runtime.v1.PREPARE_STABLE_BACKGROUND"
     const val STABLE_PROVISION_REQUEST = "ru.nelomai.runtime.v1.STABLE_PROVISION_REQUEST"
     @JvmStatic fun foreground(intent: Intent): Intent = intent.putExtra(EXTRA_FOREGROUND_START, true)

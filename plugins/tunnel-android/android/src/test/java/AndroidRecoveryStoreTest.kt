@@ -10,6 +10,68 @@ import org.junit.Test
 
 class AndroidRecoveryStoreTest {
     @Test
+    fun capturedV1TileStartSurvivesOnlyTheOriginalSystemCancellation() {
+        val request = AndroidPendingQuickStart(100, "runtime")
+        for (systemStop in listOf(false, true)) for (completed in listOf(false, true)) {
+            val backend = FakeEncryptedRecordBackend()
+            val recovery = store(backend)
+            val original = recovery.beginStart(0, template(), replay()).success()
+            val operation = requireNotNull(original.leaseTransaction).startOperationId
+            if (systemStop) recovery.cancelSystemStoppedIntent(original).success()
+            else recovery.cancelCurrentIntent().success()
+            val stopped = recovery.read().success()
+            if (completed) recovery.completeCancelledStart(stopped.intent.generation).success()
+            val reopened = store(backend)
+            val before = reopened.read().success()
+
+            val queued = reopened.queueQuickStart(request, original.intent.generation, operation, null)
+
+            if (systemStop) {
+                assertEquals(request, queued.success().pendingQuickStart)
+                assertFalse(queued.success().intent.desiredActive)
+            } else {
+                assertEquals("connection_intent_generation_conflict", queued.failure().code)
+                assertEquals(before, reopened.read().success())
+            }
+        }
+    }
+
+    @Test
+    fun latestSystemStopSeparatesAnOldRequestFromANewTap() {
+        val backend = FakeEncryptedRecordBackend()
+        val original = store(backend)
+        original.beginRedundant(redundantTransaction("old-start")).success()
+        val old = AndroidPendingQuickStart(100L, "runtime")
+        val latest = AndroidPendingQuickStart(200L, "runtime")
+        val saved = original.queueQuickStart(old, 0, "old-start", null).success()
+        val reopened = store(backend)
+        assertEquals(saved, reopened.queueQuickStart(latest, 0, "old-start", null, 99L).success())
+        assertEquals("connection_intent_generation_conflict",
+            reopened.queueQuickStart(old, 0, "old-start", null, 100L).failure().code)
+        val fresh = reopened.queueQuickStart(latest, 0, "old-start", null, 100L).success()
+        assertEquals(saved.copy(pendingQuickStart = latest), fresh)
+        assertEquals(fresh, reopened.clearPendingQuickStart(old).success())
+        assertEquals(fresh, reopened.queueQuickStart(latest, 0, "old-start", null, 100L).success())
+    }
+
+    @Test
+    fun acceptingTileStartKeepsAnAcknowledgedStopAcknowledged() {
+        val recovery = store(FakeEncryptedRecordBackend())
+        recovery.beginRedundant(redundantTransaction("old-start")).success()
+        recovery.cancelRedundantIntentAndDeferStop("old-stop", "old-start").success()
+        val old = recovery.updateRedundant("old-start") {
+            it.copy(retry = it.retry.copy(stopState = RedundantStopState.ACKNOWLEDGED))
+        }.success()
+        val request = AndroidPendingQuickStart(100, "runtime")
+
+        val queued = recovery.queueQuickStart(request, old.intent.generation, "old-start", null).success()
+
+        assertEquals(request, queued.pendingQuickStart)
+        assertEquals(old.redundantTransaction, queued.redundantTransaction)
+        assertNull(recovery.completeRedundantStop("old-stop", "old-start").success().redundantTransaction)
+    }
+
+    @Test
     fun userStopDuringPreparedRecoveryCancelsRestartWithoutLosingCleanup() {
         for (deferred in listOf(false, true)) for (cancel in 0..2) {
             val backend = FakeEncryptedRecordBackend()

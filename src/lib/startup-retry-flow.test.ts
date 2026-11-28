@@ -19,8 +19,12 @@ const names = ["isAndroidRuntime", "restore", "retryPendingStartup", "applyBoots
   "updateViewFromRuntimeState", "confirmProtectionTransition", "installUpdate"];
 const functions = ast.statements.filter((node) => ts.isFunctionDeclaration(node)
   && names.includes(node.name?.text ?? "")).map((node) => node.getText(ast)).join("\n");
+const startupPresentation = ast.statements.filter(ts.isVariableStatement)
+  .flatMap((node) => [...node.declarationList.declarations])
+  .find((node) => node.name.getText(ast) === "startupConnection")!.initializer as ts.CallExpression;
 const callbacks = new Function("context", `with (context) { ${ts.transpile(functions,
-  { target: ts.ScriptTarget.ES2022 })}; return { ${names.join(",")} }; }`);
+  { target: ts.ScriptTarget.ES2022 })};
+  return { ${names.join(",")}, startupConnection: () => (${startupPresentation.arguments[0].getText(ast)}) }; }`);
 
 // Evaluate the page's real presentation while native replies are still pending.
 function elementsWithClass(node: any, className: string): any[] {
@@ -88,7 +92,9 @@ function fixture(bootstrap: () => Promise<unknown>) {
     notificationNextCursor: null, notificationHistoryExpanded: false, notificationsOpen: false,
     changelogOpen: false, clearUpdateTimer: () => {},
   };
-  return { context, page: callbacks(context) };
+  const page = callbacks(context);
+  Object.defineProperty(context, "startupConnection", { get: page.startupConnection });
+  return { context, page };
 }
 
 describe("bounded bootstrap recovery", () => {
@@ -127,14 +133,14 @@ describe("bounded bootstrap recovery", () => {
     },
   );
 
-  it("shows preparation instead of an outage while bootstrap is in flight", async () => {
+  it("shows the Android connection panel while bootstrap is in flight", async () => {
     let finish!: (value: unknown) => void;
     const f = fixture(() => new Promise((resolve) => { finish = resolve; }));
     const running = f.page.restore();
     expect(f.context.busy).toBe(true);
     expect(f.context.view).toBe("unavailable");
-    expect(unavailableHeading(f.context)).toBe("Подключаемся к панели");
-    expect(headerStatus(f.context)).toBe("Подготовка приложения");
+    expect(f.context.startupConnection).toBe(true);
+    expect(headerStatus(f.context)).toBe("Проверяем сессию");
     expect(headerPhase(f.context)).toBe("preparing");
     finish(response);
     await running;
@@ -142,16 +148,16 @@ describe("bounded bootstrap recovery", () => {
     expect(f.context.busy).toBe(false);
   });
 
-  it("keeps preparation visible until authoritative runtime state arrives", async () => {
+  it("keeps the Android connection panel guarded until runtime state arrives", async () => {
     let finish!: (value: unknown) => void;
-    const f = fixture(async () => response);
+    const f = fixture(async () => androidResponse);
     f.context.nativeClient.state = () => new Promise((resolve) => { finish = resolve; });
     const running = f.page.restore();
     await Promise.resolve();
     expect(f.context.busy).toBe(true);
     expect(f.context.view).toBe("unavailable");
-    expect(unavailableHeading(f.context)).toBe("Подключаемся к панели");
-    expect(headerStatus(f.context)).toBe("Подготовка приложения");
+    expect(f.context.startupConnection).toBe(true);
+    expect(headerStatus(f.context)).toBe("Проверяем сессию");
     expect(headerPhase(f.context)).toBe("preparing");
     finish({ phase: "ready", connection: null, warning: null, metrics: null,
       reserveState: null, connectionIntentStatus: "none", nextRetryAtUnix: null,

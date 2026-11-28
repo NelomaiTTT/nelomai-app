@@ -34,7 +34,7 @@ class TotalLossRestartRegressionTest {
         var starts = 0
         override fun reconcile(transaction: AndroidLeaseTransaction, cancelIfAbsent: Boolean) =
             BackgroundReconcileResult(state, false, null, null, 0, null)
-        override fun start(template: AndroidIntentTemplate, transaction: AndroidLeaseTransaction, cancellation: CompletableFuture<Unit>): BackgroundStartResult {
+        override fun start(template: AndroidIntentTemplate, transaction: AndroidLeaseTransaction, alreadyIssued: Boolean, cancellation: CompletableFuture<Unit>): BackgroundStartResult {
             starts++
             throw BackgroundConnectionException("connection_already_active")
         }

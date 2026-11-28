@@ -161,7 +161,8 @@ class ServiceTunIntegrationTest {
         f.stopLegacy()
         assertTrue(f.retention.hasTun())
         // Existing automatic foreground cleanup must not destroy an armed owner.
-        ReflectionHelpers.setField(f.service, "lastHandledStartId", 1)
+        ReflectionHelpers.setField(f.service, "lastDeliveredStartId", 1)
+        ReflectionHelpers.setField(f.service, "lastAcceptedStartId", 1)
         f.call("finishService", 1)
         assertFalse(shadowOf(f.host).isStoppedBySelf)
         assertEquals(true, f.call("releaseProtection", false))

@@ -33,6 +33,7 @@ internal class RedundantCancelTombstoneStore(
     fun persist(
         startOperationId: String,
         allowRestart: Boolean = false,
+        savedStopOperationId: String? = null,
     ): RecoveryStoreResult<RedundantCancelTombstone> {
         repeat(2) {
             val encoded = try {
@@ -63,7 +64,7 @@ internal class RedundantCancelTombstoneStore(
             }
             val tombstone = RedundantCancelTombstone(
                 startOperationId,
-                operationId(),
+                savedStopOperationId ?: operationId(),
                 allowRestart,
             )
             val replacement = try {
@@ -267,9 +268,9 @@ internal fun activeRedundantTransactionForWork(
             retainedOwnerCleanupPending,
         )
     ) return null
-    val transaction = (recovery as? RecoveryStoreResult.Success)
-        ?.value?.redundantTransaction ?: return null
-    if (!transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE) {
+    val envelope = (recovery as? RecoveryStoreResult.Success)?.value ?: return null
+    val transaction = envelope.redundantTransaction ?: return null
+    if (!envelope.intent.desiredActive || !transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE) {
         return null
     }
     return transaction.takeIf {
