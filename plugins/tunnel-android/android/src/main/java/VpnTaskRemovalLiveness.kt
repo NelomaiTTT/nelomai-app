@@ -31,7 +31,7 @@ private const val VPN_TASK_REMOVAL_LIVENESS_JOB_ID = 0x4e56504c
 private const val INITIAL_DELAY_MILLIS = 15_000L
 private const val RECHECK_DELAY_MILLIS = 30_000L
 private const val DEADLINE_MILLIS = 60_000L
-private const val EXIT_RECORD_DELAY_MILLIS = 5_000L
+internal const val EXIT_RECORD_DELAY_MILLIS = 5_000L
 private const val EXTRA_PID = "vpn_watch_pid"
 private const val EXTRA_SINCE = "vpn_watch_since"
 // The bound job waits for both broker reads, each with a 10s deadline.

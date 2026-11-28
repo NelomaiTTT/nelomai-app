@@ -230,7 +230,7 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
                         }
                     }
                     val requiresStartAdmission = selectedEngine.requiresStartAdmission(intent)
-                    if (!vpnAuthorityCurrent() && !isTeardownCommand(intent)) {
+                    if (!vpnAuthorityCurrent(recovering = preparedRecovery != null) && !isTeardownCommand(intent)) {
                         if (preparedRecovery != null && vpnOwnerNotRetired()) {
                             recoveryResult = RuntimeServiceIntents.TASK_REMOVAL_RETRY
                         }
@@ -606,9 +606,11 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1, RuntimeVpnAu
 
     // Broker silence fences new work. The verified session's existing transport
     // and retained TUN stay owned until Stop, confirmed retirement, or Android revoke.
-    override fun vpnAuthorityCurrent(): Boolean =
+    override fun vpnAuthorityCurrent(): Boolean = vpnAuthorityCurrent(recovering = false)
+
+    private fun vpnAuthorityCurrent(recovering: Boolean): Boolean =
         vpnOwnerNotRetired() &&
-            (!RuntimeProcessSelection.hasVpnOwner() ||
+            ((!recovering && !RuntimeProcessSelection.hasVpnOwner()) ||
                 SystemClock.uptimeMillis() - lastBrokerVerificationAt < BROKER_RECOVERY_MILLIS)
     override fun invalidateQueuedVpnStarts() { stopRevision++ }
     override fun retireVpnAuthority() { beginRetirement() }

@@ -24,12 +24,13 @@ internal object QuickDesiredActiveProjection {
         desiredActive: Boolean,
         ownerCurrent: () -> Boolean = { true },
         expectedGeneration: Long? = null,
+        newUiStart: Boolean = false,
     ): RecoveryStoreResult<AndroidConnectionIntent> {
         val generation = expectedGeneration ?: when (val current = read(store)) {
             is RecoveryStoreResult.Failure -> return current
             is RecoveryStoreResult.Success -> current.value.generation
         }
-        return when (val result = store.setDesiredActive(generation, desiredActive, ownerCurrent)) {
+        return when (val result = store.setDesiredActive(generation, desiredActive, ownerCurrent, newUiStart)) {
             is RecoveryStoreResult.Success -> RecoveryStoreResult.Success(result.value.intent)
             is RecoveryStoreResult.Failure -> result
         }
@@ -115,6 +116,9 @@ object QuickTunnelController {
         return interruptedAt(state, prefs.getLong(STATE_UPDATED_AT_MILLIS, 0), envelope, lastStop)
     }
 
+    internal fun armedSince(context: Context, envelope: AndroidRecoveryEnvelope): Long =
+        envelope.armedAtMillis ?: preferences(context).getLong(STATE_UPDATED_AT_MILLIS, 0L)
+
     private fun interruptedAt(state: SessionState, updatedAt: Long, envelope: AndroidRecoveryEnvelope, lastStop: Long): Boolean {
         if (envelope.intent.desiredActive) {
             // Older records have only the projected timestamp. If both timestamps
@@ -143,6 +147,7 @@ object QuickTunnelController {
         changed: Boolean = false,
         ownerCurrent: () -> Boolean = { true },
         expectedGeneration: Long? = null,
+        newUiStart: Boolean = false,
         onDesiredActiveSaved: (Long) -> Unit = {},
     ): Boolean {
         val preferences = preferences(context)
@@ -153,6 +158,7 @@ object QuickTunnelController {
                 desiredActive,
                 ownerCurrent,
                 expectedGeneration,
+                newUiStart,
             )
             when (recoveryResult) {
                 is RecoveryStoreResult.Failure -> {

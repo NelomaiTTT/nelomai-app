@@ -39,6 +39,7 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 private const val IDLE_SERVICE_STOP_DELAY_MILLIS = 400L
+private const val LATE_SYSTEM_STOP_RECHECK_MILLIS = 60_000L
 private const val REDUNDANT_HEALTH_TICK_MILLIS = 1_000L
 private const val REDUNDANT_STOP_RETRY_MILLIS = 1_000L
 private const val BACKGROUND_REFRESH_WINDOW_SECONDS = 7L * 24 * 60 * 60
@@ -800,6 +801,7 @@ class NelomaiVpnService(
     private val killSwitchNoticeDue = Runnable { updateKillSwitchNotification() }
     @Volatile private var killSwitchCause: String? = null
     @Volatile private var killSwitchError: String? = null
+    private var protectionAtRestart: AndroidRecoveryEnvelope? = null
     @Volatile private var legacyTunOwner: GoBackend? = null
     @Volatile private var legacyTunTicket = 0L
     private var legacyReadyHandshake = 0L
@@ -839,6 +841,7 @@ class NelomaiVpnService(
 
     private fun releaseProtection(permanent: Boolean = false): Boolean = try {
         if (!permanent) {
+            protectionAtRestart = null
             killSwitchCause = null
             if (killSwitchError == "protection_lost") killSwitchError = null
         }
@@ -1028,7 +1031,7 @@ class NelomaiVpnService(
                 } == true)
             }
         },
-        observe = ::handleClientStatus,
+        observe = ::handleBoundClientStatus,
         decorate = ::appendKillSwitchStatus,
     )
     private val restoreHandler = Handler(Looper.getMainLooper())
@@ -1054,6 +1057,36 @@ class NelomaiVpnService(
     @Volatile private var logoutRetryAtMillis = 0L
     private val logoutAttemptInFlight = AtomicBoolean(false)
     private var systemStopChecked = false
+    private var coldRecoveryReadPending = false
+    private data class RestoredStopTarget(val generation: Long, val armedAtMillis: Long) {
+        fun matches(envelope: AndroidRecoveryEnvelope): Boolean =
+            envelope.intent.generation == generation &&
+                (envelope.armedAtMillis == null || envelope.armedAtMillis == armedAtMillis)
+    }
+    private var restoredStopTarget: RestoredStopTarget? = null
+    private val recheckSystemStop = object : Runnable {
+        override fun run() {
+            if (serviceDestroyed || serviceGeneration != VPN_PROCESS_SERVICE_GENERATION.get() || systemStopChecked) return
+            restoredStopTarget?.let { target ->
+                val current = (recoveryStore.read() as? RecoveryStoreResult.Success)?.value
+                if (current != null && (!current.intent.desiredActive || !target.matches(current))) {
+                    finishSystemStopCheck()
+                    return
+                }
+            }
+            consumeSystemStop()
+            // A running service can receive the AMS record even with no launcher or tile RPC.
+            if (!systemStopChecked) restoreHandler.postDelayed(this, LATE_SYSTEM_STOP_RECHECK_MILLIS)
+        }
+    }
+
+    private fun finishSystemStopCheck() {
+        systemStopChecked = true
+        coldRecoveryReadPending = false
+        restoredStopTarget = null
+        restoreHandler.removeCallbacks(recheckSystemStop)
+    }
+
     // A late watch advances Android's start ID even when it has no work to dispatch.
     @Volatile private var lastDeliveredStartId = 0
     @Volatile private var lastAcceptedStartId = 0
@@ -1190,12 +1223,23 @@ class NelomaiVpnService(
         AutomaticDiagnostics.captureLegacySessionWatermark(applicationContext)
         TunnelRuntime.initialize(applicationContext)
         recoveryStore = AndroidRecoveryStores.open(applicationContext)
-        val recovered = (recoveryStore.read() as? RecoveryStoreResult.Success)?.value
-        if (killSwitchPreference.enabled && recovered?.intent?.let { it.desiredActive && it.armedHistory } == true) {
-            killSwitchError = "protection_lost"
-            restoreHandler.post { updateKillSwitchNotification() }
+        val coldReadError = readColdRecovery()
+        if (coldReadError != null || restoredStopTarget != null) {
+            restoreHandler.postDelayed(recheckSystemStop, EXIT_RECORD_DELAY_MILLIS)
         }
-        pendingQuickStart = recovered?.pendingQuickStart
+        if (protectionAtRestart != null) {
+            // The first command normally classifies this synchronously. A cold engine can
+            // also be created without receiving that command if its broker proof expires.
+            restoreHandler.post {
+                if (!serviceDestroyed && protectionAtRestart != null) {
+                    try {
+                        readSystemStopForRecovery()
+                    } catch (error: RuntimeException) {
+                        TunnelLog.warning("service.system_stop_history_unavailable", error = error)
+                    }
+                }
+            }
+        }
         redundantCancelTombstones = RedundantCancelTombstoneStore(
             AndroidRedundantCancelTombstoneBackend(applicationContext),
         )
@@ -1332,12 +1376,52 @@ class NelomaiVpnService(
         TunnelLog.info("service.created")
     }
 
+    private fun readColdRecovery(): String? {
+        val result = recoveryStore.read()
+        coldRecoveryReadPending = result is RecoveryStoreResult.Failure
+        val recovered = when (result) {
+            is RecoveryStoreResult.Failure -> return result.code
+            is RecoveryStoreResult.Success -> result.value
+        }
+        pendingQuickStart = recovered.pendingQuickStart
+        if (recovered.intent.desiredActive) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                restoredStopTarget = RestoredStopTarget(recovered.intent.generation,
+                    QuickTunnelController.armedSince(applicationContext, recovered))
+            }
+            if (killSwitchPreference.enabled && recovered.intent.armedHistory) protectionAtRestart = recovered
+        }
+        return null
+    }
+
+    private fun readSystemStopForRecovery(): Long? {
+        val lastStop = VpnTaskRemovalLiveness.lastSystemStopMillis(applicationContext)
+        val before = protectionAtRestart ?: return lastStop
+        val stopped = lastStop != null && QuickTunnelController.isPausedByAndroid(applicationContext, before, lastStop)
+        protectionAtRestart = null
+        if (!stopped && killSwitchError == null && tunRetention.state() == "off") {
+            killSwitchError = "protection_lost"
+        }
+        updateKillSwitchNotification()
+        return lastStop
+    }
+
+    private fun onSystemStopRecorded() {
+        // The exit reason can arrive after creation, or the tile can consume it first.
+        protectionAtRestart = null
+        if (killSwitchError == "protection_lost") {
+            killSwitchError = null
+            updateKillSwitchNotification()
+        }
+    }
+
     // System Stop kills the entire app without a service callback. The first passive
     // RPC can otherwise recover the old owner before the launcher even renders.
     private fun consumeSystemStop(): String? {
         if (systemStopChecked) return null
+        if (coldRecoveryReadPending) readColdRecovery()?.let { return it }
         val lastStop = try {
-            VpnTaskRemovalLiveness.lastSystemStopMillis(applicationContext)
+            readSystemStopForRecovery()
         } catch (error: RuntimeException) {
             TunnelLog.warning("service.system_stop_history_unavailable", error = error)
             return "android_stop_history_unavailable"
@@ -1345,7 +1429,9 @@ class NelomaiVpnService(
         if (lastStop != null) {
             val current = recoveryStore.read()
             if (current is RecoveryStoreResult.Failure) return current.code
-            val queued = (current as RecoveryStoreResult.Success).value.pendingQuickStart
+            val envelope = (current as RecoveryStoreResult.Success).value
+            val target = restoredStopTarget
+            val queued = envelope.pendingQuickStart
             val snapshot = if (queued != null && queued.requestedAtMillis <= lastStop) {
                 recoveryStore.clearPendingQuickStart(queued)
             } else current
@@ -1354,22 +1440,36 @@ class NelomaiVpnService(
                 is RecoveryStoreResult.Success -> snapshot.value
             }
             pendingQuickStart = before.pendingQuickStart
-            // Classify and cancel the same snapshot. A new Start between these
-            // operations must cause a generation conflict instead of being stopped.
-            if (!QuickTunnelController.isPausedByAndroid(applicationContext, before, lastStop)) {
-                systemStopChecked = true
+            if (target != null && !target.matches(before)) {
+                finishSystemStopCheck()
                 return null
             }
-            val stopped = when (val result = recoveryStore.cancelSystemStoppedIntent(before, pendingRedundantStop?.tombstone)) {
+            // Classify and cancel the same snapshot. A new Start between these
+            // operations must cause a generation conflict instead of being stopped.
+            val paused = if (target != null && before.intent.desiredActive) {
+                lastStop >= target.armedAtMillis
+            } else QuickTunnelController.isPausedByAndroid(applicationContext, before, lastStop)
+            if (!paused) {
+                if (target == null) finishSystemStopCheck()
+                return null
+            }
+            val liveLegacy = TunnelRuntime.state() != SessionState.STOPPED
+            val stopped = when (val result = recoveryStore.cancelSystemStoppedIntent(before,
+                pendingRedundantStop?.tombstone, stopLocalRuntime = liveLegacy)) {
                 is RecoveryStoreResult.Failure -> return result.code
                 is RecoveryStoreResult.Success -> result.value
             }
-            if (!QuickTunnelController.updateState(applicationContext, SessionState.STOPPED, changed = true,
-                    expectedGeneration = stopped.intent.generation)) return "quick_state_save_failed"
+            if (tunRetention.state() != "off") releaseProtection()
+            onSystemStopRecorded()
+            val projected = QuickTunnelController.updateState(applicationContext, SessionState.STOPPED,
+                changed = true, expectedGeneration = stopped.intent.generation)
             VpnTaskRemovalLiveness.cancel(applicationContext)
             resumeStoppedCleanup(stopped)
+            finishSystemStopCheck()
+            if (!projected) return "quick_state_save_failed"
+        } else if (restoredStopTarget == null) {
+            finishSystemStopCheck()
         }
-        systemStopChecked = true
         return null
     }
 
@@ -1380,7 +1480,6 @@ class NelomaiVpnService(
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         lastDeliveredStartId = startId
-        if (intent?.action != ACTION_TASK_REMOVAL_LIVENESS) acceptServiceStart(startId)
         val interruptedTileStart = intent?.action == ACTION_QUICK_TOGGLE &&
             intent.getBooleanExtra(EXTRA_START_AFTER_INTERRUPTED_STOP, false) &&
             !intent.getBooleanExtra(ru.nelomai.runtime.v1.RuntimeServiceIntents.EXTRA_QUICK_STOP_ONLY, false)
@@ -1391,16 +1490,18 @@ class NelomaiVpnService(
         if (!interruptedTileStart && !explicitStop) {
             consumeSystemStop()?.let { error ->
                 if (intent == null || intent.action == ACTION_ENSURE_RUNNING) {
+                    acceptServiceStart(startId)
                     scheduleUnreadableRecoveryRetry()
                     return START_STICKY
                 }
                 intent?.resultReceiver().sendError(error)
                 TunnelLog.warning("service.system_stop_sync_failed", error)
-                if (intent?.action == ACTION_TASK_REMOVAL_LIVENESS) finishIdleWatch(startId)
-                else finishService(startId)
+                finishUnacceptedStartIfIdle(startId)
                 return START_NOT_STICKY
             }
         }
+        // A rejected observation cannot take foreground ownership from an earlier Start.
+        if (intent?.action != ACTION_TASK_REMOVAL_LIVENESS) acceptServiceStart(startId)
         if (pendingRedundantStop != null || redundantCancelTombstoneUnreadable) {
             schedulePendingRedundantStopRetry()
         }
@@ -1447,7 +1548,7 @@ class NelomaiVpnService(
                     val request = AndroidPendingQuickStart(requestedAt,
                         tappedOwner ?: ru.nelomai.client.RuntimeSelectionStore.encodeVpnRecoveryOwner(owner))
                     val lastStop = try {
-                        VpnTaskRemovalLiveness.lastSystemStopMillis(applicationContext)
+                        readSystemStopForRecovery()
                     } catch (error: RuntimeException) {
                         TunnelLog.warning("service.system_stop_history_unavailable", error = error)
                         if (!intent.hasExtra(EXTRA_QUICK_START_LAST_STOP)) {
@@ -1461,7 +1562,8 @@ class NelomaiVpnService(
                     when (val queued = recoveryStore.queueQuickStart(request, generation,
                         operationId.ifEmpty { null }, pendingRedundantStop?.tombstone, lastStop, ::wasRejectedQuickStart)) {
                         is RecoveryStoreResult.Success -> {
-                            systemStopChecked = true
+                            onSystemStopRecorded()
+                            finishSystemStopCheck()
                             TunnelLog.info("quick_start.after_interrupted_stop_requested")
                             handleEnsureRunning(queued)
                         }
@@ -1495,7 +1597,7 @@ class NelomaiVpnService(
                         VpnTaskRemovalLiveness.wasStoppedByAndroid(applicationContext, it)
                     } catch (error: RuntimeException) {
                         TunnelLog.warning("service.system_stop_history_unavailable", error = error)
-                        finishIdleWatch(startId)
+                        finishUnacceptedStartIfIdle(startId)
                         return START_NOT_STICKY
                     }
                 } ?: true
@@ -1503,7 +1605,7 @@ class NelomaiVpnService(
                     is RecoveryStoreResult.Success -> result
                     is RecoveryStoreResult.Failure -> {
                         TunnelLog.warning("service.task_removal_recovery_unreadable", result.code)
-                        finishIdleWatch(startId)
+                        finishUnacceptedStartIfIdle(startId)
                         return START_NOT_STICKY
                     }
                 }
@@ -1513,7 +1615,7 @@ class NelomaiVpnService(
                         mapOf("reason" to if (stoppedByAndroid) "android_stop" else "user_stopped"),
                     )
                     if (recovery == null) {
-                        finishIdleWatch(startId)
+                        finishUnacceptedStartIfIdle(startId)
                     } else {
                         acceptServiceStart(startId)
                         if (!resumeStoppedCleanup(recovery.value)) stopIfIdle()
@@ -1527,7 +1629,7 @@ class NelomaiVpnService(
                         ensureRunningFromDurableState("task_removal_liveness", recovery)
                     }
                 } else {
-                    finishIdleWatch(startId)
+                    finishUnacceptedStartIfIdle(startId)
                 }
             }
             intent?.action == ACTION_CLIENT_START -> handleClientStart(intent)
@@ -1688,6 +1790,7 @@ class NelomaiVpnService(
                 applicationContext, SessionState.STARTING,
                 desiredActive = if (localRestart) null else true,
                 ownerCurrent = current,
+                newUiStart = args.startSource == "ui" && args.redundancy == null,
                 onDesiredActiveSaved = onSaved,
             )
         var nativeStartOwner: (() -> Boolean)? = null
@@ -3712,6 +3815,13 @@ class NelomaiVpnService(
         )
     }
 
+    private fun handleBoundClientStatus(intent: Intent) {
+        // Binder polls bypass the system Stop check in onStartCommand.
+        val error = consumeSystemStop()
+        if (error == null) handleClientStatus(intent)
+        else statusEndpoint.replyTo(intent.resultReceiver()).sendError(error)
+    }
+
     private fun handleClientStatus(intent: Intent) {
         val receiver = statusEndpoint.replyTo(intent.resultReceiver())
         if (intent.getIntExtra(EXTRA_API_VERSION, 0) != TUNNEL_API_VERSION) {
@@ -3719,11 +3829,17 @@ class NelomaiVpnService(
             stopIfIdle()
             return
         }
-        val recovery = recoveryStore.read()
-        val redundant = (recovery as? RecoveryStoreResult.Success)
-            ?.value?.redundantTransaction
+        val recovery = when (val result = recoveryStore.read()) {
+            is RecoveryStoreResult.Failure -> {
+                receiver.sendError(result.code)
+                return
+            }
+            is RecoveryStoreResult.Success -> result
+        }
+        val envelope = recovery.value
+        val redundant = envelope.redundantTransaction
         if (redundant != null) {
-            val state = if (resumeInterruptedRedundantStop(recovery.value) || !redundant.desiredActive ||
+            val state = if (resumeInterruptedRedundantStop(envelope) || !redundant.desiredActive ||
                 redundant.retry.stopState != RedundantStopState.NONE
             ) SessionState.STOPPING else if (
                 (redundantOwnerForOperation(redundant.startOperationId) as? RedundantConnectionCoordinator)
@@ -3739,11 +3855,16 @@ class NelomaiVpnService(
             receiver.sendOperation(state, 0)
             return
         }
-        if (recovery is RecoveryStoreResult.Failure) {
-            receiver.sendError(recovery.code)
+        val state = TunnelRuntime.state()
+        // A repeated UI Stop can clear the system Stop marker while local cleanup is still queued.
+        val stopPending = !envelope.intent.desiredActive &&
+            (envelope.systemStoppedFromGeneration != null || hasDurableConnectionIntentWork(envelope))
+        if (stopPending &&
+            (state == SessionState.STARTING || state == SessionState.RUNNING)
+        ) {
+            receiver.sendOperation(SessionState.STOPPING, 0)
             return
         }
-        val state = TunnelRuntime.state()
         if (shouldRestoreDesiredTunnel(
             QuickTunnelController.desiredActive(applicationContext),
             state,
@@ -4793,6 +4914,7 @@ class NelomaiVpnService(
     }
 
     override fun onDestroy() {
+        restoreHandler.removeCallbacks(recheckSystemStop)
         restoreHandler.removeCallbacks(killSwitchNoticeDue)
         localStopFallback?.cancel(false)
         releaseProtection(permanent = true)
@@ -6285,7 +6407,7 @@ class NelomaiVpnService(
         )
     }
 
-    private fun finishIdleWatch(startId: Int) {
+    private fun finishUnacceptedStartIfIdle(startId: Int) {
         if (lastAcceptedStartId == 0 && localTransportClosed() && !redundantStartBlocked() &&
             !redundantStartOperation.hasPending() && !connectionIntentDispatch.hasPendingWork()
         ) finishService(startId)

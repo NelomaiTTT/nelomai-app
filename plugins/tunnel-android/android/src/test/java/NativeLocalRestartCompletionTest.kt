@@ -3,6 +3,8 @@ package ru.nelomai.tunnel
 import android.app.ActivityManager
 import android.app.ApplicationExitInfo
 import android.app.Application
+import android.app.Notification
+import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -1091,6 +1093,449 @@ class NativeLocalRestartCompletionTest {
         }
     }
 
+    @Test fun lateSystemStopCancelsRecoveryOnNextStatus() = lateSystemStop(afterStatus = true)
+
+    @Test fun lateSystemStopCancelsRecoveryWithoutOpeningTheApp() = lateSystemStop(afterStatus = false)
+
+    @Test fun systemStopPublishedAfterFirstBackgroundCheckStillCancelsTheWatch() =
+        lateSystemStop(afterStatus = false, afterFirstCheck = true)
+
+    @Test fun coldReadFailureStillCancelsRecoveryOnDelayedSystemStop() =
+        lateSystemStop(afterStatus = false, failFirstRead = true)
+
+    private fun lateSystemStop(afterStatus: Boolean, afterFirstCheck: Boolean = false, failFirstRead: Boolean = false) {
+        val record = armedKillSwitchRecord { f ->
+            assertTrue(QuickTunnelController.updateState(f.context, SessionState.RUNNING))
+        }
+        record.failNextRead = failFirstRead
+        val stoppedAt = System.currentTimeMillis()
+        withTileRuntime(record, retainTunDescriptor = true) { f ->
+            assertFalse(record.failNextRead)
+            if (failFirstRead) f.service.onStartCommand(Intent(NelomaiVpnService.ACTION_TAKE_STATE_CHANGE), 0, 1)
+            shadowOf(Looper.getMainLooper()).idle()
+            if (!failFirstRead) assertNotNull(f.protectionNotice())
+            val scheduler = f.context.getSystemService(android.app.job.JobScheduler::class.java)
+            registerTestVpnWatch(f.context, TaskRemovalVpnWatch(123, stoppedAt))
+            assertEquals(1, scheduler.allPendingJobs.size)
+            if (afterFirstCheck) f.publishSystemStop(requireNotNull(f.envelope().armedAtMillis) - 1)
+            f.service.onStartCommand(Intent(NelomaiVpnService.ACTION_TAKE_STATE_CHANGE), 0, 1)
+            if (afterFirstCheck) {
+                shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(6))
+                assertTrue(f.envelope().intent.desiredActive)
+                assertNotNull(f.protectionNotice())
+            }
+            f.publishSystemStop(stoppedAt)
+            if (afterStatus) {
+                f.service.onStartCommand(Intent(NelomaiVpnService.ACTION_CLIENT_STATUS)
+                    .putExtra(EXTRA_API_VERSION, TUNNEL_API_VERSION), 0, 2)
+            } else {
+                shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(if (afterFirstCheck) 60 else 6))
+            }
+            f.drainImmediateWork()
+            assertTrue(scheduler.allPendingJobs.isEmpty())
+            assertFalse("late system Stop must disarm the persisted owner", f.envelope().intent.desiredActive)
+            assertNull(f.protectionNotice())
+            f.service.onStartCommand(Intent(NelomaiVpnService.ACTION_ENSURE_RUNNING), 0, 3)
+            f.drainImmediateWork()
+            assertFalse(f.envelope().intent.desiredActive)
+            assertTrue(CompletionNative.events.none { it == "up" })
+        }
+    }
+
+    private fun Fixture.publishSystemStop(at: Long) {
+        val exit = ShadowActivityManager.ApplicationExitInfoBuilder.newBuilder()
+            .setPid(123).setProcessName(context.packageName + ":vpn").setTimestamp(at)
+            .setReason(ApplicationExitInfo.REASON_USER_REQUESTED).setDescription("[STOP APP]").build()
+        shadowOf(context.getSystemService(ActivityManager::class.java)).addApplicationExitInfo(exit)
+    }
+
+    @Test fun lateSystemStopAlsoStopsAnAlreadyRestoredLocalTunnel() {
+        val record = Record()
+        withTileRuntime(record) { f ->
+            assertTrue(QuickTunnelController.updateState(f.context, SessionState.RUNNING, desiredActive = true))
+            assertNull(f.envelope().leaseTransaction)
+        }
+        val stoppedAt = System.currentTimeMillis()
+        withTileRuntime(record) { f ->
+            f.service.onStartCommand(Intent(NelomaiVpnService.ACTION_TAKE_STATE_CHANGE), 0, 1)
+            TunnelRuntime.start(f.context, args(), { _, _ -> }, { fail(it) }, keepForegroundServiceOnFailure = true)
+            f.work.runNext()
+            assertEquals(SessionState.RUNNING, TunnelRuntime.state())
+            // The recovery worker waits for a callback from the separate native executor.
+            f.work.runImmediately = true
+            f.publishSystemStop(stoppedAt)
+            f.service.onStartCommand(Intent(NelomaiVpnService.ACTION_CLIENT_STATUS)
+                .putExtra(EXTRA_API_VERSION, TUNNEL_API_VERSION), 0, 2)
+            f.drainImmediateWork()
+            assertFalse(f.envelope().intent.desiredActive)
+            assertEquals(Tunnel.State.DOWN, f.backend.getState(f.tunnel))
+            assertNull(f.envelope().intent.retry.pendingAction)
+            assertNull(f.protectionNotice())
+        }
+    }
+
+    @Test fun delayedSystemStopCannotCancelANewerStart() {
+        val record = Record()
+        withTileRuntime(record) { f ->
+            assertTrue(f.store.setDesiredActive(0, true) is RecoveryStoreResult.Success)
+        }
+        val stoppedAt = System.currentTimeMillis()
+        withTileRuntime(record) { f ->
+            f.service.onStartCommand(Intent(NelomaiVpnService.ACTION_TAKE_STATE_CHANGE), 0, 1)
+            assertTrue(f.store.cancelCurrentIntent() is RecoveryStoreResult.Success)
+            val replacement = f.beginReplacement()
+            f.publishSystemStop(stoppedAt)
+            f.service.onStartCommand(Intent(NelomaiVpnService.ACTION_TAKE_STATE_CHANGE), 0, 2)
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(6))
+            assertEquals(replacement, f.envelope())
+        }
+    }
+
+    private fun Fixture.startUi(hotStandby: Boolean, onReply: () -> Unit = {}): String {
+        var replies = 0
+        if (hotStandby) KillSwitchPreference(context).save(enabled = true, confirmed = true)
+        val args = if (hotStandby) prepareQuick() else args()
+        val lease = java.util.UUID.randomUUID().toString()
+        val operation = java.util.UUID.randomUUID().toString()
+        val quick = requireNotNull(args.quickConnection).apply { leaseId = lease; allowAlternate = hotStandby }
+        val redundant = if (hotStandby) RedundantStartArgs().apply {
+            sessionId = java.util.UUID.randomUUID().toString()
+            state = "ready"
+            operationId = operation
+            requestFingerprint = "a".repeat(64)
+            virtualAddressV4 = "10.241.0.3/32"
+            activeLeaseId = lease
+            localActiveLeaseId = lease
+            reserveEnabled = true
+            standbyDesired = true
+            fun member(slotName: String, id: String) = RedundantMemberArgs().apply {
+                slot = slotName
+                leaseId = id
+                healthProbe = RedundantHealthProbeArgs().apply {
+                    kind = "dns_a"; targetIpv4 = "10.8.0.1"; queryName = "test.invalid"; timeoutMs = 1500
+                }
+            }
+            primary = member(RedundantSlot.A.wireName, lease)
+            standby = RedundantStandbyArgs().apply {
+                member = member(RedundantSlot.B.wireName, java.util.UUID.randomUUID().toString())
+                configuration = args.configuration.copyOf()
+            }
+        } else null
+        service.onStartCommand(Intent(NelomaiVpnService.ACTION_CLIENT_START)
+            .putExtra(EXTRA_API_VERSION, TUNNEL_API_VERSION)
+            .putExtra(EXTRA_CLIENT_OPERATION_ID, operation)
+            .putExtra(EXTRA_START_SOURCE, "ui")
+            .putExtra(EXTRA_CONFIGURATION, args.configuration)
+            .putExtra(EXTRA_OPTIONS, args.options.toBundle())
+            .putExtra(EXTRA_QUICK_CONNECTION, quick.toBundle())
+            .apply { redundant?.let { putExtra(EXTRA_REDUNDANCY, it.toBundle()) } }
+            .putExtra(EXTRA_RESULT_RECEIVER, Receiver { code, data ->
+                assertEquals(data?.getString(EXTRA_ERROR_CODE), SERVICE_RESULT_OK, code)
+                assertEquals(SessionState.RUNNING.wireName, data?.getString(EXTRA_STATE))
+                onReply()
+                replies++
+            }), 0, 1)
+        drainImmediateWork()
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
+        drainImmediateWork()
+        assertEquals(1, replies)
+        return operation
+    }
+
+    @Test fun passiveReadFailureAfterNewUiStartKeepsUnretainedVpnRunning() {
+        val stoppedAt = System.currentTimeMillis() - 1_000
+        val record = Record().apply { storeTime = stoppedAt - 1_000 }
+        withTileRuntime(record) { it.startUi(false) }
+        record.storeTime = stoppedAt + 1_000
+        withTileRuntime(record, retainTunDescriptor = false) { f ->
+            f.startUi(false)
+            assertTrue(requireNotNull(f.envelope().armedAtMillis) > stoppedAt)
+            val host = ReflectionHelpers.getField<RuntimeVpnHostV1>(f.service, "runtimeHost").service
+            val before = f.envelope()
+            val replies = mutableListOf<Pair<Int, String?>>()
+            val command = Intent(NelomaiVpnService.ACTION_TAKE_STATE_CHANGE)
+                .putExtra(EXTRA_RESULT_RECEIVER, Receiver { code, data ->
+                    replies += code to data?.getString(EXTRA_ERROR_CODE)
+                })
+
+            f.publishSystemStop(stoppedAt)
+            record.failNextRead = true
+            f.service.onStartCommand(command, 0, 3)
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
+            assertEquals(listOf(SERVICE_RESULT_ERROR to "recovery_record_read_failed"), replies)
+            assertFalse("a failed observation must not stop the active service", shadowOf(host).isStoppedBySelf)
+            assertEquals(Tunnel.State.UP, f.backend.getState(f.tunnel))
+
+            f.service.onStartCommand(command, 0, 4)
+            f.drainImmediateWork()
+            assertEquals(listOf(SERVICE_RESULT_ERROR to "recovery_record_read_failed",
+                SERVICE_RESULT_OK to null), replies)
+            assertEquals(before, f.envelope())
+            assertEquals(Tunnel.State.UP, f.backend.getState(f.tunnel))
+        }
+    }
+
+    @Test fun failedFirstObservationCanFinishAnIdleService() = withTileRuntime { f ->
+        assertFalse(f.envelope().intent.desiredActive)
+        f.publishSystemStop(System.currentTimeMillis())
+        f.record.failNextRead = true
+        val command = Intent(NelomaiVpnService.ACTION_TAKE_STATE_CHANGE)
+        assertEquals(android.app.Service.START_NOT_STICKY, f.service.onStartCommand(command, 0, 1))
+        assertFalse(f.record.failNextRead)
+        val host = ReflectionHelpers.getField<RuntimeVpnHostV1>(f.service, "runtimeHost").service
+        assertEquals(1, shadowOf(host).stopSelfResultId)
+        assertTrue(CompletionNative.events.none { it == "up" })
+    }
+
+    @Test @Config(shadows = [StatusBrokerSelection::class])
+    fun boundStatusConsumesPublishedStopBeforeRecovery() = checkBoundStatusAfterSystemStop(false)
+
+    @Test @Config(shadows = [StatusBrokerSelection::class])
+    fun boundStatusRetriesFailedJournalReadOnSameEndpoint() = checkBoundStatusAfterSystemStop(true)
+
+    private fun checkBoundStatusAfterSystemStop(failFirstPoll: Boolean) {
+        val record = armedKillSwitchRecord { f ->
+            assertTrue(QuickTunnelController.updateState(f.context, SessionState.RUNNING))
+        }
+        record.failNextRead = true
+        withTileRuntime(record, retainTunDescriptor = true) { f ->
+            val looper = shadowOf(Looper.getMainLooper())
+            val poll = f.openStatusEndpoint()
+            looper.idleFor(Duration.ofSeconds(6))
+            assertNotNull(f.protectionNotice())
+            fun restoreRequests() = org.robolectric.shadows.ShadowLog.getLogs()
+                .count { it.msg.contains("service.restore_requested") }
+            val before = restoreRequests()
+            f.publishSystemStop(System.currentTimeMillis())
+            if (failFirstPoll) {
+                record.failNextRead = true
+                val (code, result) = poll()
+                assertEquals(SERVICE_RESULT_ERROR, code)
+                assertEquals("recovery_record_read_failed", result.getString(EXTRA_ERROR_CODE))
+                assertTrue(f.envelope().intent.desiredActive)
+                assertEquals(before, restoreRequests())
+            }
+            val (code, result) = poll()
+            assertEquals(SERVICE_RESULT_OK, code)
+            assertEquals(SessionState.STOPPED.wireName, result.getString(EXTRA_STATE))
+            assertFalse(f.envelope().intent.desiredActive)
+            assertNull(f.protectionNotice())
+            assertEquals(before, restoreRequests())
+            f.drainImmediateWork()
+            assertTrue(CompletionNative.events.none { it == "up" })
+        }
+    }
+
+    private fun Fixture.openStatusEndpoint(): () -> Pair<Int, Bundle> {
+        val looper = shadowOf(Looper.getMainLooper())
+        var bootstrap: Bundle? = null
+        service.onStartCommand(Intent(NelomaiVpnService.ACTION_CLIENT_STATUS)
+            .putExtra(EXTRA_API_VERSION, TUNNEL_API_VERSION)
+            .putExtra(EXTRA_RESULT_RECEIVER, Receiver { code, data ->
+                assertEquals(SERVICE_RESULT_OK, code)
+                bootstrap = data
+            }), 0, 1)
+        looper.idle()
+        val endpoint = requireNotNull(bootstrap)
+        val messenger = android.os.Messenger(requireNotNull(endpoint.getBinder(EXTRA_STATUS_ENDPOINT)))
+        return {
+            var reply: Pair<Int, Bundle>? = null
+            messenger.send(android.os.Message.obtain(null, STATUS_OBSERVE).apply {
+                data = Bundle().apply {
+                    putInt(EXTRA_API_VERSION, TUNNEL_API_VERSION)
+                    putLong(EXTRA_STATUS_GENERATION, endpoint.getLong(EXTRA_STATUS_GENERATION))
+                    putString(EXTRA_STATUS_RUNTIME, endpoint.getString(EXTRA_STATUS_RUNTIME))
+                    putParcelable(EXTRA_RESULT_RECEIVER, Receiver { code, result -> reply = code to requireNotNull(result) })
+                }
+            })
+            looper.idle()
+            requireNotNull(reply).also { (_, result) ->
+                assertEquals(endpoint.getLong(EXTRA_STATUS_GENERATION), result.getLong(EXTRA_STATUS_GENERATION))
+                assertEquals(endpoint.getString(EXTRA_STATUS_RUNTIME), result.getString(EXTRA_STATUS_RUNTIME))
+            }
+        }
+    }
+
+    @Test @Config(shadows = [StatusBrokerSelection::class])
+    fun boundStatusReflectsSystemStopWhileRestoredTransportCloses() =
+        checkBoundStatusUntilTransportCloses(repeatStopFromUi = false)
+
+    @Test @Config(shadows = [StatusBrokerSelection::class])
+    fun boundStatusKeepsStoppingWhenUiRepeatsSystemStop() =
+        checkBoundStatusUntilTransportCloses(repeatStopFromUi = true)
+
+    private fun checkBoundStatusUntilTransportCloses(repeatStopFromUi: Boolean) {
+        val record = Record()
+        withTileRuntime(record) { f ->
+            assertTrue(QuickTunnelController.updateState(f.context, SessionState.RUNNING, desiredActive = true))
+        }
+        withTileRuntime(record) { f ->
+            val poll = f.openStatusEndpoint()
+            fun assertStatus(expected: SessionState, transport: Tunnel.State) {
+                val (code, reply) = poll()
+                assertEquals(SERVICE_RESULT_OK, code)
+                assertEquals(transport, f.backend.getState(f.tunnel))
+                assertEquals(expected.wireName, reply.getString(EXTRA_STATE))
+                assertFalse(f.envelope().intent.desiredActive)
+            }
+            TunnelRuntime.start(f.context, args(), { _, _ -> }, { fail(it) }, keepForegroundServiceOnFailure = true)
+            f.work.runNext()
+            f.publishSystemStop(System.currentTimeMillis())
+            assertStatus(SessionState.STOPPING, Tunnel.State.UP)
+            if (repeatStopFromUi) {
+                var result: Int? = null
+                f.service.onStartCommand(Intent(NelomaiVpnService.ACTION_CANCEL_CURRENT_CONNECTION_INTENT)
+                    .putExtra(EXTRA_RESULT_RECEIVER, Receiver { code, _ -> result = code }), 0, 2)
+                shadowOf(Looper.getMainLooper()).idle()
+                assertEquals(SERVICE_RESULT_OK, result)
+            }
+            repeat(2) { assertStatus(SessionState.STOPPING, Tunnel.State.UP) }
+            val repliesDuringNativeClose = mutableListOf<Pair<Int, String?>>()
+            CompletionNative.onDown = {
+                val (code, reply) = poll()
+                repliesDuringNativeClose += code to reply.getString(EXTRA_STATE)
+            }
+            f.work.runImmediately = true
+            f.drainImmediateWork()
+            assertEquals("Binder status inside awgTurnOff",
+                listOf(SERVICE_RESULT_OK to SessionState.STOPPING.wireName), repliesDuringNativeClose)
+            assertStatus(SessionState.STOPPED, Tunnel.State.DOWN)
+        }
+    }
+
+    @Test fun lateSystemStopKeepsNewUiStart() = verifyNewUiStart(false)
+
+    @Test @Config(shadows = [ConfirmedStandbyTransport::class, StandbyPhysicalNetwork::class])
+    fun lateSystemStopKeepsNewHotStandbyUiStart() = verifyNewUiStart(true)
+
+    private fun verifyNewUiStart(hotStandby: Boolean) {
+        val stoppedAt = System.currentTimeMillis() - 1_000
+        val record = Record().apply { storeTime = stoppedAt - 1_000 }
+        withTileRuntime(record) { it.startUi(false) }
+        record.storeTime = stoppedAt + 1_000
+        withTileRuntime(record, retainTunDescriptor = hotStandby) { f ->
+            val operation = f.startUi(hotStandby)
+            val before = f.envelope()
+            f.work.runImmediately = true
+            f.publishSystemStop(stoppedAt)
+            if (!hotStandby) f.service.onStartCommand(Intent(NelomaiVpnService.ACTION_TAKE_STATE_CHANGE), 0, 2)
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(6))
+            f.drainImmediateWork()
+            assertTrue(f.envelope().intent.desiredActive)
+            if (hotStandby) {
+                assertEquals(operation, before.redundantTransaction?.startOperationId)
+                assertEquals(operation, f.envelope().redundantTransaction?.startOperationId)
+                assertEquals(RedundantStopState.NONE, f.envelope().redundantTransaction?.retry?.stopState)
+            } else assertEquals(Tunnel.State.UP, f.backend.getState(f.tunnel))
+            assertTrue(requireNotNull(f.envelope().armedAtMillis) > stoppedAt)
+            ReflectionHelpers.getField<android.os.Handler>(f.service, "restoreHandler").removeCallbacksAndMessages(null)
+        }
+        // After another process death, the durable start time must distinguish
+        // the two exit records even though the lease generation was reused.
+        withTileRuntime(record, retainTunDescriptor = hotStandby) { f ->
+            f.publishSystemStop(stoppedAt)
+            f.service.onStartCommand(Intent(NelomaiVpnService.ACTION_TAKE_STATE_CHANGE), 0, 1)
+            assertTrue(f.envelope().intent.desiredActive)
+            f.publishSystemStop(requireNotNull(f.envelope().armedAtMillis) + 1)
+            f.service.onStartCommand(Intent(NelomaiVpnService.ACTION_TAKE_STATE_CHANGE), 0, 2)
+            assertFalse(f.envelope().intent.desiredActive)
+            assertNull(f.protectionNotice())
+        }
+    }
+
+    @Test @Config(shadows = [ConfirmedStandbyTransport::class, StandbyPhysicalNetwork::class])
+    fun coldRestartFromHotStandbyStartReplyShowsProtectionLoss() = verifyStandbyLoss(false)
+
+    @Test @Config(shadows = [ConfirmedStandbyTransport::class, StandbyPhysicalNetwork::class])
+    fun coldRestartRetriesUnreadableStandbyCheckpointWithoutRpc() = verifyStandbyLoss(true)
+
+    private fun verifyStandbyLoss(failFirstRead: Boolean) {
+        val atReply = Record()
+        withTileRuntime(retainTunDescriptor = true) { f ->
+            f.startUi(true) { assertTrue(atReply.write(requireNotNull(f.record.read()))) }
+            // The dead process cannot deliver its queued health checks.
+            ReflectionHelpers.getField<android.os.Handler>(f.service, "restoreHandler").removeCallbacksAndMessages(null)
+        }
+        atReply.failNextRead = failFirstRead
+        withTileRuntime(atReply, retainTunDescriptor = true) { f ->
+            assertFalse(atReply.failNextRead)
+            if (failFirstRead) shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(6))
+            else shadowOf(Looper.getMainLooper()).idle()
+            assertTrue(f.envelope().intent.armedHistory)
+            assertEquals("Защита прервана, восстанавливаем VPN",
+                f.protectionNotice()?.extras?.getCharSequence(Notification.EXTRA_TEXT))
+        }
+    }
+
+    @Test fun coldStatusAfterSystemStopDoesNotAnnounceProtectionLoss() {
+        val record = armedKillSwitchRecord { it.recordSystemStop(SessionState.RUNNING) }
+        withTileRuntime(record, retainTunDescriptor = true) { f ->
+            shadowOf(Looper.getMainLooper()).idle()
+            assertNull(f.protectionNotice())
+            f.readStatusAfterSystemStop()
+        }
+    }
+
+    @Test fun coldStatusClearsProtectionLossWhenAndroidPublishesStopAfterCreation() {
+        val record = armedKillSwitchRecord()
+        withTileRuntime(record, retainTunDescriptor = true) { f ->
+            shadowOf(Looper.getMainLooper()).idle()
+            assertNotNull(f.protectionNotice())
+            f.recordSystemStop(SessionState.RUNNING)
+            f.readStatusAfterSystemStop()
+        }
+    }
+
+    @Test fun firstTileStartAfterLateSystemStopClearsOldProtectionNotice() {
+        val record = armedKillSwitchRecord()
+        withTileRuntime(record, retainTunDescriptor = true) { f ->
+            shadowOf(Looper.getMainLooper()).idle()
+            assertNotNull(f.protectionNotice())
+            f.prepareQuick()
+            f.firstTapAfterSystemStop(SessionState.RUNNING)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertNull(f.protectionNotice())
+        }
+    }
+
+    @Test fun vpnProcessDeathAfterANewerStartReportsProtectionLoss() {
+        val record = armedKillSwitchRecord { f ->
+            val armedAt = requireNotNull(f.envelope().armedAtMillis)
+            val manager = shadowOf(f.context.getSystemService(ActivityManager::class.java))
+            fun exit(at: Long, reason: Int, description: String) = ShadowActivityManager.ApplicationExitInfoBuilder
+                .newBuilder().setPid(100).setProcessName(f.context.packageName + ":vpn")
+                .setTimestamp(at).setReason(reason).setDescription(description).build()
+            manager.addApplicationExitInfo(exit(armedAt - 1000, ApplicationExitInfo.REASON_USER_REQUESTED, "[STOP APP]"))
+            manager.addApplicationExitInfo(exit(armedAt + 1000, ApplicationExitInfo.REASON_LOW_MEMORY, "low memory"))
+        }
+        withTileRuntime(record, retainTunDescriptor = true) { f ->
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals("Защита прервана, восстанавливаем VPN",
+                f.protectionNotice()?.extras?.getCharSequence(Notification.EXTRA_TEXT))
+            assertTrue(f.envelope().intent.desiredActive)
+        }
+    }
+
+    private fun armedKillSwitchRecord(beforeDeath: (Fixture) -> Unit = {}): Record = Record().also { record ->
+        withTileRuntime(record, retainTunDescriptor = true) { f ->
+            KillSwitchPreference(f.context).save(enabled = true, confirmed = true)
+            f.armCheckpoint()
+            beforeDeath(f)
+        }
+    }
+
+    private fun Fixture.protectionNotice(): Notification? =
+        context.getSystemService(NotificationManager::class.java).activeNotifications
+            .firstOrNull { it.id == 22 }?.notification
+
+    private fun Fixture.readStatusAfterSystemStop() {
+        service.onStartCommand(Intent(NelomaiVpnService.ACTION_CLIENT_STATUS)
+            .putExtra(EXTRA_API_VERSION, TUNNEL_API_VERSION), 0, 1)
+        drainImmediateWork()
+        assertFalse(envelope().intent.desiredActive)
+        assertNull(protectionNotice())
+    }
+
     private fun checkColdSystemStop(action: String?, lastPublished: SessionState = SessionState.RUNNING) {
         val record = Record()
         val operation = java.util.UUID.randomUUID().toString()
@@ -1608,7 +2053,7 @@ class NativeLocalRestartCompletionTest {
             JSONObject().put("scope", accountScope).put("blocked", false))
         RuntimeProcessSelection.rememberVpnOwner(RuntimeSelectionStore.decode(brokerReply.toString()))
         try {
-            withRuntime(record, credentialRecord) { fixture ->
+            withRuntime(record, credentialRecord, retainTunDescriptor) { fixture ->
                 fixture.service.onCreate()
                 test(fixture)
             }
@@ -1621,7 +2066,7 @@ class NativeLocalRestartCompletionTest {
         val controller = Robolectric.buildService(VpnService::class.java).create()
         val host = controller.get()
         if (retainTunDescriptor) OwnershipBuilder.directory = host.cacheDir
-        val store = AndroidRecoveryStore(record, BootIdentityProvider { 1 }) { System.currentTimeMillis() - 2_000 }
+        val store = AndroidRecoveryStore(record, BootIdentityProvider { 1 }) { record.storeTime ?: (System.currentTimeMillis() - 2_000) }
         val coordinator = AndroidConnectionIntentCoordinator(store)
         val service = NelomaiVpnService(object : RuntimeVpnHostV1 {
             override val service = host
@@ -1687,7 +2132,11 @@ class NativeLocalRestartCompletionTest {
             field(TunnelRuntime, "backgroundExecutor", backgroundWork)
             field(TunnelRuntime, "backgroundOperationGate", BackgroundOperationGate())
             field(TunnelRuntime, "watchdogExecutor", timers)
-            field(TunnelRuntime, "stateGate", TunnelStateGate())
+            // The JVM can inline a static final reference. Reset the gate itself so
+            // compiled state() and the native callbacks observe the same object.
+            val stateGate = ReflectionHelpers.getField<TunnelStateGate>(TunnelRuntime, "stateGate")
+            field(stateGate, "state", ReflectionHelpers.getField<Any>(TunnelStateGate(), "state"))
+            field(stateGate, "revision", 0L)
             field(TunnelRuntime, "activeSession", null)
             field(TunnelRuntime, "applicationContext", host.applicationContext)
             val backend = GoBackend(host.applicationContext)
@@ -1704,6 +2153,7 @@ class NativeLocalRestartCompletionTest {
         } finally {
             saved.asReversed().forEach { it() }
             CompletionNative.onUp = {}
+            CompletionNative.onDown = {}
             CompletionQuickPlan.template = null
             CompletionPanel.onCapabilities = null
             CompletionPanel.onStart = null
@@ -1870,10 +2320,16 @@ class NativeLocalRestartCompletionTest {
     }
     private class Record : EncryptedRecordBackend {
         private var bytes: ByteArray? = null
+        var storeTime: Long? = null
+        var failNextRead = false
         var readFails = false
         var writeFails = false
         var onCommit: ((ByteArray) -> Unit)? = null
         override fun read(): ByteArray? {
+            if (failNextRead) {
+                failNextRead = false
+                error("temporary read failure")
+            }
             check(!readFails)
             return bytes?.copyOf()
         }
@@ -1886,7 +2342,10 @@ class NativeLocalRestartCompletionTest {
     }
     private class Work : AbstractExecutorService() {
         val jobs = ArrayDeque<Runnable>()
-        override fun execute(command: Runnable) { jobs.addLast(command) }
+        var runImmediately = false
+        override fun execute(command: Runnable) {
+            if (runImmediately) command.run() else jobs.addLast(command)
+        }
         fun runNext() {
             assertTrue("native worker must be queued", jobs.isNotEmpty())
             try { jobs.removeFirst().run() } catch (error: Throwable) {
@@ -1979,13 +2438,17 @@ class CompletionNative {
     companion object {
         val events = mutableListOf<String>()
         var onUp: () -> Unit = {}
+        var onDown: () -> Unit = {}
         var failNextUp = false
         @JvmStatic @Implementation fun awgVersion() = "test-jni"
         @JvmStatic @Implementation fun awgTurnOn(name: String, fd: Int, config: String): Int {
             if (failNextUp) { failNextUp = false; events += "up-failed"; return -1 }
             events += "up"; onUp(); return 41
         }
-        @JvmStatic @Implementation fun awgTurnOff(handle: Int) { events += "down" }
+        @JvmStatic @Implementation fun awgTurnOff(handle: Int) {
+            onDown()
+            events += "down"
+        }
         @JvmStatic @Implementation fun awgPreparedSocketToken(handle: Int) = 1L
         @JvmStatic @Implementation fun awgAdmitSockets(handle: Int, token: Long) = 0
         @JvmStatic @Implementation fun awgGetSocketV4(handle: Int) = 101
@@ -2014,6 +2477,28 @@ class CompletionFileDescriptor : org.robolectric.shadows.ShadowParcelFileDescrip
     @Implementation fun detachFd() = 7
 }
 
+@Implements(ServiceRedundantConnectionNative::class)
+internal class ConfirmedStandbyTransport {
+    @Implementation fun start(leaseId: String, slot: RedundantSlot, configuration: ByteArray,
+        healthProbe: BackgroundRedundantHealthProbe?): Boolean = true
+    @Implementation fun activate(leaseId: String): Boolean = true
+    @Implementation fun isUsable(leaseId: String): Boolean = true
+    @Implementation fun confirmTunReady(): Boolean = true
+    @Implementation fun healthObservations(initialReadiness: Boolean, committedStandbyLeaseId: String?,
+        freshStart: Boolean, startupStandbyRetryDeadlineMs: Long?) = listOf(
+        SlotObservation(0, true, BackendHealth.READY, handshakeFresh = true, consecutiveProbeSuccesses = 2,
+            successfulProbeValidThroughElapsedMs = Long.MAX_VALUE),
+        SlotObservation(1, false, BackendHealth.READY, handshakeFresh = true, consecutiveProbeSuccesses = 2,
+            standbyProbeState = StandbyProbeState.SUCCEEDED, successfulProbeValidThroughElapsedMs = Long.MAX_VALUE),
+    )
+}
+
+@Implements(PhysicalNetworks::class)
+internal class StandbyPhysicalNetwork {
+    @Implementation fun snapshotState() = PhysicalNetworkState(emptyList(),
+        listOf(org.robolectric.shadows.ShadowNetwork.newInstance(1)), true, "test")
+}
+
 @Implements(ActivityManager::class)
 class CompletionExitHistory : ShadowActivityManager() {
     @Implementation
@@ -2033,4 +2518,11 @@ class DeferredFailureDiagnostics {
     }
 
     companion object { var finish: ((Throwable?) -> Unit)? = null }
+}
+
+@Implements(RuntimeSelectionStore::class)
+class StatusBrokerSelection {
+    @Implementation fun read(callback: (Result<RuntimeSelectionV1>) -> Unit) {
+        callback(Result.success(requireNotNull(RuntimeProcessSelection.vpnOwnerForStop())))
+    }
 }

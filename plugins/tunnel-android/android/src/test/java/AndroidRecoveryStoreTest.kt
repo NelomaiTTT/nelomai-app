@@ -9,6 +9,29 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AndroidRecoveryStoreTest {
+    @Test fun redundantReadinessCheckpointIsScopedAndIdempotentAfterRestart() {
+        val backend = FakeEncryptedRecordBackend()
+        val store = store(backend)
+        val pending = store.beginRedundant(redundantTransaction("current")).success()
+        val initialWrites = backend.writeCount
+        assertTrue(store.recordRedundantCheckpoint("previous") is RecoveryStoreResult.Failure)
+        assertEquals(pending, store.read().success())
+        assertEquals(initialWrites, backend.writeCount)
+        backend.failWrites = true
+        assertTrue(store.recordRedundantCheckpoint("current") is RecoveryStoreResult.Failure)
+        backend.failWrites = false
+        assertEquals(pending, store.read().success())
+        val reopened = store(backend)
+        assertTrue(reopened.recordRedundantCheckpoint("current").success().intent.armedHistory)
+        val writes = backend.writeCount
+        assertTrue(store.recordRedundantCheckpoint("current").success().intent.armedHistory)
+        assertEquals(writes, backend.writeCount)
+        val stopped = store.cancelSystemStoppedIntent(store.read().success()).success()
+        assertTrue(reopened.recordRedundantCheckpoint("current") is RecoveryStoreResult.Failure)
+        assertEquals(stopped, reopened.read().success())
+        assertFalse(stopped.intent.desiredActive)
+    }
+
     @Test
     fun capturedV1TileStartSurvivesOnlyTheOriginalSystemCancellation() {
         val request = AndroidPendingQuickStart(100, "runtime")

@@ -1208,7 +1208,11 @@ internal class RedundantConnectionCoordinator(
         onReady: () -> Unit,
         onFailed: () -> Unit,
     ): Boolean {
-        if (!mutationFence.runIfActive(transaction.startOperationId) { onPrimaryReady() }) {
+        // The caller can observe RUNNING (and the process can die) as soon as onReady runs.
+        val ready = mutationFence.runIfActive(transaction.startOperationId) {
+            onPrimaryReady() && store.recordRedundantCheckpoint(transaction.startOperationId) is RecoveryStoreResult.Success
+        }
+        if (!ready) {
             recoveryStarted = false
             primaryReadinessFailed = true
             runCatching(native::stop)

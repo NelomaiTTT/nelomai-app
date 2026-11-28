@@ -145,6 +145,47 @@ class RuntimeVpnBrokerRecoveryTest {
         }
     }
 
+    @Test fun coldWatchRetriesAtBrokerDeadlineAndOnlyDeliversOnceAfterFreshProof() =
+        checkColdWatchDeadline(createMillis = 100, expires = true)
+
+    @Test fun coldWatchAcceptsProofStillFreshAfterEngineCreation() =
+        checkColdWatchDeadline(createMillis = 99, expires = false)
+
+    private fun checkColdWatchDeadline(createMillis: Long, expires: Boolean) {
+        val ctrl = Robolectric.buildService(RuntimeVpnDispatcherService::class.java).create()
+        try {
+            val service = ctrl.get()
+            val app = shadowOf(RuntimeEnvironment.getApplication())
+            val owner = RuntimeSelectionStore.encodeVpnRecoveryOwner(original)
+            val first = prepareWatch(service, owner)
+            // The selection read finishes within its deadline, with 100 ms left for delivery.
+            ShadowSystemClock.advanceBy(Duration.ofSeconds(10))
+            BrokerRecoverySelectionShadow.selected = selection("old-broker").also {
+                ReflectionHelpers.setField(it, "brokerVerifiedAtUptimeMillis",
+                    android.os.SystemClock.uptimeMillis() - 9_900L)
+            }
+            BrokerRecoveryAdaptersShadow.onCreate = { ShadowSystemClock.advanceBy(Duration.ofMillis(createMillis)) }
+            service.onStartCommand(requireNotNull(app.nextStartedService), 0, 1)
+            shadowOf(Looper.getMainLooper()).idle()
+            if (expires) {
+                assertEquals(listOf(RuntimeServiceIntents.TASK_REMOVAL_RETRY), first)
+                assertFalse(RuntimeProcessSelection.hasVpnOwner())
+                assertTrue(BrokerRecoveryAdaptersShadow.actions.isEmpty())
+                BrokerRecoverySelectionShadow.selected = original
+                val retry = prepareWatch(service, owner)
+                service.onStartCommand(requireNotNull(app.nextStartedService), 0, 2)
+                shadowOf(Looper.getMainLooper()).idle()
+                assertEquals(listOf(RuntimeServiceIntents.TASK_REMOVAL_ACCEPTED), retry)
+            } else {
+                assertEquals(listOf(RuntimeServiceIntents.TASK_REMOVAL_ACCEPTED), first)
+            }
+            assertEquals(listOf(RuntimeServiceIntents.TASK_REMOVAL_LIVENESS), BrokerRecoveryAdaptersShadow.actions)
+        } finally {
+            BrokerRecoveryAdaptersShadow.onCreate = null
+            ctrl.destroy()
+        }
+    }
+
     @Test fun watchSurvivesExpiredProofUntilFreshDelivery() {
         val controller = connectedService()
         try {
@@ -1219,7 +1260,7 @@ class BrokerRecoveryAdaptersShadow {
                     ((intent.action == RuntimeServiceIntents.QUICK_TOGGLE ||
                         intent.action == "ru.nelomai.runtime.stable.tunnel.QUICK_TOGGLE") && quickToggleWouldStart &&
                         !intent.getBooleanExtra(RuntimeServiceIntents.EXTRA_QUICK_STOP_ONLY, false))
-            override fun create() = Unit
+            override fun create() { onCreate?.invoke() }
             override fun start(intent: Intent?, flags: Int, startId: Int): Int {
                 actions += intent?.action
                 startIds += startId
@@ -1278,6 +1319,7 @@ class BrokerRecoveryAdaptersShadow {
         val rejectedStartIds = mutableListOf<Int>()
         val logoutEpochs = mutableListOf<Long>()
         var beforeEstablish: (() -> Unit)? = null
+        var onCreate: (() -> Unit)? = null
         var logoutResult: Int? = null
         var watchResult = Service.START_STICKY
         var stableStopLease = true

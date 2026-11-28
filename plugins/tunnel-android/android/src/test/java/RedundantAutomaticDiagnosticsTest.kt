@@ -25,6 +25,61 @@ import java.util.concurrent.TimeUnit
     shadows = [CompletionNoLibrary::class, DiagnosticDirectorySyncShadow::class, VpnExitActivityManagerShadow::class])
 @LooperMode(LooperMode.Mode.PAUSED)
 class RedundantAutomaticDiagnosticsTest {
+    @Test fun coldServiceReportsProtectionLostForConfirmedHotStandby() = restartConfirmedStandby(systemStop = false)
+    @Test fun coldServiceKeepsConfirmedHotStandbyQuietAfterSystemStop() = restartConfirmedStandby(systemStop = true)
+
+    private fun restartConfirmedStandby(systemStop: Boolean) = fixture { f ->
+        KillSwitchPreference(f.context).save(enabled = true, confirmed = true)
+        val owner = f.owner()
+        assertTrue(owner.start(f.tx, configs()))
+        f.idle()
+        val ctrl = Robolectric.buildService(VpnService::class.java).create()
+        val host = ctrl.get()
+        if (systemStop) {
+            val armedAt = requireNotNull((f.store.read() as RecoveryStoreResult.Success).value.armedAtMillis)
+            val exit = org.robolectric.shadows.ShadowActivityManager.ApplicationExitInfoBuilder.newBuilder()
+                .setPid(android.os.Process.myPid()).setProcessName(host.packageName + ":vpn").setTimestamp(armedAt)
+                .setReason(android.app.ApplicationExitInfo.REASON_USER_REQUESTED).setDescription("[STOP APP]").build()
+            shadowOf(host.getSystemService(android.app.ActivityManager::class.java)).addApplicationExitInfo(exit)
+        }
+        val cold = NelomaiVpnService(object : RuntimeVpnHostV1 {
+            override val service = host
+            override fun builder(beforeEstablish: (VpnService.Builder) -> Unit) = host.Builder().also(beforeEstablish)
+        })
+        val oldStore = ReflectionHelpers.getStaticField<AndroidRecoveryStore?>(AndroidRecoveryStores::class.java, "instance")
+        try {
+            ReflectionHelpers.setStaticField(AndroidRecoveryStores::class.java, "instance", f.store)
+            cold.onCreate()
+            f.idle()
+            val notice = host.getSystemService(android.app.NotificationManager::class.java)
+                .activeNotifications.singleOrNull { it.id == 22 }?.notification
+            if (systemStop) assertNull(notice) else assertEquals("Защита прервана, восстанавливаем VPN",
+                notice?.extras?.getCharSequence(android.app.Notification.EXTRA_TEXT))
+        } finally {
+            cold.onDestroy()
+            ReflectionHelpers.setStaticField(AndroidRecoveryStores::class.java, "instance", oldStore)
+            ctrl.destroy()
+        }
+    }
+
+    @Test fun failedCheckpointDoesNotAcknowledgeAHotStandbyStart() = fixture { f ->
+        var nativeStops = 0
+        val owner = f.owner(onNativeStop = { nativeStops++ })
+        val backend = ReflectionHelpers.getField<EncryptedRecordBackend>(f.store, "backend")
+        ReflectionHelpers.setField(f.store, "backend", object : EncryptedRecordBackend {
+            override fun read() = backend.read()
+            override fun write(plaintext: ByteArray) =
+                !AndroidRecoveryEnvelopeCodec.decode(plaintext).intent.armedHistory && backend.write(plaintext)
+        })
+        var started = 0
+        var failed = 0
+        assertFalse(owner.start(f.tx, configs(), onPrimaryStarted = { started++ }, onPrimaryFailed = { failed++ }))
+        assertEquals(0, started)
+        assertEquals(1, failed)
+        assertEquals(1, nativeStops)
+        assertFalse((f.store.read() as RecoveryStoreResult.Success).value.intent.armedHistory)
+    }
+
     @Test fun initialStartCreatesCheckpointAndOneStopReport() = fixture { f ->
         val owner = f.owner()
         assertTrue(owner.start(f.tx, configs()))

@@ -1002,6 +1002,21 @@ internal class AndroidRecoveryStore(
         }
     }
 
+    /** Keep the confirmed running checkpoint across process death, scoped to this Start. */
+    fun recordRedundantCheckpoint(startOperationId: String): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
+        val result = readLocked()
+        if (result !is RecoveryStoreResult.Success) return@synchronized result
+        val current = result.value
+        val active = current.redundantTransaction
+        if (active?.startOperationId != startOperationId || !active.desiredActive ||
+            active.retry.stopState != RedundantStopState.NONE
+        ) return@synchronized generationConflict()
+        // Older v2 records have an active redundant transaction and no shared desired intent.
+        // Their existing recovery does not arm a new intent.
+        if (!current.intent.desiredActive || current.intent.armedHistory) return@synchronized result
+        persist(current.copy(intent = current.intent.copy(armedHistory = true)))
+    }
+
     /** Transfer a fresh v2 allocation to the existing session owner in one durable write. */
     fun promotePendingRedundant(
         pending: AndroidLeaseTransaction,
@@ -1054,6 +1069,8 @@ internal class AndroidRecoveryStore(
                     template = transaction.template,
                     retry = AndroidRetryState(),
                 ),
+                // A new group owns this Start only once its transaction is accepted.
+                armedAtMillis = if (transaction.desiredActive) nowMillis() else null,
                 pendingQuickStart = null,
                 systemStoppedFromGeneration = null,
                 redundantTransaction = transaction,
@@ -1297,18 +1314,20 @@ internal class AndroidRecoveryStore(
     fun cancelSystemStoppedIntent(
         expected: AndroidRecoveryEnvelope,
         pendingStop: RedundantCancelTombstone? = null,
+        stopLocalRuntime: Boolean = false,
     ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
         val result = readLocked()
         if (result is RecoveryStoreResult.Failure) return@synchronized result
         val current = (result as RecoveryStoreResult.Success).value
         if (current != expected) return@synchronized generationConflict()
         if (!current.intent.desiredActive) return@synchronized result
-        disarmForSystemStop(current, pendingStop)
+        disarmForSystemStop(current, pendingStop, stopLocalRuntime)
     }
 
     private fun disarmForSystemStop(
         current: AndroidRecoveryEnvelope,
         pendingStop: RedundantCancelTombstone?,
+        stopLocalRuntime: Boolean = false,
     ): RecoveryStoreResult<AndroidRecoveryEnvelope> {
         val transaction = current.redundantTransaction
         return when {
@@ -1316,7 +1335,8 @@ internal class AndroidRecoveryStore(
                 transaction.retry.stopState == RedundantStopState.NONE) -> fenceRedundantStop(current, transaction,
                 pendingStop?.takeIf { it.startOperationId == transaction.startOperationId }?.stopOperationId
                     ?: UUID.randomUUID().toString(), retainActivePeer = true)
-            current.intent.desiredActive -> setDesiredActiveLocked(current, false, systemStop = true)
+            current.intent.desiredActive -> setDesiredActiveLocked(current, false,
+                leaseLessRuntimeStop = stopLocalRuntime && current.leaseTransaction == null, systemStop = true)
             else -> persist(current)
         }
     }
@@ -1439,13 +1459,19 @@ internal class AndroidRecoveryStore(
         expectedGeneration: Long,
         desiredActive: Boolean,
         ownerCurrent: () -> Boolean = { true },
+        newUiStart: Boolean = false,
     ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
         val currentResult = readLocked()
         if (currentResult is RecoveryStoreResult.Failure) return@synchronized currentResult
         val current = (currentResult as RecoveryStoreResult.Success).value
         if (current.intent.generation != expectedGeneration) return@synchronized generationConflict()
         if (!ownerCurrent()) return@synchronized generationConflict()
-        setDesiredActiveLocked(current.copy(pendingQuickStart = null), desiredActive)
+        val next = current.copy(pendingQuickStart = null)
+        // A replacement admitted by the UI can reuse the lease generation. Its
+        // start time must still distinguish it from the previous Android Stop.
+        if (newUiStart && desiredActive && current.intent.desiredActive) {
+            persist(next.copy(armedAtMillis = nowMillis()), newStart = true)
+        } else setDesiredActiveLocked(next, desiredActive)
     }
 
     fun cancelCurrentIntent(): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
